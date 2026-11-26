@@ -1,11 +1,13 @@
-"""Microphone audio recording and Groq Whisper speech-to-text."""
+"""Microphone audio recording (with RMS silence auto-stop) and Groq Whisper STT."""
 
 from __future__ import annotations
 
 import io
+import math
 import threading
 import time
 import wave
+from array import array
 from typing import Any
 
 import httpx
@@ -18,10 +20,25 @@ SAMPLE_WIDTH = 2  # int16
 MAX_RECORD_SECONDS = 120
 MAX_PCM_BYTES = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH * MAX_RECORD_SECONDS
 WHISPER_MODEL = "whisper-large-v3-turbo"
+SPEECH_RMS_THRESHOLD = 450.0
+SILENCE_RMS_THRESHOLD = 220.0
+MIN_SPEECH_CHUNKS = 3
 
 
 class VoiceError(Exception):
     """Raised when microphone recording or Whisper transcription fails."""
+
+
+def _pcm_rms(chunk: bytes) -> float:
+    usable = len(chunk) - (len(chunk) % 2)
+    if usable <= 0:
+        return 0.0
+    samples = array("h")
+    samples.frombytes(chunk[:usable])
+    if not samples:
+        return 0.0
+    mean_sq = sum(s * s for s in samples) / len(samples)
+    return math.sqrt(mean_sq)
 
 
 def list_microphones() -> list[dict[str, Any]]:
@@ -61,13 +78,29 @@ class VoiceRecorder:
         self._buffer = bytearray()
         self._recording = False
         self._started_at: float = 0.0
+        self._auto_silence: bool = True
+        self._silence_seconds: float = 1.8
+        self._speech_detected: bool = False
+        self._speech_chunks: int = 0
+        self._last_speech_at: float = 0.0
+        self._auto_stopped: bool = False
 
     def status(self) -> dict[str, Any]:
         with self._lock:
             elapsed = round(time.monotonic() - self._started_at, 1) if self._recording else 0.0
-            return {"recording": self._recording, "elapsed_seconds": elapsed}
+            return {
+                "recording": self._recording,
+                "elapsed_seconds": elapsed,
+                "speech_detected": self._speech_detected,
+                "auto_stopped": self._auto_stopped,
+            }
 
-    def start(self, device: int | str | None = None) -> dict[str, Any]:
+    def start(
+        self,
+        device: int | str | None = None,
+        auto_silence: bool = True,
+        silence_seconds: float = 1.8,
+    ) -> dict[str, Any]:
         with self._lock:
             if self._recording:
                 raise VoiceError("Recording is already in progress.")
@@ -77,11 +110,37 @@ class VoiceRecorder:
                 raise VoiceError(f"Audio library unavailable: {exc}") from exc
 
             self._buffer = bytearray()
+            self._auto_silence = bool(auto_silence)
+            self._silence_seconds = max(0.6, min(6.0, float(silence_seconds)))
+            self._speech_detected = False
+            self._speech_chunks = 0
+            self._last_speech_at = time.monotonic()
+            self._auto_stopped = False
 
             def _callback(indata: bytes, _frames: int, _time_info: Any, _status: Any) -> None:
+                chunk = bytes(indata)
                 if len(self._buffer) < MAX_PCM_BYTES:
                     remaining = MAX_PCM_BYTES - len(self._buffer)
-                    self._buffer.extend(bytes(indata)[:remaining])
+                    self._buffer.extend(chunk[:remaining])
+                if len(self._buffer) >= MAX_PCM_BYTES:
+                    self._auto_stopped = True
+                    raise sd.CallbackStop()
+
+                if self._auto_silence:
+                    rms = _pcm_rms(chunk)
+                    now_t = time.monotonic()
+                    if rms >= SPEECH_RMS_THRESHOLD:
+                        self._speech_chunks += 1
+                        self._last_speech_at = now_t
+                        if self._speech_chunks >= MIN_SPEECH_CHUNKS:
+                            self._speech_detected = True
+                    elif (
+                        self._speech_detected
+                        and rms < SILENCE_RMS_THRESHOLD
+                        and (now_t - self._last_speech_at) >= self._silence_seconds
+                    ):
+                        self._auto_stopped = True
+                        raise sd.CallbackStop()
 
             dev_arg: int | str | None = device
             if isinstance(dev_arg, str):
@@ -106,7 +165,12 @@ class VoiceRecorder:
             self._stream = stream
             self._recording = True
             self._started_at = time.monotonic()
-            return {"recording": True, "elapsed_seconds": 0.0}
+            return {
+                "recording": True,
+                "elapsed_seconds": 0.0,
+                "speech_detected": False,
+                "auto_stopped": False,
+            }
 
     def stop(self) -> bytes:
         with self._lock:
@@ -115,6 +179,7 @@ class VoiceRecorder:
             stream = self._stream
             self._stream = None
             self._recording = False
+            self._auto_stopped = False
             pcm_bytes = bytes(self._buffer)
             self._buffer = bytearray()
 
@@ -141,6 +206,8 @@ class VoiceRecorder:
             stream = self._stream
             self._stream = None
             self._recording = False
+            self._auto_stopped = False
+            self._speech_detected = False
             self._buffer = bytearray()
         if stream is not None:
             try:

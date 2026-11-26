@@ -10,11 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app import ai, db, dialogs, notes_sync, voice
+from app import agent, ai, db, dialogs, notes_sync, tts, voice
 from app.config import (
     get_data_dir,
     get_media_dir,
@@ -53,6 +53,9 @@ class TaskCreate(BaseModel):
     category: str = ""
     priority: str = "normal"
     due_date: str | None = None
+    status: str = "not_started"
+    progress_note: str = ""
+    checklist_items: list[str] = Field(default_factory=list)
 
 
 class TaskUpdate(BaseModel):
@@ -61,6 +64,29 @@ class TaskUpdate(BaseModel):
     category: str | None = None
     priority: str | None = None
     due_date: str | None = None
+    done: bool | None = None
+    status: str | None = None
+    progress_note: str | None = None
+
+
+class TaskItemCreate(BaseModel):
+    text: str
+
+
+class TaskItemUpdate(BaseModel):
+    text: str | None = None
+    done: bool | None = None
+
+
+class NoteAppendPayload(BaseModel):
+    text: str = ""
+    checklist_items: list[str] = Field(default_factory=list)
+    add_tags: list[str] | str = Field(default_factory=list)
+
+
+class NoteChecklistTogglePayload(BaseModel):
+    item_index: int | None = None
+    match_text: str | None = None
     done: bool | None = None
 
 
@@ -145,6 +171,11 @@ class SettingsUpdate(BaseModel):
     mic_device: int | str | None = None
     notes_folder: str | None = None
     weight_unit: str | None = None
+    tts_mode: str | None = None
+    tts_provider: str | None = None
+    tts_voice: str | None = None
+    auto_silence: bool | None = None
+    silence_seconds: float | None = None
 
 
 class CapturePayload(BaseModel):
@@ -157,6 +188,16 @@ class AskPayload(BaseModel):
     question: str
 
 
+class AgentSessionCreate(BaseModel):
+    title: str = "Voice Session"
+
+
+class AgentChatPayload(BaseModel):
+    text: str
+    session_id: int | None = None
+    source: str = "text"
+
+
 class TestGroqPayload(BaseModel):
     api_key: str | None = None
 
@@ -165,8 +206,21 @@ class NotesSyncPayload(BaseModel):
     folder: str | None = None
 
 
+class VoiceStartPayload(BaseModel):
+    auto_silence: bool | None = None
+    silence_seconds: float | None = None
+
+
 class VoiceStopPayload(BaseModel):
     voice_mode: str | None = None
+    session_id: int | None = None
+    use_agent: bool = False
+
+
+class TTSPayload(BaseModel):
+    text: str
+    provider: str | None = None
+    voice: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -198,8 +252,9 @@ def search(q: str = Query("", max_length=300), limit: int = 25) -> dict[str, Any
 def get_tasks(
     list_type: str | None = None,
     include_done: bool = True,
+    status: str | None = None,
 ) -> dict[str, Any]:
-    return {"items": db.list_tasks(list_type=list_type, include_done=include_done)}
+    return {"items": db.list_tasks(list_type=list_type, include_done=include_done, status=status)}
 
 
 @app.post("/api/tasks", status_code=201)
@@ -211,6 +266,9 @@ def post_task(payload: TaskCreate) -> dict[str, Any]:
             category=payload.category,
             priority=payload.priority,
             due_date=payload.due_date,
+            status=payload.status,
+            progress_note=payload.progress_note,
+            checklist_items=payload.checklist_items,
         )
         return {"item": item}
     except ValueError as exc:
@@ -234,6 +292,37 @@ def remove_task(task_id: int) -> dict[str, Any]:
     if not db.delete_task(task_id):
         raise HTTPException(status_code=404, detail="Task not found.")
     return {"deleted": True}
+
+
+@app.post("/api/tasks/{task_id}/items", status_code=201)
+def post_task_item(task_id: int, payload: TaskItemCreate) -> dict[str, Any]:
+    try:
+        item = db.add_task_item(task_id, payload.text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not item:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    return {"item": item}
+
+
+@app.patch("/api/tasks/{task_id}/items/{item_id}")
+def patch_task_item(task_id: int, item_id: int, payload: TaskItemUpdate) -> dict[str, Any]:
+    patch = payload.model_dump(exclude_unset=True)
+    try:
+        item = db.update_task_item(task_id, item_id, patch)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not item:
+        raise HTTPException(status_code=404, detail="Task or checklist item not found.")
+    return {"item": item}
+
+
+@app.delete("/api/tasks/{task_id}/items/{item_id}")
+def remove_task_item(task_id: int, item_id: int) -> dict[str, Any]:
+    item = db.delete_task_item(task_id, item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Task or checklist item not found.")
+    return {"item": item}
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +375,44 @@ def remove_note(note_id: int) -> dict[str, Any]:
     if not db.delete_note(note_id):
         raise HTTPException(status_code=404, detail="Note not found.")
     return {"deleted": True}
+
+
+@app.post("/api/notes/{note_id}/append")
+def post_note_append(note_id: int, payload: NoteAppendPayload) -> dict[str, Any]:
+    item = db.append_to_note(
+        note_id=note_id,
+        text=payload.text,
+        checklist_items=payload.checklist_items,
+        add_tags=payload.add_tags,
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Note not found.")
+    if item.get("source_path"):
+        try:
+            item = notes_sync.write_note_to_source(item)
+        except OSError:
+            pass
+    return {"item": item}
+
+
+@app.post("/api/notes/{note_id}/checklist-toggle")
+def post_note_checklist_toggle(
+    note_id: int, payload: NoteChecklistTogglePayload
+) -> dict[str, Any]:
+    item = db.toggle_note_checklist_line(
+        note_id=note_id,
+        item_index=payload.item_index,
+        match_text=payload.match_text,
+        done=payload.done,
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Note not found.")
+    if item.get("source_path"):
+        try:
+            item = notes_sync.write_note_to_source(item)
+        except OSError:
+            pass
+    return {"item": item}
 
 
 @app.post("/api/notes/sync")
@@ -566,6 +693,46 @@ async def post_ai_ask(payload: AskPayload) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/agent/sessions")
+def get_agent_sessions(limit: int = 20) -> dict[str, Any]:
+    return {"sessions": db.list_agent_sessions(limit=limit)}
+
+
+@app.post("/api/agent/sessions", status_code=201)
+def post_agent_session(payload: AgentSessionCreate | None = None) -> dict[str, Any]:
+    title = payload.title if payload else "Voice Session"
+    session = db.create_agent_session(title=title)
+    session["messages"] = []
+    return {"session": session}
+
+
+@app.get("/api/agent/sessions/{session_id}")
+def get_agent_session(session_id: int) -> dict[str, Any]:
+    detail = db.get_agent_session_detail(session_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Agent session not found.")
+    return {"session": detail}
+
+
+@app.delete("/api/agent/sessions/{session_id}")
+def remove_agent_session(session_id: int) -> dict[str, Any]:
+    if not db.delete_agent_session(session_id):
+        raise HTTPException(status_code=404, detail="Agent session not found.")
+    return {"deleted": True}
+
+
+@app.post("/api/agent/chat")
+async def post_agent_chat(payload: AgentChatPayload) -> dict[str, Any]:
+    try:
+        return await agent.run_agent_turn(
+            user_text=payload.text,
+            session_id=payload.session_id,
+            source=payload.source,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/settings/test-groq")
 async def test_groq(payload: TestGroqPayload | None = None) -> dict[str, Any]:
     key = (payload.api_key if payload and payload.api_key else "") or load_settings().get("groq_api_key", "")
@@ -588,10 +755,24 @@ def get_voice_status() -> dict[str, Any]:
 
 
 @app.post("/api/voice/start")
-def post_voice_start() -> dict[str, Any]:
+def post_voice_start(payload: VoiceStartPayload | None = None) -> dict[str, Any]:
     settings = load_settings()
+    auto_silence = (
+        payload.auto_silence
+        if payload and payload.auto_silence is not None
+        else settings.get("auto_silence", True)
+    )
+    silence_seconds = (
+        payload.silence_seconds
+        if payload and payload.silence_seconds is not None
+        else settings.get("silence_seconds", 1.8)
+    )
     try:
-        return voice.recorder.start(device=settings.get("mic_device"))
+        return voice.recorder.start(
+            device=settings.get("mic_device"),
+            auto_silence=bool(auto_silence),
+            silence_seconds=float(silence_seconds),
+        )
     except voice.VoiceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -601,6 +782,8 @@ async def post_voice_stop(payload: VoiceStopPayload | None = None) -> dict[str, 
     settings = load_settings()
     api_key = settings.get("groq_api_key", "").strip()
     mode = (payload.voice_mode if payload and payload.voice_mode else "") or settings.get("voice_mode", "auto_ai")
+    use_agent = bool(payload.use_agent) if payload else False
+    session_id = payload.session_id if payload else None
     try:
         wav_bytes = voice.recorder.stop()
         transcript = await voice.transcribe_wav_groq(wav_bytes, api_key)
@@ -609,19 +792,43 @@ async def post_voice_stop(payload: VoiceStopPayload | None = None) -> dict[str, 
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Whisper request failed: {exc}") from exc
 
+    agent_result = None
     capture_result = None
     if mode == "auto_ai":
-        capture_result = await ai.smart_capture(transcript, source="voice", mode="auto")
+        if use_agent:
+            agent_result = await agent.run_agent_turn(
+                transcript, session_id=session_id, source="voice"
+            )
+        else:
+            capture_result = await ai.smart_capture(transcript, source="voice", mode="auto")
     return {
         "transcript": transcript,
         "voice_mode": mode,
         "capture": capture_result,
+        "agent": agent_result,
     }
 
 
 @app.post("/api/voice/cancel")
 def post_voice_cancel() -> dict[str, Any]:
     return voice.recorder.cancel()
+
+
+@app.post("/api/voice/tts")
+async def post_voice_tts(payload: TTSPayload) -> Response:
+    res = await tts.synthesize_speech(
+        text=payload.text,
+        provider=payload.provider,
+        voice=payload.voice,
+    )
+    if res.get("audio_bytes"):
+        return Response(content=res["audio_bytes"], media_type="audio/wav")
+    return JSONResponse(
+        content={
+            "fallback_local": True,
+            "reason": res.get("reason", "Using built-in speech."),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
