@@ -163,3 +163,19 @@ def test_gaming_crud_and_settings_key_masking(monkeypatch, tmp_path):
         rs3 = client.patch("/api/settings", json={"groq_api_key": ""}).json()
         assert rs3["has_api_key"] is False
         assert rs3["groq_api_key_masked"] == ""
+
+
+def test_run_app_smoke_with_none_streams(monkeypatch, tmp_path):
+    """Ensure launching under pythonw.exe (stdout/stderr is None) does not crash."""
+    import sys
+    import run_app
+
+    monkeypatch.setenv("LIFEHUB_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    monkeypatch.setattr(sys, "argv", ["run_app.py", "--smoke-test"])
+
+    exit_code = run_app.main()
+    assert exit_code == 0
+    assert (tmp_path / "app.log").exists()
+
