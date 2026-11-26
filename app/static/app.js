@@ -19,10 +19,16 @@ const state = {
   captureMode: "auto",
   settings: null,
   voiceMode: "auto_ai",
+  autoSilence: true,
+  continuousVoice: false,
   recording: false,
+  voiceBusy: false,
   voiceTimerId: null,
+  voicePollId: null,
+  currentAudio: null,
   dashboard: null,
   tasks: [],
+  taskFilter: "all",
   notes: [],
   activeNoteId: null,
   notesQuery: "",
@@ -30,6 +36,9 @@ const state = {
   artMonth: localTodayStr().slice(0, 7),
   gymFilterExercise: "",
   gameFilter: "all",
+  activeSessionId: null,
+  agentSessions: [],
+  agentMessages: [],
   askQuery: "",
   askResult: null,
 };
@@ -92,12 +101,13 @@ function formatTodayLabel(isoDate) {
 // ---------------------------------------------------------------------------
 
 async function switchView(viewName) {
-  state.view = viewName;
+  const target = viewName === "agent" ? "ask" : viewName;
+  state.view = target;
   document.querySelectorAll(".nav-item").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.view === viewName);
+    btn.classList.toggle("active", btn.dataset.view === target);
   });
   document.querySelectorAll(".view").forEach((sec) => {
-    sec.classList.toggle("active", sec.id === `view-${viewName}`);
+    sec.classList.toggle("active", sec.id === `view-${target}`);
   });
   await renderCurrentView();
 }
@@ -122,6 +132,7 @@ async function refreshSettingsBadge() {
     const s = await api("/api/settings");
     state.settings = s;
     state.voiceMode = s.voice_mode || "auto_ai";
+    state.autoSilence = s.auto_silence !== undefined ? Boolean(s.auto_silence) : true;
     updateVoiceModeLabel();
     const pill = document.getElementById("sidebar-ai-status");
     if (s.has_api_key) {
@@ -137,7 +148,7 @@ async function refreshSettingsBadge() {
 }
 
 // ---------------------------------------------------------------------------
-// Top Quick-Capture & Voice Input
+// Top Quick-Capture, Voice Agent Loop & TTS Playback
 // ---------------------------------------------------------------------------
 
 function updateVoiceModeLabel() {
@@ -145,7 +156,86 @@ function updateVoiceModeLabel() {
   btn.textContent = state.voiceMode === "auto_ai" ? "Auto-file" : "To text";
 }
 
-function setRecordingUI(active, elapsed = 0) {
+function stopCurrentSpeech() {
+  if (state.currentAudio) {
+    try {
+      state.currentAudio.pause();
+      state.currentAudio = null;
+    } catch {
+      // ignore
+    }
+  }
+  if ("speechSynthesis" in window) {
+    try {
+      window.speechSynthesis.cancel();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function speakLocal(text) {
+  return new Promise((resolve) => {
+    if (!("speechSynthesis" in window)) {
+      resolve();
+      return;
+    }
+    try {
+      window.speechSynthesis.cancel();
+      const utt = new SpeechSynthesisUtterance(text);
+      utt.rate = 1.05;
+      utt.onend = () => resolve();
+      utt.onerror = () => resolve();
+      window.speechSynthesis.speak(utt);
+    } catch {
+      resolve();
+    }
+  });
+}
+
+async function playAgentSpeech(text, isQuestion = false, forceSpeak = false) {
+  if (!text) return;
+  const ttsMode = state.settings?.tts_mode || "questions_only";
+  if (!forceSpeak) {
+    if (ttsMode === "off") return;
+    if (ttsMode === "questions_only" && !isQuestion) return;
+  }
+
+  stopCurrentSpeech();
+  try {
+    const resp = await fetch("/api/voice/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    const ctype = resp.headers.get("content-type") || "";
+    if (resp.ok && ctype.includes("audio/")) {
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      await new Promise((resolve) => {
+        const audio = new Audio(url);
+        state.currentAudio = audio;
+        const done = () => {
+          URL.revokeObjectURL(url);
+          if (state.currentAudio === audio) state.currentAudio = null;
+          resolve();
+        };
+        audio.onended = done;
+        audio.onerror = done;
+        audio.play().catch(done);
+      });
+      return;
+    }
+    const data = await resp.json().catch(() => ({}));
+    if (data && data.fallback_local) {
+      await speakLocal(text);
+    }
+  } catch {
+    await speakLocal(text);
+  }
+}
+
+function setRecordingUI(active, elapsed = 0, speechDetected = false) {
   state.recording = active;
   const btn = document.getElementById("voice-btn");
   const label = document.getElementById("voice-btn-label");
@@ -155,8 +245,19 @@ function setRecordingUI(active, elapsed = 0) {
   btn.classList.toggle("recording", active);
   cancelBtn.classList.toggle("hidden", !active);
   timer.classList.toggle("hidden", !active);
-  label.textContent = active ? "Stop & Send" : "🎙️ Speak";
+  label.textContent = active ? (speechDetected ? "Listening…" : "Stop & Send") : "🎙️ Speak";
   timer.textContent = `${elapsed.toFixed(1)}s`;
+
+  const agentBtn = document.getElementById("agent-voice-btn");
+  if (agentBtn) {
+    agentBtn.classList.toggle("recording", active);
+    const agentLbl = document.getElementById("agent-voice-label");
+    if (agentLbl) {
+      agentLbl.textContent = active
+        ? (speechDetected ? `Hearing speech… (${elapsed.toFixed(1)}s)` : `Listening… (${elapsed.toFixed(1)}s)`)
+        : "🎙️ Tap to Speak";
+    }
+  }
 
   if (state.voiceTimerId) {
     clearInterval(state.voiceTimerId);
@@ -167,8 +268,39 @@ function setRecordingUI(active, elapsed = 0) {
     state.voiceTimerId = setInterval(() => {
       const sec = (performance.now() - started) / 1000;
       timer.textContent = `${sec.toFixed(1)}s`;
+      const agentLbl = document.getElementById("agent-voice-label");
+      if (agentLbl && state.recording) {
+        agentLbl.textContent = `${speechDetected ? "Hearing speech" : "Listening"}… (${sec.toFixed(1)}s)`;
+      }
     }, 100);
   }
+}
+
+function clearVoiceTimers() {
+  if (state.voiceTimerId) {
+    clearInterval(state.voiceTimerId);
+    state.voiceTimerId = null;
+  }
+  if (state.voicePollId) {
+    clearInterval(state.voicePollId);
+    state.voicePollId = null;
+  }
+}
+
+async function handleAgentResponse(res, transcriptPrefix = "") {
+  if (res.session_id) {
+    state.activeSessionId = res.session_id;
+  }
+  const msg = res.warning ? `${res.reply} (${res.warning})` : res.reply;
+  const fullToast = transcriptPrefix ? `🎙️ "${transcriptPrefix}" → ${msg}` : msg;
+  toast(fullToast || "Done!", res.warning ? "info" : "success");
+
+  if (res.navigate_to && res.navigate_to !== state.view) {
+    await switchView(res.navigate_to);
+  } else {
+    await renderCurrentView();
+  }
+  await playAgentSpeech(res.reply, Boolean(res.is_question));
 }
 
 async function submitCapture() {
@@ -177,16 +309,25 @@ async function submitCapture() {
   const text = input.value.trim();
   if (!text) return;
   btn.disabled = true;
-  btn.textContent = "Filing…";
+  btn.textContent = state.captureMode === "auto" ? "Thinking…" : "Filing…";
   try {
-    const res = await api("/api/capture", {
-      method: "POST",
-      body: { text, mode: state.captureMode, source: "text" },
-    });
-    input.value = "";
-    const msg = res.warning ? `${res.summary} (${res.warning})` : res.summary;
-    toast(msg || "Captured!", res.warning ? "info" : "success");
-    await renderCurrentView();
+    if (state.captureMode === "auto") {
+      const res = await api("/api/agent/chat", {
+        method: "POST",
+        body: { text, session_id: state.activeSessionId, source: "text" },
+      });
+      input.value = "";
+      await handleAgentResponse(res);
+    } else {
+      const res = await api("/api/capture", {
+        method: "POST",
+        body: { text, mode: state.captureMode, source: "text" },
+      });
+      input.value = "";
+      const msg = res.warning ? `${res.summary} (${res.warning})` : res.summary;
+      toast(msg || "Captured!", res.warning ? "info" : "success");
+      await renderCurrentView();
+    }
   } catch (err) {
     toast(err.message, "error");
   } finally {
@@ -195,31 +336,68 @@ async function submitCapture() {
   }
 }
 
-async function toggleVoiceRecording() {
-  const btn = document.getElementById("voice-btn");
-  if (!state.recording) {
-    try {
-      await api("/api/voice/start", { method: "POST" });
-      setRecordingUI(true, 0);
-    } catch (err) {
-      toast(err.message, "error");
-    }
-    return;
+async function startVoiceRecording() {
+  if (state.recording || state.voiceBusy) return;
+  stopCurrentSpeech();
+  try {
+    await api("/api/voice/start", {
+      method: "POST",
+      body: {
+        auto_silence: state.autoSilence,
+        silence_seconds: state.settings?.silence_seconds ?? 1.8,
+      },
+    });
+    setRecordingUI(true, 0, false);
+    if (state.voicePollId) clearInterval(state.voicePollId);
+    state.voicePollId = setInterval(async () => {
+      if (!state.recording || state.voiceBusy) return;
+      try {
+        const st = await api("/api/voice/status");
+        if (st.auto_stopped) {
+          await stopAndProcessVoice();
+        } else if (st.speech_detected) {
+          const lbl = document.getElementById("voice-btn-label");
+          if (lbl && state.recording) lbl.textContent = "Hearing…";
+        }
+      } catch {
+        // ignore transient poll errors
+      }
+    }, 250);
+  } catch (err) {
+    setRecordingUI(false, 0, false);
+    toast(err.message, "error");
   }
+}
 
+async function stopAndProcessVoice() {
+  if (!state.recording || state.voiceBusy) return;
+  state.voiceBusy = true;
+  clearVoiceTimers();
+  const btn = document.getElementById("voice-btn");
   btn.disabled = true;
   document.getElementById("voice-btn-label").textContent = "Transcribing…";
-  if (state.voiceTimerId) {
-    clearInterval(state.voiceTimerId);
-    state.voiceTimerId = null;
-  }
+  const agentLbl = document.getElementById("agent-voice-label");
+  if (agentLbl) agentLbl.textContent = "Transcribing & thinking…";
+
   try {
     const res = await api("/api/voice/stop", {
       method: "POST",
-      body: { voice_mode: state.voiceMode },
+      body: {
+        voice_mode: state.voiceMode,
+        session_id: state.activeSessionId,
+        use_agent: true,
+      },
     });
-    setRecordingUI(false, 0);
-    if (res.voice_mode === "auto_ai" && res.capture) {
+    setRecordingUI(false, 0, false);
+    if (res.voice_mode === "auto_ai" && res.agent) {
+      await handleAgentResponse(res.agent, res.transcript);
+      if (state.continuousVoice) {
+        state.voiceBusy = false;
+        btn.disabled = false;
+        await startVoiceRecording();
+        return;
+      }
+    } else if (res.voice_mode === "auto_ai" && res.capture) {
       toast(`🎙️ "${res.transcript}" → ${res.capture.summary}`, "success");
       await renderCurrentView();
     } else {
@@ -229,27 +407,62 @@ async function toggleVoiceRecording() {
       toast("🎙️ Transcribed to capture box", "info");
     }
   } catch (err) {
-    setRecordingUI(false, 0);
+    setRecordingUI(false, 0, false);
     toast(err.message, "error");
   } finally {
+    state.voiceBusy = false;
     btn.disabled = false;
   }
 }
 
+async function toggleVoiceRecording() {
+  if (!state.recording) {
+    await startVoiceRecording();
+  } else {
+    await stopAndProcessVoice();
+  }
+}
+
 async function cancelVoiceRecording() {
+  state.continuousVoice = false;
+  const contCb = document.getElementById("agent-continuous-cb");
+  if (contCb) contCb.checked = false;
+  clearVoiceTimers();
   if (!state.recording) return;
   try {
     await api("/api/voice/cancel", { method: "POST" });
   } catch {
     // ignore
   }
-  setRecordingUI(false, 0);
+  setRecordingUI(false, 0, false);
   toast("Voice recording cancelled", "info");
 }
 
 // ---------------------------------------------------------------------------
 // View 1: Hub (Today Overview)
 // ---------------------------------------------------------------------------
+
+function nextTaskStatus(status) {
+  if (status === "not_started") return "partially_completed";
+  if (status === "partially_completed") return "completed";
+  return "not_started";
+}
+
+function taskStatusIcon(status) {
+  if (status === "completed") return "✓";
+  if (status === "partially_completed") return "◐";
+  return "○";
+}
+
+function taskStatusBadge(t) {
+  if (t.status === "partially_completed") {
+    return '<span class="badge badge-art">◐ Partial</span>';
+  }
+  if (t.status === "completed") {
+    return '<span class="badge badge-gym">✓ Completed</span>';
+  }
+  return "";
+}
 
 async function renderHub() {
   const data = await api("/api/dashboard");
@@ -262,10 +475,12 @@ async function renderHub() {
         .map(
           (t) => `
       <div class="list-row">
-        <input type="checkbox" class="checkbox" data-hub-task="${t.id}" />
+        <button type="button" class="status-btn ${esc(t.status)}" data-hub-cycle="${t.id}" data-cur="${esc(t.status)}" title="Cycle: Not Started → Partial → Completed">${taskStatusIcon(t.status)}</button>
         <div class="row-main">
           <div class="row-title">${esc(t.title)}</div>
           <div class="row-meta">
+            ${taskStatusBadge(t)}
+            ${t.checklist_total ? `<span class="badge">${t.checklist_done}/${t.checklist_total}</span>` : ""}
             ${t.priority === "high" ? '<span class="badge badge-high">High</span>' : ""}
             ${t.due_date ? `<span>Due ${esc(t.due_date)}</span>` : ""}
           </div>
@@ -408,9 +623,10 @@ async function renderHub() {
     await api("/api/activity-days", { method: "POST", body: { domain: "art" } });
     await renderHub();
   });
-  el.querySelectorAll("[data-hub-task]").forEach((cb) => {
-    cb.addEventListener("change", async () => {
-      await api(`/api/tasks/${cb.dataset.hubTask}`, { method: "PATCH", body: { done: cb.checked } });
+  el.querySelectorAll("[data-hub-cycle]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const next = nextTaskStatus(btn.dataset.cur);
+      await api(`/api/tasks/${btn.dataset.hubCycle}`, { method: "PATCH", body: { status: next } });
       await renderHub();
     });
   });
@@ -439,37 +655,98 @@ async function renderHub() {
 async function renderTasks() {
   const { items } = await api("/api/tasks");
   state.tasks = items;
-  const daily = items.filter((t) => t.list_type === "daily");
-  const want = items.filter((t) => t.list_type === "want_to_do");
 
-  const renderTaskRow = (t, isWant) => `
-    <div class="list-row ${t.done ? "done" : ""}">
-      <input type="checkbox" class="checkbox" data-task-done="${t.id}" ${t.done ? "checked" : ""} />
-      <div class="row-main">
-        <div class="row-title">${esc(t.title)}</div>
-        <div class="row-meta">
-          ${t.priority === "high" ? '<span class="badge badge-high">High</span>' : ""}
-          ${t.category ? `<span class="badge">${esc(t.category)}</span>` : ""}
-          ${t.due_date ? `<span>Due ${esc(t.due_date)}</span>` : ""}
+  const filterMatches = (t) =>
+    state.taskFilter === "all" ? true : t.status === state.taskFilter;
+
+  const daily = items.filter((t) => t.list_type === "daily" && filterMatches(t));
+  const want = items.filter((t) => t.list_type === "want_to_do" && filterMatches(t));
+
+  const counts = {
+    all: items.length,
+    not_started: items.filter((t) => t.status === "not_started").length,
+    partially_completed: items.filter((t) => t.status === "partially_completed").length,
+    completed: items.filter((t) => t.status === "completed").length,
+  };
+
+  const renderTaskRow = (t, isWant) => {
+    const pct = t.checklist_total ? Math.round((t.checklist_done / t.checklist_total) * 100) : 0;
+    return `
+    <div class="task-card ${esc(t.status)}">
+      <div style="display:flex;align-items:flex-start;gap:10px;">
+        <button type="button" class="status-btn ${esc(t.status)}" data-task-cycle="${t.id}" data-cur="${esc(t.status)}" title="Cycle: Not Started → Partially Completed → Completed">
+          ${taskStatusIcon(t.status)}
+        </button>
+        <div class="row-main">
+          <div class="row-title">${esc(t.title)}</div>
+          <div class="row-meta">
+            ${taskStatusBadge(t)}
+            ${t.checklist_total ? `<span class="badge">${t.checklist_done}/${t.checklist_total} steps</span>` : ""}
+            ${t.priority === "high" ? '<span class="badge badge-high">High</span>' : ""}
+            ${t.category ? `<span class="badge">${esc(t.category)}</span>` : ""}
+            ${t.due_date ? `<span>Due ${esc(t.due_date)}</span>` : ""}
+            ${t.progress_note ? `<span style="color:var(--art)">Note: ${esc(t.progress_note)}</span>` : ""}
+          </div>
+          ${
+            t.checklist_total
+              ? `<div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>`
+              : ""
+          }
+        </div>
+        <div class="row-actions">
+          ${
+            isWant
+              ? `<button class="btn btn-xs btn-ghost" data-move-list="${t.id}" data-target="daily" title="Move to Daily Tasks">→ Daily</button>`
+              : `<button class="btn btn-xs btn-ghost" data-move-list="${t.id}" data-target="want_to_do" title="Move to Want to Do">→ Someday</button>`
+          }
+          <button class="btn btn-xs btn-danger" data-del-task="${t.id}" title="Delete">✕</button>
         </div>
       </div>
-      <div class="row-actions">
-        ${
-          isWant
-            ? `<button class="btn btn-xs btn-ghost" data-move-list="${t.id}" data-target="daily" title="Move to Daily Tasks">→ Daily</button>`
-            : `<button class="btn btn-xs btn-ghost" data-move-list="${t.id}" data-target="want_to_do" title="Move to Want to Do">→ Someday</button>`
-        }
-        <button class="btn btn-xs btn-danger" data-del-task="${t.id}" title="Delete">✕</button>
+
+      <div class="checklist-box">
+        ${(t.checklist_items || [])
+          .map(
+            (sub) => `
+          <div class="sub-item-row ${sub.done ? "done" : ""}">
+            <input type="checkbox" class="checkbox" data-sub-toggle="${t.id}" data-sub-id="${sub.id}" ${sub.done ? "checked" : ""} />
+            <span style="flex:1">${esc(sub.text)}</span>
+            <button type="button" class="btn btn-xs btn-ghost" data-sub-del="${t.id}" data-sub-id="${sub.id}" title="Remove step">✕</button>
+          </div>`
+          )
+          .join("")}
+        <form class="sub-add-form" data-sub-add-form="${t.id}">
+          <input class="input" type="text" placeholder="+ Add checklist step…" />
+          <button type="submit" class="btn btn-xs btn-ghost">Add</button>
+        </form>
       </div>
     </div>`;
+  };
+
+  const tabs = [
+    { key: "all", label: "All" },
+    { key: "not_started", label: "○ Not Started" },
+    { key: "partially_completed", label: "◐ Partially Completed" },
+    { key: "completed", label: "✓ Completed" },
+  ];
 
   const el = document.getElementById("view-tasks");
   el.innerHTML = `
     <div class="view-header">
       <div>
         <h1 class="view-title">✅ Tasks &amp; Want to Do</h1>
-        <p class="view-sub">Actionable daily to-dos on the left, someday ideas &amp; bucket items on the right</p>
+        <p class="view-sub">3-state checklist tasks (Not Started · ◐ Partial · ✓ Completed) — checking sub-steps updates progress automatically</p>
       </div>
+    </div>
+
+    <div class="tab-bar">
+      ${tabs
+        .map(
+          (tab) => `
+        <button class="tab-btn ${state.taskFilter === tab.key ? "active" : ""}" data-task-filter="${tab.key}">
+          ${tab.label} (${counts[tab.key]})
+        </button>`
+        )
+        .join("")}
     </div>
 
     <div class="grid-2">
@@ -478,7 +755,8 @@ async function renderTasks() {
           <h2 class="card-title">Daily Tasks <span class="badge badge-accent">${daily.filter((x) => !x.done).length} open</span></h2>
         </div>
         <form id="form-daily-task" class="inline-form">
-          <input id="daily-title" class="input grow" type="text" placeholder="Add daily task…" required />
+          <input id="daily-title" class="input grow" type="text" placeholder="Task title…" required />
+          <input id="daily-steps" class="input grow" type="text" placeholder="Checklist steps (comma-separated, optional)" />
           <select id="daily-priority">
             <option value="normal">Normal</option>
             <option value="high">High</option>
@@ -487,7 +765,7 @@ async function renderTasks() {
           <button type="submit" class="btn btn-primary btn-sm">Add</button>
         </form>
         <div class="item-list">
-          ${daily.length ? daily.map((t) => renderTaskRow(t, false)).join("") : '<div class="empty-state">No daily tasks yet.</div>'}
+          ${daily.length ? daily.map((t) => renderTaskRow(t, false)).join("") : '<div class="empty-state">No matching daily tasks.</div>'}
         </div>
       </div>
 
@@ -496,21 +774,34 @@ async function renderTasks() {
           <h2 class="card-title">Want to Do / Someday <span class="badge">${want.filter((x) => !x.done).length} open</span></h2>
         </div>
         <form id="form-want-task" class="inline-form">
-          <input id="want-title" class="input grow" type="text" placeholder="Add thing you want to do…" required />
-          <input id="want-cat" class="input" type="text" placeholder="Tag (optional)" style="width:120px" />
+          <input id="want-title" class="input grow" type="text" placeholder="Thing you want to do…" required />
+          <input id="want-steps" class="input grow" type="text" placeholder="Checklist steps (optional)" />
+          <input id="want-cat" class="input" type="text" placeholder="Tag" style="width:100px" />
           <button type="submit" class="btn btn-primary btn-sm">Add</button>
         </form>
         <div class="item-list">
-          ${want.length ? want.map((t) => renderTaskRow(t, true)).join("") : '<div class="empty-state">Add ideas, trips, or skills you want to try!</div>'}
+          ${want.length ? want.map((t) => renderTaskRow(t, true)).join("") : '<div class="empty-state">No matching someday items.</div>'}
         </div>
       </div>
     </div>
   `;
 
+  el.querySelectorAll("[data-task-filter]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      state.taskFilter = btn.dataset.taskFilter;
+      await renderTasks();
+    });
+  });
+
   el.querySelector("#form-daily-task").addEventListener("submit", async (e) => {
     e.preventDefault();
     const title = el.querySelector("#daily-title").value.trim();
     if (!title) return;
+    const rawSteps = el.querySelector("#daily-steps").value;
+    const checklistItems = rawSteps
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
     await api("/api/tasks", {
       method: "POST",
       body: {
@@ -518,6 +809,7 @@ async function renderTasks() {
         list_type: "daily",
         priority: el.querySelector("#daily-priority").value,
         due_date: el.querySelector("#daily-due").value || null,
+        checklist_items: checklistItems,
       },
     });
     await renderTasks();
@@ -527,20 +819,60 @@ async function renderTasks() {
     e.preventDefault();
     const title = el.querySelector("#want-title").value.trim();
     if (!title) return;
+    const rawSteps = el.querySelector("#want-steps").value;
+    const checklistItems = rawSteps
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
     await api("/api/tasks", {
       method: "POST",
       body: {
         title,
         list_type: "want_to_do",
         category: el.querySelector("#want-cat").value.trim(),
+        checklist_items: checklistItems,
       },
     });
     await renderTasks();
   });
 
-  el.querySelectorAll("[data-task-done]").forEach((cb) => {
+  el.querySelectorAll("[data-task-cycle]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const next = nextTaskStatus(btn.dataset.cur);
+      await api(`/api/tasks/${btn.dataset.taskCycle}`, { method: "PATCH", body: { status: next } });
+      await renderTasks();
+    });
+  });
+
+  el.querySelectorAll("[data-sub-toggle]").forEach((cb) => {
     cb.addEventListener("change", async () => {
-      await api(`/api/tasks/${cb.dataset.taskDone}`, { method: "PATCH", body: { done: cb.checked } });
+      await api(`/api/tasks/${cb.dataset.subToggle}/items/${cb.dataset.subId}`, {
+        method: "PATCH",
+        body: { done: cb.checked },
+      });
+      await renderTasks();
+    });
+  });
+
+  el.querySelectorAll("[data-sub-del]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      await api(`/api/tasks/${btn.dataset.subDel}/items/${btn.dataset.subId}`, {
+        method: "DELETE",
+      });
+      await renderTasks();
+    });
+  });
+
+  el.querySelectorAll("[data-sub-add-form]").forEach((form) => {
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const input = form.querySelector("input");
+      const text = input.value.trim();
+      if (!text) return;
+      await api(`/api/tasks/${form.dataset.subAddForm}/items`, {
+        method: "POST",
+        body: { text },
+      });
       await renderTasks();
     });
   });
@@ -576,12 +908,20 @@ async function renderNotes() {
   const active = items.find((n) => n.id === state.activeNoteId) || null;
   const hasFolder = Boolean(state.settings?.notes_folder);
 
+  const noteChkBadge = (n) => {
+    const c = n.checklist;
+    if (!c || !c.total) return "";
+    if (c.status === "completed") return `<span class="badge badge-gym">✓ ${c.done}/${c.total}</span>`;
+    if (c.status === "partially_completed") return `<span class="badge badge-art">◐ ${c.done}/${c.total}</span>`;
+    return `<span class="badge">☐ ${c.done}/${c.total}</span>`;
+  };
+
   const el = document.getElementById("view-notes");
   el.innerHTML = `
     <div class="view-header">
       <div>
         <h1 class="view-title">📝 Notes</h1>
-        <p class="view-sub">Fast notes with tags, search, and safe local .md/.txt folder sync</p>
+        <p class="view-sub">Fast notes &amp; lecture logs with tags, interactive checklists, and local .md/.txt folder sync</p>
       </div>
       <div style="display:flex; gap:8px; flex-wrap:wrap;">
         <button id="notes-sync-btn" class="btn btn-ghost btn-sm" ${hasFolder ? "" : "title='Configure a folder in Settings first'"}>
@@ -604,6 +944,7 @@ async function renderNotes() {
                 <div class="row-title">${n.pinned ? "📌 " : ""}${esc(n.title)}</div>
                 <div class="row-meta">
                   <span>${esc(n.updated_at.slice(0, 10))}</span>
+                  ${noteChkBadge(n)}
                   ${n.source_path ? '<span class="badge badge-accent">Synced</span>' : ""}
                   ${n.tags.map((t) => `<span class="badge">#${esc(t)}</span>`).join("")}
                 </div>
@@ -626,8 +967,31 @@ async function renderNotes() {
               <button id="note-save-btn" class="btn btn-sm btn-primary">Save</button>
               <button id="note-del-btn" class="btn btn-sm btn-danger">Delete</button>
             </div>
-            <input id="note-edit-tags" class="input" type="text" value="${esc(active.tags.join(", "))}" placeholder="Comma-separated tags (e.g. ideas, study)" />
-            <textarea id="note-edit-content" placeholder="Write your note here…">${esc(active.content)}</textarea>
+            <input id="note-edit-tags" class="input" type="text" value="${esc(active.tags.join(", "))}" placeholder="Comma-separated tags (e.g. lecture, AI, research)" />
+            <div class="note-checklist-panel">
+              <div style="display:flex;align-items:center;justify-content:space-between;">
+                <span class="field-label">Checklist / Research Later</span>
+                ${noteChkBadge(active)}
+              </div>
+              ${
+                active.checklist && active.checklist.total
+                  ? active.checklist.items
+                      .map(
+                        (ci) => `
+                      <div class="sub-item-row ${ci.done ? "done" : ""}">
+                        <input type="checkbox" class="checkbox" data-note-chk-idx="${ci.index}" ${ci.done ? "checked" : ""} />
+                        <span>${esc(ci.text)}</span>
+                      </div>`
+                      )
+                      .join("")
+                  : '<div style="font-size:12px;color:var(--muted)">Add `- [ ]` items below or ask the Voice Agent mid-lecture.</div>'
+              }
+              <form id="note-add-chk-form" class="sub-add-form">
+                <input id="note-add-chk-input" class="input" type="text" placeholder="+ Add checklist / research-later item…" />
+                <button type="submit" class="btn btn-xs btn-ghost">Add</button>
+              </form>
+            </div>
+            <textarea id="note-edit-content" placeholder="Write your note here… (use '- [ ] item' for checkboxes)">${esc(active.content)}</textarea>
             <div class="row-meta">
               <span>Updated ${esc(active.updated_at)}</span>
               ${active.source_path ? `<span>File: ${esc(active.source_path)}</span>` : ""}
@@ -698,6 +1062,28 @@ async function renderNotes() {
   });
 
   if (active) {
+    el.querySelectorAll("[data-note-chk-idx]").forEach((cb) => {
+      cb.addEventListener("change", async () => {
+        await api(`/api/notes/${active.id}/checklist-toggle`, {
+          method: "POST",
+          body: { item_index: Number(cb.dataset.noteChkIdx), done: cb.checked },
+        });
+        await renderNotes();
+      });
+    });
+    const chkForm = el.querySelector("#note-add-chk-form");
+    if (chkForm) {
+      chkForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const text = el.querySelector("#note-add-chk-input").value.trim();
+        if (!text) return;
+        await api(`/api/notes/${active.id}/append`, {
+          method: "POST",
+          body: { checklist_items: [text] },
+        });
+        await renderNotes();
+      });
+    }
     el.querySelector("#note-save-btn").addEventListener("click", async () => {
       await api(`/api/notes/${active.id}`, {
         method: "PATCH",
@@ -1403,122 +1789,258 @@ async function renderGaming() {
 }
 
 // ---------------------------------------------------------------------------
-// View 7: Ask AI & Search Everything
+// View 7: Voice Agent Console (Multi-Turn Tool Calling + TTS)
 // ---------------------------------------------------------------------------
 
 async function renderAsk() {
-  const el = document.getElementById("view-ask");
+  const sessData = await api("/api/agent/sessions");
+  const sessions = sessData.sessions || [];
+  state.agentSessions = sessions;
+  if (!state.activeSessionId && sessions.length) {
+    state.activeSessionId = sessions[0].id;
+  }
+
+  let messages = [];
+  if (state.activeSessionId) {
+    try {
+      const detail = await api(`/api/agent/sessions/${state.activeSessionId}`);
+      messages = detail.session?.messages || [];
+    } catch {
+      state.activeSessionId = sessions.length ? sessions[0].id : null;
+    }
+  }
+  state.agentMessages = messages;
+
+  const ttsMode = state.settings?.tts_mode || "questions_only";
   const examples = [
-    "What are my open daily tasks?",
-    "Summarize my recent gym progress and PBs",
-    "What notes do I have?",
-    "What games am I playing or want to play?",
+    "I went to the gym, did squats 100kg 3x5, drew a sketch today, and watched an ML lecture tagged AI, neural-nets",
+    "Add to that lecture note: research vanishing gradients later",
+    "Make a daily task to clean my room with steps: desk, cables, closet",
+    "What is partially completed or still open right now?",
   ];
 
-  const res = state.askResult;
+  const el = document.getElementById("view-ask");
   el.innerHTML = `
     <div class="view-header">
       <div>
-        <h1 class="view-title">🤖 Ask My Notes &amp; Life</h1>
-        <p class="view-sub">Ask Groq AI or search across your notes, tasks, gym logs, art, and games</p>
+        <h1 class="view-title">🎙️ Voice Agent Console</h1>
+        <p class="view-sub">Talk across multiple turns — auto-stops on silence, calls tools, and organizes checklists &amp; lecture notes</p>
       </div>
+      <button id="agent-new-session" class="btn btn-primary btn-sm">+ New Conversation</button>
     </div>
 
-    <div class="card" style="margin-bottom:16px;">
-      <form id="ask-form" class="inline-form">
-        <input id="ask-input" class="input grow" type="text" value="${esc(state.askQuery)}" placeholder="Ask anything about your notes, workouts, tasks, or hobbies…" required />
-        <button id="ask-submit-btn" type="submit" class="btn btn-primary">Ask</button>
-      </form>
-      <div style="display:flex;gap:6px;flex-wrap:wrap;">
-        ${examples
-          .map(
-            (q) =>
-              `<button type="button" class="mode-pill" data-ask-example="${esc(q)}">${esc(q)}</button>`
-          )
-          .join("")}
-      </div>
-    </div>
-
-    ${
-      res
-        ? `
-      <div class="card" style="margin-bottom:16px;">
-        <div class="card-header">
-          <h2 class="card-title">Answer</h2>
-          <span class="badge ${res.ai_used ? "badge-gym" : ""}">
-            ${res.ai_used ? `Groq · ${esc(res.model)}` : "Local Search Mode"}
-          </span>
+    <div class="agent-layout">
+      <div class="card" style="display:flex;flex-direction:column;gap:8px;">
+        <div class="card-header" style="margin-bottom:4px;">
+          <h2 class="card-title">Conversations</h2>
         </div>
-        <div class="answer-box">${esc(res.answer)}</div>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <h2 class="card-title">Matching Sources <span class="badge">${(res.sources || []).length}</span></h2>
-        </div>
-        <div class="item-list">
+        <div class="item-list" style="max-height:480px;overflow-y:auto;">
           ${
-            res.sources && res.sources.length
-              ? res.sources
+            sessions.length
+              ? sessions
                   .map(
                     (s) => `
-                  <div class="list-row" data-source-jump="${esc(s.type)}" data-source-id="${s.id}" style="cursor:pointer;">
-                    <span class="badge badge-accent">${esc(s.type.toUpperCase())}</span>
-                    <div class="row-main">
-                      <div class="row-title">${esc(s.title)}</div>
-                      <div class="row-meta">
-                        <span>${esc(s.meta || "")}</span>
-                        <span>${esc((s.snippet || "").slice(0, 120))}</span>
-                      </div>
+                  <div class="note-list-item ${s.id === state.activeSessionId ? "active" : ""}" style="display:flex;align-items:center;gap:6px;" data-agent-sess="${s.id}">
+                    <div style="flex:1;min-width:0;">
+                      <div class="row-title" style="font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(s.title)}</div>
+                      <div class="row-meta">${esc(s.updated_at.slice(0, 16).replace("T", " "))}</div>
                     </div>
+                    <button type="button" class="btn btn-xs btn-ghost" data-del-sess="${s.id}" title="Delete conversation">✕</button>
                   </div>`
                   )
                   .join("")
-              : '<div class="empty-state">No direct source records matched.</div>'
+              : '<div class="empty-state">Tap Speak or type below to start a session!</div>'
           }
         </div>
-      </div>`
-        : ""
-    }
+      </div>
+
+      <div class="card" style="display:flex;flex-direction:column;gap:10px;">
+        <div class="agent-hero">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <button id="agent-voice-btn" type="button" class="btn-voice btn-voice-lg ${state.recording ? "recording" : ""}">
+              <span class="voice-dot"></span>
+              <span id="agent-voice-label">${state.recording ? "Listening…" : "🎙️ Tap to Speak"}</span>
+            </button>
+            ${
+              state.recording
+                ? '<button id="agent-voice-cancel" type="button" class="btn btn-ghost btn-sm">Cancel</button>'
+                : ""
+            }
+          </div>
+
+          <div class="agent-toggles">
+            <label title="Automatically send when you pause speaking">
+              <input id="agent-autosilence-cb" type="checkbox" ${state.autoSilence ? "checked" : ""} />
+              Auto-stop on pause
+            </label>
+            <label title="Keep listening again after the agent finishes replying">
+              <input id="agent-continuous-cb" type="checkbox" ${state.continuousVoice ? "checked" : ""} />
+              Continuous loop
+            </label>
+            <label>
+              🔊
+              <select id="agent-tts-select" style="padding:3px 7px;font-size:12px;">
+                <option value="questions_only" ${ttsMode === "questions_only" ? "selected" : ""}>Questions Only</option>
+                <option value="all" ${ttsMode === "all" ? "selected" : ""}>Speak All</option>
+                <option value="off" ${ttsMode === "off" ? "selected" : ""}>Muted</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div id="agent-chat-feed" class="chat-feed">
+          ${
+            messages.length
+              ? messages
+                  .map(
+                    (m) => `
+                  <div class="chat-bubble ${esc(m.role)}">
+                    <div class="chat-meta">
+                      <strong>${m.role === "user" ? (m.source === "voice" ? "🎙️ You" : "You") : "🤖 Agent"}</strong>
+                      <span>${esc((m.created_at || "").slice(11, 16))}</span>
+                      ${
+                        m.role === "assistant"
+                          ? `<button type="button" class="btn btn-xs btn-ghost" data-replay-tts="${esc(m.content)}" title="Speak reply">🔊</button>`
+                          : ""
+                      }
+                    </div>
+                    <div>${esc(m.content)}</div>
+                    ${
+                      m.actions && m.actions.length
+                        ? `<div class="action-chips">
+                            ${m.actions
+                              .map(
+                                (a) =>
+                                  `<button type="button" class="action-chip" data-chip-domain="${esc(a.domain || "")}" data-chip-id="${a.item_id ?? ""}">${esc(a.label)}</button>`
+                              )
+                              .join("")}
+                          </div>`
+                        : ""
+                    }
+                  </div>`
+                  )
+                  .join("")
+              : `
+                <div class="empty-state" style="text-align:left;padding:10px 4px;">
+                  <div style="margin-bottom:10px;color:var(--text);font-weight:600;">Try speaking or clicking an example:</div>
+                  <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                    ${examples
+                      .map(
+                        (q) =>
+                          `<button type="button" class="mode-pill" data-agent-example="${esc(q)}">${esc(q)}</button>`
+                      )
+                      .join("")}
+                  </div>
+                </div>`
+          }
+        </div>
+
+        <form id="agent-chat-form" class="inline-form" style="margin-bottom:0;margin-top:auto;">
+          <input id="agent-chat-input" class="input grow" type="text" placeholder="Message the agent (or press Alt+V to speak)…" required />
+          <button id="agent-chat-send" type="submit" class="btn btn-primary">Send</button>
+        </form>
+      </div>
+    </div>
   `;
 
-  const runAsk = async (question) => {
-    state.askQuery = question;
-    const btn = el.querySelector("#ask-submit-btn");
-    btn.disabled = true;
-    btn.textContent = "Thinking…";
+  const feed = el.querySelector("#agent-chat-feed");
+  if (feed) {
+    feed.scrollTop = feed.scrollHeight;
+  }
+
+  const sendAgentText = async (text) => {
+    const sendBtn = el.querySelector("#agent-chat-send");
+    if (sendBtn) {
+      sendBtn.disabled = true;
+      sendBtn.textContent = "Thinking…";
+    }
     try {
-      state.askResult = await api("/api/ai/ask", { method: "POST", body: { question } });
-      await renderAsk();
+      const res = await api("/api/agent/chat", {
+        method: "POST",
+        body: { text, session_id: state.activeSessionId, source: "text" },
+      });
+      await handleAgentResponse(res);
     } finally {
-      if (document.body.contains(btn)) {
-        btn.disabled = false;
-        btn.textContent = "Ask";
+      if (sendBtn && document.body.contains(sendBtn)) {
+        sendBtn.disabled = false;
+        sendBtn.textContent = "Send";
       }
     }
   };
 
-  el.querySelector("#ask-form").addEventListener("submit", async (e) => {
+  el.querySelector("#agent-new-session").addEventListener("click", async () => {
+    const res = await api("/api/agent/sessions", { method: "POST", body: { title: "New Session" } });
+    state.activeSessionId = res.session.id;
+    await renderAsk();
+  });
+
+  el.querySelectorAll("[data-agent-sess]").forEach((row) => {
+    row.addEventListener("click", async (e) => {
+      if (e.target.closest("[data-del-sess]")) return;
+      state.activeSessionId = Number(row.dataset.agentSess);
+      await renderAsk();
+    });
+  });
+
+  el.querySelectorAll("[data-del-sess]").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const id = Number(btn.dataset.delSess);
+      await api(`/api/agent/sessions/${id}`, { method: "DELETE" });
+      if (state.activeSessionId === id) state.activeSessionId = null;
+      await renderAsk();
+    });
+  });
+
+  el.querySelector("#agent-voice-btn").addEventListener("click", toggleVoiceRecording);
+  const cancelBtn = el.querySelector("#agent-voice-cancel");
+  if (cancelBtn) {
+    cancelBtn.addEventListener("click", cancelVoiceRecording);
+  }
+
+  el.querySelector("#agent-autosilence-cb").addEventListener("change", async (e) => {
+    state.autoSilence = e.target.checked;
+    await api("/api/settings", { method: "PATCH", body: { auto_silence: state.autoSilence } }).catch(() => {});
+  });
+
+  el.querySelector("#agent-continuous-cb").addEventListener("change", (e) => {
+    state.continuousVoice = e.target.checked;
+  });
+
+  el.querySelector("#agent-tts-select").addEventListener("change", async (e) => {
+    const tts_mode = e.target.value;
+    await api("/api/settings", { method: "PATCH", body: { tts_mode } });
+    await refreshSettingsBadge();
+  });
+
+  el.querySelector("#agent-chat-form").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const q = el.querySelector("#ask-input").value.trim();
-    if (q) await runAsk(q);
+    const input = el.querySelector("#agent-chat-input");
+    const txt = input.value.trim();
+    if (!txt) return;
+    input.value = "";
+    await sendAgentText(txt);
   });
 
-  el.querySelectorAll("[data-ask-example]").forEach((btn) => {
-    btn.addEventListener("click", () => runAsk(btn.dataset.askExample));
+  el.querySelectorAll("[data-agent-example]").forEach((btn) => {
+    btn.addEventListener("click", () => sendAgentText(btn.dataset.agentExample));
   });
 
-  el.querySelectorAll("[data-source-jump]").forEach((row) => {
-    row.addEventListener("click", () => {
-      const t = row.dataset.sourceJump;
-      const id = Number(row.dataset.sourceId);
-      if (t === "note") {
-        state.activeNoteId = id;
+  el.querySelectorAll("[data-replay-tts]").forEach((btn) => {
+    btn.addEventListener("click", () => playAgentSpeech(btn.dataset.replayTts, true, true));
+  });
+
+  el.querySelectorAll("[data-chip-domain]").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const dom = chip.dataset.chipDomain;
+      const id = chip.dataset.chipId ? Number(chip.dataset.chipId) : null;
+      if (dom === "note") {
+        if (id) state.activeNoteId = id;
         switchView("notes");
-      } else if (t === "task") switchView("tasks");
-      else if (t === "gym") switchView("gym");
-      else if (t === "art") switchView("art");
-      else if (t === "game") switchView("gaming");
+      } else if (dom === "task" || dom === "want_to_do") switchView("tasks");
+      else if (dom === "gym") switchView("gym");
+      else if (dom === "art") switchView("art");
+      else if (dom === "game") switchView("gaming");
     });
   });
 }
@@ -1595,7 +2117,7 @@ async function renderSettings() {
           <div class="field-group">
             <label class="field-label">Default Voice Action</label>
             <select id="set-voice-mode">
-              <option value="auto_ai" ${settings.voice_mode === "auto_ai" ? "selected" : ""}>Transcribe &amp; Auto-File via AI</option>
+              <option value="auto_ai" ${settings.voice_mode === "auto_ai" ? "selected" : ""}>Transcribe &amp; Run Voice Agent</option>
               <option value="fill_input" ${settings.voice_mode === "fill_input" ? "selected" : ""}>Transcribe into Quick-Capture Box</option>
             </select>
           </div>
@@ -1605,6 +2127,63 @@ async function renderSettings() {
               <option value="kg" ${settings.weight_unit === "kg" ? "selected" : ""}>Kilograms (kg)</option>
               <option value="lbs" ${settings.weight_unit === "lbs" ? "selected" : ""}>Pounds (lbs)</option>
             </select>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div class="field-group">
+            <label class="field-label">Auto-Stop Recording on Silence</label>
+            <select id="set-auto-silence">
+              <option value="true" ${settings.auto_silence ? "selected" : ""}>Enabled (hands-free)</option>
+              <option value="false" ${!settings.auto_silence ? "selected" : ""}>Manual tap Start/Stop only</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <label class="field-label">Silence Pause Delay</label>
+            <select id="set-silence-seconds">
+              ${[1.2, 1.8, 2.5, 3.5]
+                .map(
+                  (sec) =>
+                    `<option value="${sec}" ${Number(settings.silence_seconds) === sec ? "selected" : ""}>${sec}s pause</option>`
+                )
+                .join("")}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><h2 class="card-title">🔊 Spoken Replies (TTS)</h2></div>
+        <div class="grid-3">
+          <div class="field-group">
+            <label class="field-label">When to Speak</label>
+            <select id="set-tts-mode">
+              <option value="questions_only" ${settings.tts_mode === "questions_only" ? "selected" : ""}>Questions &amp; Clarifications Only</option>
+              <option value="all" ${settings.tts_mode === "all" ? "selected" : ""}>All Agent Replies</option>
+              <option value="off" ${settings.tts_mode === "off" ? "selected" : ""}>Muted / Visual Only</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <label class="field-label">TTS Provider</label>
+            <select id="set-tts-provider">
+              <option value="groq" ${settings.tts_provider === "groq" ? "selected" : ""}>Groq Orpheus + Local Fallback</option>
+              <option value="local" ${settings.tts_provider === "local" ? "selected" : ""}>Windows / Edge Built-in Only</option>
+              <option value="google" ${settings.tts_provider === "google" ? "selected" : ""}>Google TTS (Fallback Until Configured)</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <label class="field-label">Groq Orpheus Voice</label>
+            <div class="field-row">
+              <select id="set-tts-voice">
+                ${(settings.allowed_tts_voices || ["troy", "hannah", "autumn", "diana", "austin", "daniel"])
+                  .map(
+                    (v) =>
+                      `<option value="${esc(v)}" ${settings.tts_voice === v ? "selected" : ""}>${esc(v)}</option>`
+                  )
+                  .join("")}
+              </select>
+              <button id="set-test-tts" type="button" class="btn btn-ghost btn-sm">🔊 Test</button>
+            </div>
           </div>
         </div>
       </div>
@@ -1680,6 +2259,11 @@ async function renderSettings() {
       voice_mode: el.querySelector("#set-voice-mode").value,
       weight_unit: el.querySelector("#set-weight-unit").value,
       notes_folder: el.querySelector("#set-notes-folder").value.trim(),
+      auto_silence: el.querySelector("#set-auto-silence").value === "true",
+      silence_seconds: Number(el.querySelector("#set-silence-seconds").value || 1.8),
+      tts_mode: el.querySelector("#set-tts-mode").value,
+      tts_provider: el.querySelector("#set-tts-provider").value,
+      tts_voice: el.querySelector("#set-tts-voice").value,
       mic_device: (() => {
         const raw = el.querySelector("#set-mic-device").value;
         return raw === "" ? null : Number(raw);
@@ -1692,6 +2276,11 @@ async function renderSettings() {
     await api("/api/settings", { method: "PATCH", body: payload });
     await refreshSettingsBadge();
   };
+
+  el.querySelector("#set-test-tts").addEventListener("click", async () => {
+    await saveAllSettings();
+    await playAgentSpeech("Hey! Your Personal Life Hub voice agent is ready.", true, true);
+  });
 
   el.querySelector("#set-sync-now").addEventListener("click", async () => {
     await saveAllSettings();
