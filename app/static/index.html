@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Personal Life Hub</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Left Navigation Sidebar -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-logo">⚡</div>
+        <div>
+          <div class="brand-title">Life Hub</div>
+          <div class="brand-sub" id="sidebar-today">Today</div>
+        </div>
+      </div>
+
+      <nav class="nav-list" id="nav-list">
+        <button class="nav-item active" data-view="hub" title="Alt+1">
+          <span class="nav-icon">🏠</span>
+          <span>Hub</span>
+          <kbd>1</kbd>
+        </button>
+        <button class="nav-item" data-view="tasks" title="Alt+2">
+          <span class="nav-icon">✅</span>
+          <span>Tasks &amp; Want</span>
+          <kbd>2</kbd>
+        </button>
+        <button class="nav-item" data-view="notes" title="Alt+3">
+          <span class="nav-icon">📝</span>
+          <span>Notes</span>
+          <kbd>3</kbd>
+        </button>
+        <button class="nav-item" data-view="gym" title="Alt+4">
+          <span class="nav-icon">🏋️</span>
+          <span>Gym</span>
+          <kbd>4</kbd>
+        </button>
+        <button class="nav-item" data-view="art" title="Alt+5">
+          <span class="nav-icon">🎨</span>
+          <span>Art</span>
+          <kbd>5</kbd>
+        </button>
+        <button class="nav-item" data-view="gaming" title="Alt+6">
+          <span class="nav-icon">🎮</span>
+          <span>Gaming</span>
+          <kbd>6</kbd>
+        </button>
+        <button class="nav-item" data-view="ask" title="Alt+7">
+          <span class="nav-icon">🤖</span>
+          <span>Ask AI &amp; Search</span>
+          <kbd>7</kbd>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="ai-pill" id="sidebar-ai-status">Groq: Checking…</div>
+        <button class="nav-item" data-view="settings" title="Alt+8">
+          <span class="nav-icon">⚙️</span>
+          <span>Settings</span>
+          <kbd>8</kbd>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main Workspace -->
+    <div class="main-area">
+      <!-- Pinned Top Quick-Capture + Voice Bar -->
+      <header class="capture-bar">
+        <div class="capture-input-wrap">
+          <input
+            id="capture-input"
+            type="text"
+            placeholder="Quick capture anything… e.g. 'Bench 80kg 3x8, buy sketchbook, want to play Hollow Knight'  (Ctrl+K)"
+            autocomplete="off"
+          />
+          <button id="capture-submit-btn" class="btn btn-primary" title="Save / Auto-File (Enter)">
+            Capture
+          </button>
+        </div>
+
+        <div class="capture-controls">
+          <div class="mode-pills" id="capture-modes">
+            <button class="mode-pill active" data-mode="auto">✨ Auto AI</button>
+            <button class="mode-pill" data-mode="task">Task</button>
+            <button class="mode-pill" data-mode="want_to_do">Want</button>
+            <button class="mode-pill" data-mode="note">Note</button>
+            <button class="mode-pill" data-mode="gym">Gym</button>
+            <button class="mode-pill" data-mode="art">Art</button>
+            <button class="mode-pill" data-mode="game">Game</button>
+          </div>
+
+          <div class="voice-group">
+            <button id="voice-btn" class="btn-voice" title="Voice Capture (Alt+V or Ctrl+Space)">
+              <span class="voice-dot"></span>
+              <span id="voice-btn-label">🎙️ Speak</span>
+              <span id="voice-timer" class="voice-timer hidden">0.0s</span>
+            </button>
+            <button id="voice-cancel-btn" class="btn btn-ghost btn-sm hidden" title="Cancel recording (Esc)">
+              Cancel
+            </button>
+            <button id="voice-mode-toggle" class="btn btn-ghost btn-sm" title="Switch what happens after voice transcription">
+              Auto-file
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <!-- Views Container -->
+      <main class="view-container">
+        <!-- View 1: Hub (Today) -->
+        <section id="view-hub" class="view active"></section>
+
+        <!-- View 2: Tasks & Want to Do -->
+        <section id="view-tasks" class="view"></section>
+
+        <!-- View 3: Notes -->
+        <section id="view-notes" class="view"></section>
+
+        <!-- View 4: Gym -->
+        <section id="view-gym" class="view"></section>
+
+        <!-- View 5: Art -->
+        <section id="view-art" class="view"></section>
+
+        <!-- View 6: Gaming -->
+        <section id="view-gaming" class="view"></section>
+
+        <!-- View 7: Ask AI / Search -->
+        <section id="view-ask" class="view"></section>
+
+        <!-- View 8: Settings -->
+        <section id="view-settings" class="view"></section>
+      </main>
+    </div>
+  </div>
+
+  <!-- Toast Container -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <!-- Reference Image Lightbox Modal -->
+  <div id="image-modal" class="modal hidden">
+    <div class="modal-backdrop" id="image-modal-backdrop"></div>
+    <div class="modal-content">
+      <button id="image-modal-close" class="btn btn-ghost modal-close">✕</button>
+      <img id="image-modal-img" src="" alt="Reference preview" />
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
