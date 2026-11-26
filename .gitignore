@@ -1,0 +1,30 @@
+# Python & virtual environment
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Sensitive & local personal runtime data (kept in %LOCALAPPDATA%\PersonalLifeHub)
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.wav
+*.mp3
+settings.json
+user_data/
+media/
+
+# OS & editor artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
