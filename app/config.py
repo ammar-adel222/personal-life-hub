@@ -17,6 +17,10 @@ ALLOWED_GROQ_MODELS = (
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
 )
+ALLOWED_TTS_MODES = ("questions_only", "all", "off")
+ALLOWED_TTS_PROVIDERS = ("groq", "local", "google")
+ALLOWED_ORPHEUS_VOICES = ("troy", "hannah", "autumn", "diana", "austin", "daniel")
+
 DEFAULT_SETTINGS: dict[str, Any] = {
     "groq_api_key": "",
     "groq_model": "llama-3.3-70b-versatile",
@@ -24,6 +28,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "mic_device": None,
     "notes_folder": "",
     "weight_unit": "kg",
+    "tts_mode": "questions_only",
+    "tts_provider": "groq",
+    "tts_voice": "troy",
+    "auto_silence": True,
+    "silence_seconds": 1.8,
 }
 
 
@@ -73,6 +82,18 @@ def _normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         merged["notes_folder"] = ""
     if merged["groq_model"] not in ALLOWED_GROQ_MODELS:
         merged["groq_model"] = DEFAULT_SETTINGS["groq_model"]
+    if merged["tts_mode"] not in ALLOWED_TTS_MODES:
+        merged["tts_mode"] = DEFAULT_SETTINGS["tts_mode"]
+    if merged["tts_provider"] not in ALLOWED_TTS_PROVIDERS:
+        merged["tts_provider"] = DEFAULT_SETTINGS["tts_provider"]
+    if merged["tts_voice"] not in ALLOWED_ORPHEUS_VOICES:
+        merged["tts_voice"] = DEFAULT_SETTINGS["tts_voice"]
+    merged["auto_silence"] = bool(merged.get("auto_silence", True))
+    try:
+        sil = float(merged.get("silence_seconds", 1.8))
+    except (TypeError, ValueError):
+        sil = 1.8
+    merged["silence_seconds"] = max(0.6, min(6.0, round(sil, 1)))
     return merged
 
 
@@ -138,5 +159,13 @@ def get_public_settings() -> dict[str, Any]:
         "mic_device": settings["mic_device"],
         "notes_folder": settings["notes_folder"],
         "weight_unit": settings["weight_unit"],
+        "tts_mode": settings["tts_mode"],
+        "tts_provider": settings["tts_provider"],
+        "tts_voice": settings["tts_voice"],
+        "auto_silence": settings["auto_silence"],
+        "silence_seconds": settings["silence_seconds"],
+        "allowed_tts_modes": list(ALLOWED_TTS_MODES),
+        "allowed_tts_providers": list(ALLOWED_TTS_PROVIDERS),
+        "allowed_tts_voices": list(ALLOWED_ORPHEUS_VOICES),
         "data_dir": str(get_data_dir()),
     }

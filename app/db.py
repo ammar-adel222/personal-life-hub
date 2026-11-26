@@ -14,6 +14,7 @@ from app.config import get_db_path, get_media_dir
 
 TASK_LIST_TYPES = ("daily", "want_to_do")
 TASK_PRIORITIES = ("normal", "high")
+TASK_STATUSES = ("not_started", "partially_completed", "completed")
 ACTIVITY_DOMAINS = ("gym", "art")
 ART_STATUSES = ("idea", "wip", "finished")
 GAME_STATUSES = ("playing", "want_to_play", "finished", "on_hold")
@@ -38,8 +39,19 @@ CREATE TABLE IF NOT EXISTS tasks (
     priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('normal', 'high')),
     due_date TEXT,
     done INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'not_started'
+        CHECK(status IN ('not_started', 'partially_completed', 'completed')),
+    progress_note TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    text TEXT NOT NULL,
+    done INTEGER NOT NULL DEFAULT 0,
+    position INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS notes (
@@ -105,16 +117,50 @@ CREATE TABLE IF NOT EXISTS capture_history (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL DEFAULT 'Voice Session',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    actions_json TEXT NOT NULL DEFAULT '[]',
+    source TEXT NOT NULL DEFAULT 'text',
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_list_done ON tasks(list_type, done);
+CREATE INDEX IF NOT EXISTS idx_task_items_task ON task_items(task_id, position ASC, id ASC);
 CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(pinned DESC, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_activity_domain_date ON activity_days(domain, date DESC);
 CREATE INDEX IF NOT EXISTS idx_gym_logs_date ON gym_logs(date DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_gym_logs_exercise ON gym_logs(exercise COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_art_status ON art_items(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_games_status ON games(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_msgs_session ON agent_messages(session_id, id ASC);
 """
 
 _initialized_db_paths: set[str] = set()
+
+
+def _migrate_db(conn: sqlite3.Connection) -> None:
+    """Safely migrate legacy v0.1 databases without dropping user rows."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    if "status" not in cols:
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN status TEXT NOT NULL DEFAULT 'not_started'"
+        )
+        conn.execute(
+            "UPDATE tasks SET status = CASE WHEN done = 1 THEN 'completed' ELSE 'not_started' END"
+        )
+    if "progress_note" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN progress_note TEXT NOT NULL DEFAULT ''")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);")
 
 
 @contextmanager
@@ -130,6 +176,7 @@ def get_conn() -> Iterator[sqlite3.Connection]:
     conn.execute("PRAGMA foreign_keys=ON;")
     if not existed or resolved not in _initialized_db_paths:
         conn.executescript(_SCHEMA_SQL)
+        _migrate_db(conn)
         _initialized_db_paths.add(resolved)
     try:
         yield conn
@@ -145,6 +192,7 @@ def init_db() -> None:
     """Initialize all SQLite tables and indexes if they do not exist."""
     with get_conn() as conn:
         conn.executescript(_SCHEMA_SQL)
+        _migrate_db(conn)
         _initialized_db_paths.add(str(get_db_path().resolve()))
 
 
@@ -174,7 +222,66 @@ def _clean_tags(tags: list[str] | str | None) -> list[str]:
     return cleaned
 
 
-def _row_to_task(row: sqlite3.Row) -> dict[str, Any]:
+_CHECKLIST_LINE_RE = re.compile(r"^(\s*[-*]\s*)\[([ xX])\](\s+)(.*)$")
+
+
+def _compute_note_checklist_stats(content: str) -> dict[str, Any]:
+    """Parse Markdown `- [ ]` / `- [x]` checklist lines inside a note."""
+    items: list[dict[str, Any]] = []
+    done_count = 0
+    for line_no, line in enumerate(content.splitlines()):
+        m = _CHECKLIST_LINE_RE.match(line)
+        if not m:
+            continue
+        is_done = m.group(2).lower() == "x"
+        if is_done:
+            done_count += 1
+        items.append(
+            {
+                "index": len(items),
+                "line_no": line_no,
+                "text": m.group(4).strip(),
+                "done": is_done,
+            }
+        )
+    total = len(items)
+    if total == 0:
+        status = None
+    elif done_count == 0:
+        status = "not_started"
+    elif done_count == total:
+        status = "completed"
+    else:
+        status = "partially_completed"
+    return {
+        "items": items,
+        "total": total,
+        "done": done_count,
+        "status": status,
+    }
+
+
+def _row_to_task_item(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "task_id": row["task_id"],
+        "text": row["text"],
+        "done": bool(row["done"]),
+        "position": row["position"],
+    }
+
+
+def _row_to_task(
+    row: sqlite3.Row,
+    checklist_items: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    items = checklist_items if checklist_items is not None else []
+    done_count = sum(1 for item in items if item["done"])
+    row_keys = row.keys()
+    status = row["status"] if "status" in row_keys and row["status"] in TASK_STATUSES else (
+        "completed" if row["done"] else "not_started"
+    )
+    progress_note = row["progress_note"] if "progress_note" in row_keys else ""
     return {
         "id": row["id"],
         "title": row["title"],
@@ -183,18 +290,25 @@ def _row_to_task(row: sqlite3.Row) -> dict[str, Any]:
         "priority": row["priority"],
         "due_date": row["due_date"],
         "done": bool(row["done"]),
+        "status": status,
+        "progress_note": progress_note,
+        "checklist_items": items,
+        "checklist_total": len(items),
+        "checklist_done": done_count,
         "created_at": row["created_at"],
         "completed_at": row["completed_at"],
     }
 
 
 def _row_to_note(row: sqlite3.Row) -> dict[str, Any]:
+    content = row["content"]
     return {
         "id": row["id"],
         "title": row["title"],
-        "content": row["content"],
+        "content": content,
         "tags": _parse_json_list(row["tags"]),
         "pinned": bool(row["pinned"]),
+        "checklist": _compute_note_checklist_stats(content),
         "source_path": row["source_path"],
         "file_mtime": row["file_mtime"],
         "created_at": row["created_at"],
@@ -247,25 +361,83 @@ def _row_to_gym_log(row: sqlite3.Row) -> dict[str, Any]:
 # Tasks & Want to Do
 # ---------------------------------------------------------------------------
 
+def _fetch_task_items_map(
+    conn: sqlite3.Connection, task_ids: list[int]
+) -> dict[int, list[dict[str, Any]]]:
+    if not task_ids:
+        return {}
+    placeholders = ",".join("?" for _ in task_ids)
+    rows = conn.execute(
+        f"SELECT * FROM task_items WHERE task_id IN ({placeholders}) ORDER BY position ASC, id ASC",
+        task_ids,
+    ).fetchall()
+    grouped: dict[int, list[dict[str, Any]]] = {tid: [] for tid in task_ids}
+    for r in rows:
+        grouped.setdefault(r["task_id"], []).append(_row_to_task_item(r))
+    return grouped
+
+
+def _recompute_task_rollup(conn: sqlite3.Connection, task_id: int) -> None:
+    rows = conn.execute(
+        "SELECT done FROM task_items WHERE task_id = ?", (task_id,)
+    ).fetchall()
+    if not rows:
+        return
+    total = len(rows)
+    done_count = sum(1 for r in rows if r["done"])
+    if done_count == 0:
+        status = "not_started"
+        done_int = 0
+        completed_at = None
+    elif done_count == total:
+        status = "completed"
+        done_int = 1
+        completed_at = now_iso()
+    else:
+        status = "partially_completed"
+        done_int = 0
+        completed_at = None
+    conn.execute(
+        "UPDATE tasks SET status = ?, done = ?, completed_at = ? WHERE id = ?",
+        (status, done_int, completed_at, task_id),
+    )
+
+
+def get_task(task_id: int) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not row:
+            return None
+        items_map = _fetch_task_items_map(conn, [task_id])
+        return _row_to_task(row, items_map.get(task_id, []))
+
+
 def list_tasks(
     list_type: str | None = None,
     include_done: bool = True,
+    status: str | None = None,
 ) -> list[dict[str, Any]]:
     clauses: list[str] = []
     params: list[Any] = []
     if list_type in TASK_LIST_TYPES:
         clauses.append("list_type = ?")
         params.append(list_type)
-    if not include_done:
+    if status in TASK_STATUSES:
+        clauses.append("status = ?")
+        params.append(status)
+    elif not include_done:
         clauses.append("done = 0")
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     sql = (
         f"SELECT * FROM tasks {where_sql} "
-        "ORDER BY done ASC, CASE priority WHEN 'high' THEN 0 ELSE 1 END ASC, id DESC"
+        "ORDER BY done ASC, "
+        "CASE status WHEN 'partially_completed' THEN 0 WHEN 'not_started' THEN 1 ELSE 2 END ASC, "
+        "CASE priority WHEN 'high' THEN 0 ELSE 1 END ASC, id DESC"
     )
     with get_conn() as conn:
         rows = conn.execute(sql, params).fetchall()
-        return [_row_to_task(r) for r in rows]
+        items_map = _fetch_task_items_map(conn, [r["id"] for r in rows])
+        return [_row_to_task(r, items_map.get(r["id"], [])) for r in rows]
 
 
 def create_task(
@@ -274,24 +446,40 @@ def create_task(
     category: str = "",
     priority: str = "normal",
     due_date: str | None = None,
+    status: str = "not_started",
+    progress_note: str = "",
+    checklist_items: list[str] | None = None,
 ) -> dict[str, Any]:
     clean_title = title.strip()
     if not clean_title:
         raise ValueError("Task title cannot be empty.")
     lt = list_type if list_type in TASK_LIST_TYPES else "daily"
     pr = priority if priority in TASK_PRIORITIES else "normal"
+    st = status if status in TASK_STATUSES else "not_started"
+    done_int = 1 if st == "completed" else 0
+    completed_at = now_iso() if st == "completed" else None
     due = due_date.strip() if isinstance(due_date, str) and due_date.strip() else None
     ts = now_iso()
     with get_conn() as conn:
         cur = conn.execute(
             """
-            INSERT INTO tasks (title, list_type, category, priority, due_date, done, created_at)
-            VALUES (?, ?, ?, ?, ?, 0, ?)
+            INSERT INTO tasks (title, list_type, category, priority, due_date, done, status, progress_note, created_at, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (clean_title, lt, category.strip(), pr, due, ts),
+            (clean_title, lt, category.strip(), pr, due, done_int, st, progress_note.strip(), ts, completed_at),
         )
-        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (cur.lastrowid,)).fetchone()
-        return _row_to_task(row)
+        task_id = int(cur.lastrowid)
+        if checklist_items:
+            for pos, text in enumerate(checklist_items):
+                clean_item = str(text).strip()
+                if clean_item:
+                    conn.execute(
+                        "INSERT INTO task_items (task_id, text, done, position) VALUES (?, ?, 0, ?)",
+                        (task_id, clean_item, pos),
+                    )
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        items_map = _fetch_task_items_map(conn, [task_id])
+        return _row_to_task(row, items_map.get(task_id, []))
 
 
 def update_task(task_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
@@ -312,21 +500,173 @@ def update_task(task_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
         due_date = patch.get("due_date", existing["due_date"])
         if isinstance(due_date, str):
             due_date = due_date.strip() or None
-        done = bool(patch.get("done", bool(existing["done"])))
+        progress_note = str(patch.get("progress_note", existing["progress_note"])).strip()
+
+        existing_status = (
+            existing["status"]
+            if existing["status"] in TASK_STATUSES
+            else ("completed" if existing["done"] else "not_started")
+        )
         completed_at = existing["completed_at"]
-        if "done" in patch:
+
+        if "status" in patch and patch["status"] in TASK_STATUSES:
+            status = patch["status"]
+            done = status == "completed"
             completed_at = now_iso() if done else None
+        elif "done" in patch:
+            done = bool(patch["done"])
+            status = "completed" if done else "not_started"
+            completed_at = now_iso() if done else None
+        else:
+            status = existing_status
+            done = bool(existing["done"])
+
         conn.execute(
             """
             UPDATE tasks
             SET title = ?, list_type = ?, category = ?, priority = ?, due_date = ?,
-                done = ?, completed_at = ?
+                done = ?, status = ?, progress_note = ?, completed_at = ?
             WHERE id = ?
             """,
-            (title, list_type, category, priority, due_date, int(done), completed_at, task_id),
+            (title, list_type, category, priority, due_date, int(done), status, progress_note, completed_at, task_id),
         )
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        return _row_to_task(row)
+        items_map = _fetch_task_items_map(conn, [task_id])
+        return _row_to_task(row, items_map.get(task_id, []))
+
+
+def add_task_item(task_id: int, text: str) -> dict[str, Any] | None:
+    clean = text.strip()
+    if not clean:
+        raise ValueError("Checklist item text cannot be empty.")
+    with get_conn() as conn:
+        existing = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not existing:
+            return None
+        max_pos_row = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) AS mp FROM task_items WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        pos = int(max_pos_row["mp"]) + 1
+        conn.execute(
+            "INSERT INTO task_items (task_id, text, done, position) VALUES (?, ?, 0, ?)",
+            (task_id, clean, pos),
+        )
+        _recompute_task_rollup(conn, task_id)
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        items_map = _fetch_task_items_map(conn, [task_id])
+        return _row_to_task(row, items_map.get(task_id, []))
+
+
+def update_task_item(
+    task_id: int, item_id: int, patch: dict[str, Any]
+) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM task_items WHERE id = ? AND task_id = ?",
+            (item_id, task_id),
+        ).fetchone()
+        if not existing:
+            return None
+        text = str(patch.get("text", existing["text"])).strip()
+        if not text:
+            raise ValueError("Checklist item text cannot be empty.")
+        done = bool(patch.get("done", bool(existing["done"])))
+        conn.execute(
+            "UPDATE task_items SET text = ?, done = ? WHERE id = ? AND task_id = ?",
+            (text, int(done), item_id, task_id),
+        )
+        _recompute_task_rollup(conn, task_id)
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        items_map = _fetch_task_items_map(conn, [task_id])
+        return _row_to_task(row, items_map.get(task_id, []))
+
+
+def delete_task_item(task_id: int, item_id: int) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM task_items WHERE id = ? AND task_id = ?",
+            (item_id, task_id),
+        )
+        if cur.rowcount == 0:
+            return None
+        _recompute_task_rollup(conn, task_id)
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not row:
+            return None
+        items_map = _fetch_task_items_map(conn, [task_id])
+        return _row_to_task(row, items_map.get(task_id, []))
+
+
+def _match_task_item_rows(
+    rows: list[sqlite3.Row], targets: list[Any]
+) -> list[int]:
+    matched_ids: list[int] = []
+    for t in targets:
+        if isinstance(t, int) or (isinstance(t, str) and t.strip().isdigit()):
+            tid = int(t)
+            for r in rows:
+                if r["id"] == tid and r["id"] not in matched_ids:
+                    matched_ids.append(r["id"])
+        else:
+            needle = str(t).strip().lower()
+            if not needle:
+                continue
+            for r in rows:
+                if needle in r["text"].lower() and r["id"] not in matched_ids:
+                    matched_ids.append(r["id"])
+    return matched_ids
+
+
+def bulk_manage_task_items(
+    task_id: int,
+    add_items: list[str] | None = None,
+    check_items: list[Any] | None = None,
+    uncheck_items: list[Any] | None = None,
+    remove_items: list[Any] | None = None,
+) -> dict[str, Any] | None:
+    """Add, check, uncheck, or remove task checklist items in a single transaction."""
+    with get_conn() as conn:
+        existing_task = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not existing_task:
+            return None
+
+        if add_items:
+            max_pos_row = conn.execute(
+                "SELECT COALESCE(MAX(position), -1) AS mp FROM task_items WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            pos = int(max_pos_row["mp"]) + 1
+            for raw_text in add_items:
+                clean_item = str(raw_text).strip()
+                if clean_item:
+                    conn.execute(
+                        "INSERT INTO task_items (task_id, text, done, position) VALUES (?, ?, 0, ?)",
+                        (task_id, clean_item, pos),
+                    )
+                    pos += 1
+
+        rows = conn.execute(
+            "SELECT * FROM task_items WHERE task_id = ? ORDER BY position ASC, id ASC",
+            (task_id,),
+        ).fetchall()
+
+        if check_items:
+            for item_id in _match_task_item_rows(rows, check_items):
+                conn.execute("UPDATE task_items SET done = 1 WHERE id = ?", (item_id,))
+
+        if uncheck_items:
+            for item_id in _match_task_item_rows(rows, uncheck_items):
+                conn.execute("UPDATE task_items SET done = 0 WHERE id = ?", (item_id,))
+
+        if remove_items:
+            for item_id in _match_task_item_rows(rows, remove_items):
+                conn.execute("DELETE FROM task_items WHERE id = ?", (item_id,))
+
+        _recompute_task_rollup(conn, task_id)
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        items_map = _fetch_task_items_map(conn, [task_id])
+        return _row_to_task(row, items_map.get(task_id, []))
 
 
 def delete_task(task_id: int) -> bool:
@@ -449,6 +789,76 @@ def update_note(note_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
         )
         row = conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
         return _row_to_note(row)
+
+
+def append_to_note(
+    note_id: int,
+    text: str = "",
+    checklist_items: list[str] | None = None,
+    add_tags: list[str] | str | None = None,
+) -> dict[str, Any] | None:
+    """Append text, Markdown checklist lines, and/or tags to an existing note."""
+    existing = get_note(note_id)
+    if not existing:
+        return None
+    parts: list[str] = []
+    if existing["content"].strip():
+        parts.append(existing["content"].rstrip())
+    clean_text = (text or "").strip("\r\n")
+    if clean_text:
+        parts.append(clean_text)
+    if checklist_items:
+        checklist_lines = [
+            f"- [ ] {str(item).strip()}"
+            for item in checklist_items
+            if str(item).strip()
+        ]
+        if checklist_lines:
+            parts.append("\n".join(checklist_lines))
+    merged_content = "\n\n".join(parts) if parts else existing["content"]
+    merged_tags = list(existing["tags"])
+    for tag in _clean_tags(add_tags):
+        if tag.lower() not in {t.lower() for t in merged_tags}:
+            merged_tags.append(tag)
+    return update_note(note_id, {"content": merged_content, "tags": merged_tags})
+
+
+def toggle_note_checklist_line(
+    note_id: int,
+    item_index: int | None = None,
+    match_text: str | None = None,
+    done: bool | None = None,
+) -> dict[str, Any] | None:
+    """Toggle or set `- [ ]` / `- [x]` on one or more checklist lines inside a note."""
+    existing = get_note(note_id)
+    if not existing:
+        return None
+    lines = existing["content"].splitlines()
+    checklist_counter = 0
+    changed = False
+    needle = (match_text or "").strip().lower()
+
+    for idx, line in enumerate(lines):
+        m = _CHECKLIST_LINE_RE.match(line)
+        if not m:
+            continue
+        cur_done = m.group(2).lower() == "x"
+        item_text = m.group(4).strip()
+        matched = False
+        if item_index is not None and checklist_counter == item_index:
+            matched = True
+        elif needle and needle in item_text.lower():
+            matched = True
+        if matched:
+            new_done = (not cur_done) if done is None else bool(done)
+            mark = "x" if new_done else " "
+            lines[idx] = f"{m.group(1)}[{mark}]{m.group(3)}{m.group(4)}"
+            changed = True
+        checklist_counter += 1
+
+    if not changed:
+        return existing
+    return update_note(note_id, {"content": "\n".join(lines)})
 
 
 def delete_note(note_id: int) -> bool:
@@ -1025,6 +1435,7 @@ def search_everything(query: str, limit: int = 25) -> list[dict[str, Any]]:
     with get_conn() as conn:
         note_rows = conn.execute("SELECT * FROM notes ORDER BY pinned DESC, updated_at DESC").fetchall()
         task_rows = conn.execute("SELECT * FROM tasks ORDER BY done ASC, id DESC").fetchall()
+        task_items_map = _fetch_task_items_map(conn, [r["id"] for r in task_rows])
         gym_rows = conn.execute("SELECT * FROM gym_logs ORDER BY date DESC, id DESC").fetchall()
         art_rows = conn.execute("SELECT * FROM art_items ORDER BY updated_at DESC").fetchall()
         game_rows = conn.execute("SELECT * FROM games ORDER BY updated_at DESC").fetchall()
@@ -1046,17 +1457,25 @@ def search_everything(query: str, limit: int = 25) -> list[dict[str, Any]]:
             )
 
     for r in task_rows:
-        text = f"{r['title']} {r['category']} {r['list_type']}"
-        score = _score_match(q_lower, tokens, text, boost=0.2 if not r["done"] else 0.0)
+        sub_items = task_items_map.get(r["id"], [])
+        sub_text = " ".join(it["text"] for it in sub_items)
+        t_obj = _row_to_task(r, sub_items)
+        text = f"{r['title']} {r['category']} {r['list_type']} {t_obj['progress_note']} {sub_text}"
+        score = _score_match(q_lower, tokens, text, boost=0.2 if not t_obj["done"] else 0.0)
         if score > 0:
             label = "Daily Task" if r["list_type"] == "daily" else "Want to Do"
-            status = "Done" if r["done"] else "Open"
+            st_label = t_obj["status"].replace("_", " ").title()
+            prog = (
+                f" · {t_obj['checklist_done']}/{t_obj['checklist_total']}"
+                if t_obj["checklist_total"]
+                else ""
+            )
             results.append(
                 {
                     "type": "task",
                     "id": r["id"],
                     "title": r["title"],
-                    "snippet": f"{label} ({status})" + (f" · {r['category']}" if r["category"] else ""),
+                    "snippet": f"{label} ({st_label}{prog})" + (f" · {r['category']}" if r["category"] else ""),
                     "meta": r["due_date"] or r["created_at"][:10],
                     "score": score,
                 }
@@ -1155,6 +1574,135 @@ def get_dashboard() -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Agent Sessions & Multi-Turn History
+# ---------------------------------------------------------------------------
+
+def _row_to_agent_session(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _row_to_agent_message(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "role": row["role"],
+        "content": row["content"],
+        "actions": _parse_json_list(row["actions_json"]),
+        "source": row["source"],
+        "created_at": row["created_at"],
+    }
+
+
+def create_agent_session(title: str = "New Session") -> dict[str, Any]:
+    clean = (title or "New Session").strip()[:80] or "New Session"
+    ts = now_iso()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO agent_sessions (title, created_at, updated_at) VALUES (?, ?, ?)",
+            (clean, ts, ts),
+        )
+        row = conn.execute(
+            "SELECT * FROM agent_sessions WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+        return _row_to_agent_session(row)
+
+
+def get_or_create_active_session(session_id: int | None = None) -> dict[str, Any]:
+    with get_conn() as conn:
+        if session_id is not None:
+            row = conn.execute(
+                "SELECT * FROM agent_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row:
+                return _row_to_agent_session(row)
+        latest = conn.execute(
+            "SELECT * FROM agent_sessions ORDER BY updated_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+        if latest:
+            return _row_to_agent_session(latest)
+    return create_agent_session("Voice Session")
+
+
+def list_agent_sessions(limit: int = 20) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM agent_sessions ORDER BY updated_at DESC, id DESC LIMIT ?",
+            (max(1, min(limit, 50)),),
+        ).fetchall()
+        return [_row_to_agent_session(r) for r in rows]
+
+
+def update_agent_session_title(session_id: int, title: str) -> None:
+    clean = (title or "").strip()[:80]
+    if not clean:
+        return
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE agent_sessions SET title = ?, updated_at = ? WHERE id = ?",
+            (clean, now_iso(), session_id),
+        )
+
+
+def add_agent_message(
+    session_id: int,
+    role: str,
+    content: str,
+    actions: list[dict[str, Any]] | None = None,
+    source: str = "text",
+) -> dict[str, Any]:
+    ts = now_iso()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO agent_messages (session_id, role, content, actions_json, source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, role, content.strip(), json.dumps(actions or []), source, ts),
+        )
+        conn.execute(
+            "UPDATE agent_sessions SET updated_at = ? WHERE id = ?",
+            (ts, session_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM agent_messages WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+        return _row_to_agent_message(row)
+
+
+def get_agent_session_detail(
+    session_id: int, message_limit: int = 40
+) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        s_row = conn.execute(
+            "SELECT * FROM agent_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if not s_row:
+            return None
+        m_rows = conn.execute(
+            """
+            SELECT * FROM (
+                SELECT * FROM agent_messages WHERE session_id = ? ORDER BY id DESC LIMIT ?
+            ) sub ORDER BY id ASC
+            """,
+            (session_id, max(1, min(message_limit, 200))),
+        ).fetchall()
+        session = _row_to_agent_session(s_row)
+        session["messages"] = [_row_to_agent_message(r) for r in m_rows]
+        return session
+
+
+def delete_agent_session(session_id: int) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM agent_sessions WHERE id = ?", (session_id,))
+        return cur.rowcount > 0
+
+
 def export_all_data() -> dict[str, Any]:
     """Return a full JSON-serializable backup of all user records."""
     return {
@@ -1167,4 +1715,5 @@ def export_all_data() -> dict[str, Any]:
         "art_items": list_art_items(),
         "games": list_games(),
         "captures": list_captures(limit=100),
+        "agent_sessions": list_agent_sessions(limit=50),
     }
