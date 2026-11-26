@@ -23,11 +23,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "list_tasks",
-            "description": "List tasks and their nested checklist items. Use before updating/checking off an existing task when you do not yet know its task_id.",
+            "description": "List tasks and their nested checklist items. Use list_type='daily' for Active/Scheduled Tasks (today, next N days, meetings, weekly goals) and 'want_to_do' for unscheduled bucket-list ideas.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "list_type": {"type": "string", "enum": ["daily", "want_to_do"]},
+                    "list_type": {
+                        "type": "string",
+                        "enum": ["daily", "want_to_do"],
+                        "description": "'daily' = Active/Scheduled Tasks, 'want_to_do' = Unscheduled Someday list",
+                    },
                     "status": {
                         "type": "string",
                         "enum": ["not_started", "partially_completed", "completed"],
@@ -42,20 +46,33 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "create_task",
-            "description": "Create a new Daily Task or Want-to-Do item, optionally with checklist sub-items.",
+            "description": "Create one Active Task (list_type='daily', default for any task with a timeline/deadline/plan) or Want-to-Do item, with timeline, frequency, due_date, and optional checklist sub-items.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "title": {"type": "string"},
-                    "list_type": {"type": "string", "enum": ["daily", "want_to_do"]},
+                    "list_type": {
+                        "type": "string",
+                        "enum": ["daily", "want_to_do"],
+                        "description": "Use 'daily' for Active/Scheduled tasks (including multi-day or 10-day plans). Use 'want_to_do' ONLY for unscheduled someday ideas.",
+                    },
                     "checklist_items": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional list of checkable steps inside the task.",
+                        "description": "Optional list of concrete checkable steps inside the task.",
                     },
                     "priority": {"type": "string", "enum": ["normal", "high"]},
                     "category": {"type": "string"},
-                    "due_date": {"type": "string", "description": "YYYY-MM-DD or null"},
+                    "start_date": {"type": "string", "description": "YYYY-MM-DD or null"},
+                    "due_date": {"type": "string", "description": "YYYY-MM-DD deadline or null"},
+                    "timeline": {
+                        "type": "string",
+                        "description": "Human-readable timeframe e.g. 'Next 10 days' or 'Before Ericsson meeting (10 days)'",
+                    },
+                    "frequency": {
+                        "type": "string",
+                        "description": "Target cadence/volume e.g. '4x / week', '3 artworks in 10 days', '10-20 hours total'",
+                    },
                     "status": {
                         "type": "string",
                         "enum": ["not_started", "partially_completed", "completed"],
@@ -69,8 +86,40 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "create_tasks_batch",
+            "description": "Create multiple separate Active Tasks in one call. Preferred whenever the user speaks a multi-item task list or 10-day plan.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "list_type": {"type": "string", "enum": ["daily", "want_to_do"]},
+                                "checklist_items": {"type": "array", "items": {"type": "string"}},
+                                "priority": {"type": "string", "enum": ["normal", "high"]},
+                                "category": {"type": "string"},
+                                "start_date": {"type": "string"},
+                                "due_date": {"type": "string"},
+                                "timeline": {"type": "string"},
+                                "frequency": {"type": "string"},
+                                "progress_note": {"type": "string"},
+                            },
+                            "required": ["title"],
+                        },
+                    }
+                },
+                "required": ["tasks"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "update_task",
-            "description": "Update an existing task's status (not_started, partially_completed, completed), title, list_type, priority, due_date, or progress_note.",
+            "description": "Update an existing task's status, title, list_type, priority, start_date, due_date, timeline, frequency, or progress_note.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -83,7 +132,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "list_type": {"type": "string", "enum": ["daily", "want_to_do"]},
                     "priority": {"type": "string", "enum": ["normal", "high"]},
                     "category": {"type": "string"},
+                    "start_date": {"type": "string"},
                     "due_date": {"type": "string"},
+                    "timeline": {"type": "string"},
+                    "frequency": {"type": "string"},
                     "progress_note": {"type": "string"},
                 },
                 "required": ["task_id"],
@@ -389,6 +441,51 @@ def _sync_note_if_needed(note: dict[str, Any]) -> dict[str, Any]:
     return note
 
 
+def _clean_opt_date(val: Any) -> str | None:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s or s.lower() == "null":
+        return None
+    return s
+
+
+def _create_single_task_from_args(args: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    title = str(args.get("title") or "").strip()
+    checklist = _coerce_str_list(args.get("checklist_items"))
+    item = db.create_task(
+        title=title,
+        list_type=str(args.get("list_type") or "daily"),
+        category=str(args.get("category") or ""),
+        priority=str(args.get("priority") or "normal"),
+        due_date=_clean_opt_date(args.get("due_date")),
+        status=str(args.get("status") or "not_started"),
+        progress_note=str(args.get("progress_note") or ""),
+        checklist_items=checklist,
+        start_date=_clean_opt_date(args.get("start_date")),
+        timeline=str(args.get("timeline") or ""),
+        frequency=str(args.get("frequency") or ""),
+    )
+    meta_parts: list[str] = []
+    if item["checklist_total"]:
+        meta_parts.append(f"{item['checklist_total']} steps")
+    if item["frequency"]:
+        meta_parts.append(item["frequency"])
+    if item["due_date"]:
+        meta_parts.append(f"Due {item['due_date']}")
+    elif item["timeline"]:
+        meta_parts.append(item["timeline"])
+    suffix = f" ({' · '.join(meta_parts)})" if meta_parts else ""
+    prefix = "Task" if item["list_type"] == "daily" else "Want to do"
+    badge = {
+        "tool": "create_task",
+        "domain": "task",
+        "item_id": item["id"],
+        "label": f"{prefix}: {item['title']}{suffix}",
+    }
+    return item, badge
+
+
 def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str, Any]:
     """Execute an agent tool call locally and return structured tool result + UI metadata."""
     args = raw_args if isinstance(raw_args, dict) else {}
@@ -414,37 +511,37 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
                     for t in items
                     if q in t["title"].lower()
                     or q in t["category"].lower()
+                    or q in t["timeline"].lower()
+                    or q in t["frequency"].lower()
                     or q in t["progress_note"].lower()
                     or any(q in sub["text"].lower() for sub in t["checklist_items"])
                 ]
             return {"result": {"tasks": items[:30]}, "action_badge": None, "navigate_to": None}
 
         if name == "create_task":
-            title = str(args.get("title") or "").strip()
-            checklist = _coerce_str_list(args.get("checklist_items"))
-            due = args.get("due_date")
-            if isinstance(due, str) and due.strip().lower() == "null":
-                due = None
-            item = db.create_task(
-                title=title,
-                list_type=str(args.get("list_type") or "daily"),
-                category=str(args.get("category") or ""),
-                priority=str(args.get("priority") or "normal"),
-                due_date=due,
-                status=str(args.get("status") or "not_started"),
-                progress_note=str(args.get("progress_note") or ""),
-                checklist_items=checklist,
-            )
-            sub_info = f" ({item['checklist_total']} steps)" if item["checklist_total"] else ""
-            prefix = "Task" if item["list_type"] == "daily" else "Want to do"
+            item, badge = _create_single_task_from_args(args)
             return {
                 "result": {"task": item},
-                "action_badge": {
-                    "tool": name,
-                    "domain": "task",
-                    "item_id": item["id"],
-                    "label": f"{prefix}: {item['title']}{sub_info}",
-                },
+                "action_badge": badge,
+                "navigate_to": None,
+            }
+
+        if name == "create_tasks_batch":
+            raw_list = args.get("tasks")
+            if not isinstance(raw_list, list) or not raw_list:
+                return {"result": {"error": "tasks array is required."}, "action_badge": None, "navigate_to": None}
+            created: list[dict[str, Any]] = []
+            badges: list[dict[str, Any]] = []
+            for entry in raw_list:
+                if not isinstance(entry, dict) or not str(entry.get("title") or "").strip():
+                    continue
+                item, badge = _create_single_task_from_args(entry)
+                created.append(item)
+                badges.append(badge)
+            return {
+                "result": {"tasks": created, "count": len(created)},
+                "action_badge": badges[0] if badges else None,
+                "action_badges": badges,
                 "navigate_to": None,
             }
 
@@ -453,11 +550,22 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
             if task_id is None:
                 return {"result": {"error": "task_id is required."}, "action_badge": None, "navigate_to": None}
             patch: dict[str, Any] = {}
-            for key in ("title", "status", "list_type", "priority", "category", "due_date", "progress_note"):
+            for key in (
+                "title",
+                "status",
+                "list_type",
+                "priority",
+                "category",
+                "start_date",
+                "due_date",
+                "timeline",
+                "frequency",
+                "progress_note",
+            ):
                 if key in args and args[key] is not None:
                     val = args[key]
-                    if key == "due_date" and str(val).strip().lower() == "null":
-                        val = None
+                    if key in ("start_date", "due_date"):
+                        val = _clean_opt_date(val)
                     patch[key] = val
             item = db.update_task(task_id, patch)
             if not item:

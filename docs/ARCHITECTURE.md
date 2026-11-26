@@ -9,8 +9,8 @@ This document details how **Personal Life Hub** implements a voice-first, multi-
 Instead of pulling in LangChain/LangGraph abstractions, `app/agent.py` + `app/tools.py` run a focused, inspectable ~150-line tool-calling loop directly over Groq's OpenAI-compatible `/chat/completions` API:
 
 1. **Session Context Assembly**: Loads the active session from `agent_sessions` and the last 12 `agent_messages`, injecting compact `[Executed actions: domain #id: label]` annotations onto prior assistant messages so follow-up voice turns (*"check off the first item on that lecture note"*) resolve exact database IDs across turns.
-2. **Bounded Tool Loop (`MAX_TOOL_ROUNDS = 6`)**:
-   - Sends messages + 17 JSON tool schemas (`tools.TOOL_SCHEMAS`) to `llama-3.3-70b-versatile` (falling back automatically to `llama-3.1-8b-instant` on HTTP `400`/`429`/`503`).
+2. **Bounded Tool Loop (`MAX_TOOL_ROUNDS = 12`)**:
+   - Sends messages + 18 JSON tool schemas (`tools.TOOL_SCHEMAS`) + a 14-day local calendar context to `openai/gpt-oss-120b` (with automatic fallback to `qwen/qwen3.8-27b`, `openai/gpt-oss-20b`, and dynamic `/models` discovery on HTTP `404`).
    - Executes returned `tool_calls` synchronously in `app/tools.py`, appends structured JSON results as `"tool"` messages, and collects UI badges (`action_badge`) and navigation triggers (`navigate_to`).
    - When the model returns a natural-language response, persists both the reply and action metadata into SQLite and returns `is_question` so the UI knows whether to speak clarifications aloud.
 3. **Offline Fallback**: When no Groq key is present (or the network is unreachable), `_offline_agent_fallback` handles checklist task syntax (`steps: ...`), tagged lecture notes, gym sets, and quick captures cleanly.
@@ -23,8 +23,9 @@ Instead of pulling in LangChain/LangGraph abstractions, `app/agent.py` + `app/to
 | :--- | :--- |
 | `get_today_overview` | Read today's gym/art status, open tasks, notes, and active games |
 | `list_tasks` | Inspect tasks + nested checklist items filtered by list, status, or query |
-| `create_task` | Create Daily or Want-to-Do task with optional `checklist_items` & status |
-| `update_task` | Update title, priority, due date, `progress_note`, or 3-state `status` |
+| `create_task` | Create Active or Want-to-Do task with timeline, frequency, dates & `checklist_items` |
+| `create_tasks_batch` | Decompose a multi-item spoken plan into multiple Active Tasks in one call |
+| `update_task` | Update title, priority, start/due dates, timeline, frequency, `progress_note`, or 3-state `status` |
 | `manage_task_checklist` | Add, check, uncheck, or remove sub-items with automatic parent rollup |
 | `search_notes` | Search notes by keywords and `#tags` |
 | `get_note` | Read full note content, tags, and Markdown checklist stats |
@@ -54,6 +55,10 @@ erDiagram
         int id PK
         text title
         text list_type "daily | want_to_do"
+        text start_date
+        text due_date
+        text timeline
+        text frequency
         text status "not_started | partially_completed | completed"
         text progress_note
         int done
@@ -98,7 +103,7 @@ erDiagram
 
 1. **Recording & Pure-Python RMS VAD (`app/voice.py`)**:
    - Captures `16kHz`, mono, 16-bit PCM via `sounddevice.RawInputStream` into an in-memory buffer capped at 120 seconds.
-   - Computes per-chunk RMS in pure Python (`array('h')` + `math.sqrt` — no `numpy` dependency). Once sustained speech exceeds `SPEECH_RMS_THRESHOLD` (`450`) and drops below `SILENCE_RMS_THRESHOLD` (`220`) for `silence_seconds` (default `1.8s`), the callback sets `_auto_stopped = True` and raises `sounddevice.CallbackStop` safely without calling `stream.stop()` inside the PortAudio thread.
+   - Computes per-chunk RMS in pure Python (`array('h')` + `math.sqrt` — no `numpy` dependency). When `auto_silence` is enabled, once sustained speech exceeds `SPEECH_RMS_THRESHOLD` (`450`) and drops below `SILENCE_RMS_THRESHOLD` (`220`) for `silence_seconds` (default `3.5s`), the callback sets `_auto_stopped = True` and raises `sounddevice.CallbackStop` safely without calling `stream.stop()` inside the PortAudio thread. Manual Start/Stop is the default so longer multi-item voice plans never cut off mid-thought.
 2. **Speech-to-Text**: Sends standard WAV bytes to Groq `whisper-large-v3-turbo` (`/openai/v1/audio/transcriptions`).
 3. **Text-to-Speech (`app/tts.py`) & Extending with Google TTS**:
    - Primary provider calls Groq Orpheus (`canopylabs/orpheus-v1-english`, `response_format="wav"`).

@@ -53,6 +53,58 @@ def test_legacy_tasks_db_migration(monkeypatch, tmp_path):
     assert by_title["Legacy completed task"]["done"] is True
     assert by_title["Legacy open task"]["status"] == "not_started"
     assert by_title["Legacy open task"]["done"] is False
+    assert by_title["Legacy open task"]["timeline"] == ""
+    assert by_title["Legacy open task"]["frequency"] == ""
+
+
+def test_tasks_batch_timeline_and_frequency(monkeypatch, tmp_path):
+    monkeypatch.setenv("LIFEHUB_DATA_DIR", str(tmp_path))
+    assert len(tools.TOOL_SCHEMAS) == 18
+
+    with TestClient(app) as client:
+        res = tools.execute_tool(
+            "create_tasks_batch",
+            {
+                "tasks": [
+                    {
+                        "title": "Stanford Agentic AI Lectures 1-5",
+                        "list_type": "daily",
+                        "start_date": "2026-11-27",
+                        "due_date": "2026-12-07",
+                        "timeline": "Next 10 days",
+                        "frequency": "1 lecture every 2 days",
+                        "checklist_items": ["Lecture 1", "Lecture 2", "Lecture 3", "Lecture 4", "Lecture 5"],
+                    },
+                    {
+                        "title": "Draw 3 artworks",
+                        "list_type": "daily",
+                        "start_date": "2026-11-27",
+                        "due_date": "2026-12-07",
+                        "timeline": "Next 10 days",
+                        "frequency": "3 artworks in 10 days",
+                        "checklist_items": ["Artwork 1", "Artwork 2", "Artwork 3"],
+                    },
+                ]
+            },
+        )
+        assert res["result"]["count"] == 2
+        assert len(res["action_badges"]) == 2
+
+        tasks = client.get("/api/tasks?list_type=daily").json()["items"]
+        assert len(tasks) == 2
+        by_title = {t["title"]: t for t in tasks}
+        assert by_title["Stanford Agentic AI Lectures 1-5"]["timeline"] == "Next 10 days"
+        assert by_title["Stanford Agentic AI Lectures 1-5"]["due_date"] == "2026-12-07"
+        assert by_title["Draw 3 artworks"]["frequency"] == "3 artworks in 10 days"
+
+        # Patch timeline/frequency via REST API
+        tid = by_title["Draw 3 artworks"]["id"]
+        upd = client.patch(
+            f"/api/tasks/{tid}",
+            json={"frequency": "3 artworks (1 every 3 days)", "timeline": "10-day sprint"},
+        ).json()["item"]
+        assert upd["frequency"] == "3 artworks (1 every 3 days)"
+        assert upd["timeline"] == "10-day sprint"
 
 
 def test_task_subchecklist_auto_rollup_and_partial_status(monkeypatch, tmp_path):

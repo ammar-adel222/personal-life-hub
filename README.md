@@ -1,6 +1,6 @@
 # Personal Life Hub
 
-A **voice-first, pure-Python agentic desktop app** built with **FastAPI + Edge WebView2 (`pywebview`) + SQLite + Groq (Llama + Whisper + Orpheus TTS)** to capture tasks, 3-state checklists, lecture notes, gym sessions, art projects, and gaming logs in one fast local workspace.
+A **voice-first, pure-Python agentic desktop app** built with **FastAPI + Edge WebView2 (`pywebview`) + SQLite + Groq (`gpt-oss-120b` / `qwen3.8-27b` + Whisper + Orpheus TTS)** to capture tasks, 3-state checklists, lecture notes, gym sessions, art projects, and gaming logs in one fast local workspace.
 
 > Designed to be genuinely useful every day — and clean, modular, and self-contained without LangChain or LangGraph bloat.
 
@@ -13,8 +13,8 @@ flowchart LR
     U["Voice or Text Input\n(Auto-Stop Silence VAD)"] -->|"16kHz Mono WAV"| W["Groq Whisper\nwhisper-large-v3-turbo"]
     W -->|"Transcript"| AG["Pure-Python Tool Agent\n(app/agent.py)"]
     U -->|"Typed Text"| AG
-    AG <-->|"OpenAI Tool Schemas\n(llama-3.3-70b / 8b)"| G["Groq Chat API"]
-    AG -->|"17 Typed Tools\n(app/tools.py)"| DB[("SQLite WAL\n%LOCALAPPDATA%\\PersonalLifeHub")]
+    AG <-->|"OpenAI Tool Schemas\n(gpt-oss-120b / qwen3.8-27b)"| G["Groq Chat API"]
+    AG -->|"18 Typed Tools\n(app/tools.py)"| DB[("SQLite WAL\n%LOCALAPPDATA%\\PersonalLifeHub")]
     DB -->|"Sync .md/.txt"| FS["Local Notes Folder"]
     AG -->|"Reply"| TTS["Groq Orpheus TTS\n(orpheus-v1-english)"]
     TTS -->|"Fallback on offline/429"| LOCAL["Windows / Edge Speech"]
@@ -33,7 +33,7 @@ flowchart LR
 - **✅ 3-State Tasks & Auto-Rollup Checklists**:
   - Every task supports **`not_started` (`○`)**, **`partially_completed` (`◐`)**, and **`completed` (`✓`)** states plus optional progress notes.
   - Tasks can contain nested checklist steps — checking `1..N-1` steps automatically sets the parent task to **`partially_completed`** with a progress bar; checking all steps completes it.
-  - Separate **Daily Tasks** and **Want to Do / Someday** lists with 1-click promotion.
+  - **Active Tasks** and **Want to Do / Someday** lists with timelines (`start_date` / `due_date` / `timeline`), target frequencies (`frequency`), and 1-click promotion.
 - **📝 Interactive Lecture Notes & Folder Sync**:
   - Supports tags, pinning, instant cross-app search, clickable `- [ ]` / `- [x]` Markdown checklists inside the editor, and safe synchronization with a local `.md`/`.txt` folder.
 - **🏋️ Simple Gym Tracker**:
@@ -95,4 +95,4 @@ All personal data stays outside this repository in:
 .\.venv\Scripts\python.exe run_app.py --smoke-test
 ```
 
-For deeper technical details (agent loop, 17-tool catalog, SQLite ER schema, RMS VAD, and extending TTS with Google TTS), see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+For deeper technical details (agent loop, 18-tool catalog, SQLite ER schema, RMS VAD, and extending TTS with Google TTS), see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

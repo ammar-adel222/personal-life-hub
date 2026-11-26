@@ -52,7 +52,10 @@ class TaskCreate(BaseModel):
     list_type: str = "daily"
     category: str = ""
     priority: str = "normal"
+    start_date: str | None = None
     due_date: str | None = None
+    timeline: str = ""
+    frequency: str = ""
     status: str = "not_started"
     progress_note: str = ""
     checklist_items: list[str] = Field(default_factory=list)
@@ -63,7 +66,10 @@ class TaskUpdate(BaseModel):
     list_type: str | None = None
     category: str | None = None
     priority: str | None = None
+    start_date: str | None = None
     due_date: str | None = None
+    timeline: str | None = None
+    frequency: str | None = None
     done: bool | None = None
     status: str | None = None
     progress_note: str | None = None
@@ -269,6 +275,9 @@ def post_task(payload: TaskCreate) -> dict[str, Any]:
             status=payload.status,
             progress_note=payload.progress_note,
             checklist_items=payload.checklist_items,
+            start_date=payload.start_date,
+            timeline=payload.timeline,
+            frequency=payload.frequency,
         )
         return {"item": item}
     except ValueError as exc:

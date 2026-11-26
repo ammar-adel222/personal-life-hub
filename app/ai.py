@@ -9,10 +9,11 @@ from typing import Any
 import httpx
 
 from app import db
-from app.config import load_settings
+from app.config import ALLOWED_GROQ_MODELS, load_settings
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-FALLBACK_CHAT_MODEL = "llama-3.1-8b-instant"
+FALLBACK_CHAT_MODEL = "openai/gpt-oss-20b"
+_NON_CHAT_SUBSTRINGS = ("whisper", "orpheus", "guard", "safeguard", "tts", "audio")
 
 
 class AIError(Exception):
@@ -57,6 +58,38 @@ async def verify_groq_key(api_key: str) -> dict[str, Any]:
     return {"valid": True, "models_count": len(models), "models": models[:20]}
 
 
+def _candidate_chat_models(preferred: str) -> list[str]:
+    ordered: list[str] = []
+    for m in (preferred, *ALLOWED_GROQ_MODELS, FALLBACK_CHAT_MODEL):
+        if m and m not in ordered:
+            ordered.append(m)
+    return ordered
+
+
+async def discover_live_chat_models(client: httpx.AsyncClient, api_key: str) -> list[str]:
+    """Query Groq /models to dynamically discover available chat-capable models."""
+    try:
+        resp = await client.get(
+            f"{GROQ_BASE_URL}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10.0,
+        )
+        if resp.status_code != 200:
+            return []
+        models = []
+        for entry in resp.json().get("data", []):
+            mid = str(entry.get("id") or "").strip()
+            if not mid:
+                continue
+            low = mid.lower()
+            if any(bad in low for bad in _NON_CHAT_SUBSTRINGS):
+                continue
+            models.append(mid)
+        return models
+    except Exception:
+        return []
+
+
 async def _call_groq_chat(
     messages: list[dict[str, str]],
     api_key: str,
@@ -64,14 +97,21 @@ async def _call_groq_chat(
     json_mode: bool = False,
     temperature: float = 0.2,
 ) -> tuple[str, str]:
-    """Call Groq chat completions with automatic fallback to 8B instant on rate/model issues."""
-    candidates = [model]
-    if model != FALLBACK_CHAT_MODEL:
-        candidates.append(FALLBACK_CHAT_MODEL)
-
+    """Call Groq chat completions with model fallback and dynamic /models discovery."""
+    candidates = _candidate_chat_models(model)
+    tried: set[str] = set()
     last_error = "Unknown Groq error"
+
     async with httpx.AsyncClient(timeout=25.0) as client:
-        for idx, candidate in enumerate(candidates):
+        idx = 0
+        discovered = False
+        while idx < len(candidates):
+            candidate = candidates[idx]
+            idx += 1
+            if candidate in tried:
+                continue
+            tried.add(candidate)
+
             body: dict[str, Any] = {
                 "model": candidate,
                 "messages": messages,
@@ -92,7 +132,14 @@ async def _call_groq_chat(
                 content = data["choices"][0]["message"]["content"]
                 return content, candidate
             last_error = f"HTTP {resp.status_code}: {resp.text[:240]}"
-            if resp.status_code in (429, 500, 502, 503, 404) and idx + 1 < len(candidates):
+            if resp.status_code == 404 and not discovered:
+                discovered = True
+                for live_model in await discover_live_chat_models(client, api_key):
+                    if live_model not in tried and live_model not in candidates:
+                        candidates.append(live_model)
+            if resp.status_code in (429, 500, 502, 503, 404) and idx < len(candidates):
+                continue
+            if idx < len(candidates):
                 continue
             raise AIError(last_error)
     raise AIError(last_error)
@@ -350,7 +397,7 @@ async def smart_capture(
     today = db.today_str()
     default_unit = settings.get("weight_unit", "kg")
     api_key = settings.get("groq_api_key", "").strip()
-    model = settings.get("groq_model", "llama-3.3-70b-versatile")
+    model = settings.get("groq_model", "openai/gpt-oss-120b")
 
     ai_used = False
     model_used: str | None = None
@@ -481,7 +528,7 @@ async def ask_my_life(question: str) -> dict[str, Any]:
     context_text, hits = _build_life_context(clean)
     settings = load_settings()
     api_key = settings.get("groq_api_key", "").strip()
-    model = settings.get("groq_model", "llama-3.3-70b-versatile")
+    model = settings.get("groq_model", "openai/gpt-oss-120b")
 
     if not api_key:
         if hits:

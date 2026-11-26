@@ -14,8 +14,9 @@ from typing import Any
 
 APP_NAME = "PersonalLifeHub"
 ALLOWED_GROQ_MODELS = (
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
+    "openai/gpt-oss-20b",
 )
 ALLOWED_TTS_MODES = ("questions_only", "all", "off")
 ALLOWED_TTS_PROVIDERS = ("groq", "local", "google")
@@ -23,7 +24,7 @@ ALLOWED_ORPHEUS_VOICES = ("troy", "hannah", "autumn", "diana", "austin", "daniel
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "groq_api_key": "",
-    "groq_model": "llama-3.3-70b-versatile",
+    "groq_model": "openai/gpt-oss-120b",
     "voice_mode": "auto_ai",
     "mic_device": None,
     "notes_folder": "",
@@ -31,8 +32,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "tts_mode": "questions_only",
     "tts_provider": "groq",
     "tts_voice": "troy",
-    "auto_silence": True,
-    "silence_seconds": 1.8,
+    "auto_silence": False,
+    "silence_seconds": 3.5,
 }
 
 
@@ -88,11 +89,11 @@ def _normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         merged["tts_provider"] = DEFAULT_SETTINGS["tts_provider"]
     if merged["tts_voice"] not in ALLOWED_ORPHEUS_VOICES:
         merged["tts_voice"] = DEFAULT_SETTINGS["tts_voice"]
-    merged["auto_silence"] = bool(merged.get("auto_silence", True))
+    merged["auto_silence"] = bool(merged.get("auto_silence", False))
     try:
-        sil = float(merged.get("silence_seconds", 1.8))
+        sil = float(merged.get("silence_seconds", 3.5))
     except (TypeError, ValueError):
-        sil = 1.8
+        sil = 3.5
     merged["silence_seconds"] = max(0.6, min(6.0, round(sil, 1)))
     return merged
 

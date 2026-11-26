@@ -10,7 +10,9 @@ from typing import Any
 from app import db
 
 SUPPORTED_NOTE_EXTS = {".md", ".txt"}
-IGNORED_DIR_NAMES = {".git", ".venv", "venv", "node_modules", "__pycache__"}
+IGNORED_DIR_NAMES = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache"}
+APP_REPO_DIRS = {"app", "tests", "docs"}
+APP_REPO_ROOT_FILES = {"README.md", "requirements.txt"}
 
 
 def _extract_title_from_file(path: Path, content: str) -> str:
@@ -46,11 +48,19 @@ def sync_notes_folder(folder_path: str) -> dict[str, Any]:
     unchanged = 0
     errors: list[str] = []
 
+    is_app_repo = (root / "run_app.py").exists() and (root / "app").is_dir()
+
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [
-            d for d in dirnames if not d.startswith(".") and d not in IGNORED_DIR_NAMES
+            d
+            for d in dirnames
+            if not d.startswith(".")
+            and d not in IGNORED_DIR_NAMES
+            and not (is_app_repo and Path(dirpath) == root and d in APP_REPO_DIRS)
         ]
         for fname in filenames:
+            if is_app_repo and Path(dirpath) == root and fname in APP_REPO_ROOT_FILES:
+                continue
             fpath = Path(dirpath) / fname
             if fpath.suffix.lower() not in SUPPORTED_NOTE_EXTS:
                 continue

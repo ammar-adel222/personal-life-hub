@@ -4,16 +4,28 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
 
 from app import ai, db, tools
-from app.config import load_settings
+from app.config import ALLOWED_GROQ_MODELS, load_settings
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-FALLBACK_CHAT_MODEL = "llama-3.1-8b-instant"
-MAX_TOOL_ROUNDS = 6
+FALLBACK_CHAT_MODEL = "openai/gpt-oss-20b"
+MAX_TOOL_ROUNDS = 12
+
+
+def _build_calendar_context() -> str:
+    now = datetime.now()
+    rows = [f"Today: {now.strftime('%A, %Y-%m-%d')}"]
+    upcoming = []
+    for delta in range(1, 15):
+        dt = now + timedelta(days=delta)
+        upcoming.append(f"+{delta}d={dt.strftime('%a %Y-%m-%d')}")
+    rows.append("Upcoming 14 days: " + ", ".join(upcoming))
+    return "\n".join(rows)
 
 
 async def _call_groq_agent_step(
@@ -22,18 +34,28 @@ async def _call_groq_agent_step(
     model: str,
     use_tools: bool = True,
 ) -> tuple[dict[str, Any], str]:
-    """Execute one Groq chat-completions step with optional tool schemas."""
-    candidates = [model]
-    if model != FALLBACK_CHAT_MODEL:
-        candidates.append(FALLBACK_CHAT_MODEL)
+    """Execute one Groq chat-completions step with fallback and dynamic model discovery."""
+    candidates: list[str] = []
+    for m in (model, *ALLOWED_GROQ_MODELS, FALLBACK_CHAT_MODEL):
+        if m and m not in candidates:
+            candidates.append(m)
 
+    tried: set[str] = set()
     last_error = "Unknown Groq error"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        for idx, candidate in enumerate(candidates):
+    async with httpx.AsyncClient(timeout=35.0) as client:
+        idx = 0
+        discovered = False
+        while idx < len(candidates):
+            candidate = candidates[idx]
+            idx += 1
+            if candidate in tried:
+                continue
+            tried.add(candidate)
+
             body: dict[str, Any] = {
                 "model": candidate,
                 "messages": messages,
-                "temperature": 0.2,
+                "temperature": 0.15,
             }
             if use_tools:
                 body["tools"] = tools.TOOL_SCHEMAS
@@ -53,25 +75,42 @@ async def _call_groq_agent_step(
                 return msg, candidate
 
             last_error = f"HTTP {resp.status_code}: {resp.text[:260]}"
-            if resp.status_code in (400, 404, 429, 500, 502, 503) and idx + 1 < len(candidates):
+            if resp.status_code == 404 and not discovered:
+                discovered = True
+                for live_model in await ai.discover_live_chat_models(client, api_key):
+                    if live_model not in tried and live_model not in candidates:
+                        candidates.append(live_model)
+            if resp.status_code in (400, 404, 429, 500, 502, 503) and idx < len(candidates):
                 continue
             raise ai.AIError(last_error)
 
     raise ai.AIError(last_error)
 
 
-def _offline_agent_fallback(user_text: str, default_unit: str = "kg") -> tuple[str, list[dict[str, Any]]]:
+def _offline_agent_fallback(
+    user_text: str, default_unit: str = "kg"
+) -> tuple[str, list[dict[str, Any]]]:
     """Deterministic fallback when no Groq API key is configured or network is down."""
     text = user_text.strip()
     lower = text.lower()
     actions_taken: list[dict[str, Any]] = []
 
-    # Check for explicit checklist creation pattern: "task X with steps: a, b, c"
-    steps_match = re.search(r"(?:with\s+)?(?:steps|checklist)\s*:\s*(.+)$", text, flags=re.IGNORECASE)
+    steps_match = re.search(
+        r"(?:with\s+)?(?:steps|checklist)\s*:\s*(.+)$", text, flags=re.IGNORECASE
+    )
     if steps_match:
-        raw_steps = [s.strip(" .") for s in re.split(r"[,;]+", steps_match.group(1)) if s.strip(" .")]
+        raw_steps = [
+            s.strip(" .")
+            for s in re.split(r"[,;]+", steps_match.group(1))
+            if s.strip(" .")
+        ]
         prefix_title = text[: steps_match.start()].strip(" :-")
-        prefix_title = re.sub(r"^(?:create|make|add)\s+(?:a\s+)?(?:task|checklist)\s*(?:to|for)?\s*", "", prefix_title, flags=re.IGNORECASE).strip()
+        prefix_title = re.sub(
+            r"^(?:create|make|add)\s+(?:a\s+)?(?:task|checklist)\s*(?:to|for)?\s*",
+            "",
+            prefix_title,
+            flags=re.IGNORECASE,
+        ).strip()
         if raw_steps and prefix_title:
             res = tools.execute_tool(
                 "create_task",
@@ -84,9 +123,17 @@ def _offline_agent_fallback(user_text: str, default_unit: str = "kg") -> tuple[s
                 actions_taken,
             )
 
-    # Lecture note pattern with tags
-    if "lecture" in lower or "tags" in lower or "tag " in lower:
-        tags_match = re.search(r"tags?\s*[:\-]?\s*([a-zA-Z0-9,\s_-]+)$", text, flags=re.IGNORECASE)
+    # Only save as a lecture note if the user isn't explicitly asking for a task list / timeline
+    is_task_plan = any(
+        kw in lower
+        for kw in ("task list", "make a task", "create a task", "next 10 days", "for the next")
+    )
+    if not is_task_plan and (
+        "note:" in lower or "tags:" in lower or ("lecture" in lower and "watch" not in lower)
+    ):
+        tags_match = re.search(
+            r"tags?\s*[:\-]?\s*([a-zA-Z0-9,\s_-]+)$", text, flags=re.IGNORECASE
+        )
         tags = (
             [t.strip() for t in re.split(r"[\s,]+", tags_match.group(1)) if t.strip()]
             if tags_match
@@ -98,13 +145,19 @@ def _offline_agent_fallback(user_text: str, default_unit: str = "kg") -> tuple[s
         )
         if res["action_badge"]:
             actions_taken.append(res["action_badge"])
-        return (f"Saved note '{res['result']['note']['title']}' (offline mode).", actions_taken)
+        return (
+            f"Saved note '{res['result']['note']['title']}' (offline mode).",
+            actions_taken,
+        )
 
-    # Fallback to smart_capture heuristics
     parsed = ai._fallback_parse(text, db.today_str(), default_unit)
     executed = ai.execute_actions(parsed.get("actions", []), default_unit=default_unit)
     for ex in executed:
-        domain = "gym" if ex["type"].startswith("gym") else ("art" if ex["type"].startswith("art") else ex["type"])
+        domain = (
+            "gym"
+            if ex["type"].startswith("gym")
+            else ("art" if ex["type"].startswith("art") else ex["type"])
+        )
         item = ex.get("item") if isinstance(ex.get("item"), dict) else {}
         actions_taken.append(
             {
@@ -115,7 +168,10 @@ def _offline_agent_fallback(user_text: str, default_unit: str = "kg") -> tuple[s
             }
         )
     reply = " · ".join(a["label"] for a in actions_taken) if actions_taken else "Saved note."
-    return f"{reply} (offline mode — add your Groq API key in Settings for full agentic AI).", actions_taken
+    return (
+        f"{reply} (offline mode — add your Groq API key in Settings for full agentic AI).",
+        actions_taken,
+    )
 
 
 def _parse_tool_args(raw: Any) -> dict[str, Any]:
@@ -145,10 +201,8 @@ async def run_agent_turn(
     detail = db.get_agent_session_detail(sid, message_limit=14)
     prior_messages = detail["messages"] if detail else []
 
-    # Save user turn immediately
     db.add_agent_message(sid, "user", clean, source=source)
 
-    # Auto-name new sessions after first user turn
     if session["title"] in ("Voice Session", "New Session") and not prior_messages:
         short_title = clean[:52] + ("…" if len(clean) > 52 else "")
         db.update_agent_session_title(sid, short_title)
@@ -156,24 +210,33 @@ async def run_agent_turn(
 
     settings = load_settings()
     api_key = settings.get("groq_api_key", "").strip()
-    model = settings.get("groq_model", "llama-3.3-70b-versatile")
+    model = settings.get("groq_model", "openai/gpt-oss-120b")
     default_unit = settings.get("weight_unit", "kg")
-    today = db.today_str()
+    calendar_ctx = _build_calendar_context()
 
     system_prompt = (
-        f"You are the voice-first personal AI agent inside Personal Life Hub. Today's date is {today}.\n"
+        "You are the voice-first personal AI agent inside Personal Life Hub.\n"
+        f"{calendar_ctx}\n"
         f"Default gym weight unit: {default_unit}.\n\n"
-        "Capabilities & Rules:\n"
-        "1. You control the entire app via tools: 3-state checklist tasks (not_started, partially_completed, completed), "
-        "nested task checklist sub-items, interactive Markdown checklist notes & tags, gym days/exercises/stats, art days/WIPs/ideas, gaming tracker, and UI navigation.\n"
-        "2. When the user dumps multiple events at once (e.g. went to gym, drew art, watched a lecture with tags, need to research X later), "
-        "call ALL needed tools so everything lands in the right place.\n"
-        "3. When referring to an existing task or lecture note (e.g. 'check off the first step', 'add to that lecture note', 'mark it partially done') "
-        "and you do not already see its ID in recent history, call list_tasks or search_notes first.\n"
-        "4. Use checklist_items on create_task/create_note whenever the user lists steps, sub-tasks, or things to research/check later.\n"
-        "5. Never delete anything without explicit confirmation: first call delete_item with confirmed=false (or ask), and only pass confirmed=true after the user confirms.\n"
-        "6. Keep your final reply concise, friendly, and voice-ready (1 to 3 short sentences unless asked for details). "
-        "If anything is genuinely ambiguous between two items, ask a brief clarifying question."
+        "CRITICAL RULES:\n"
+        "1. **Clean up voice/Whisper typos**: Spoken transcripts may contain phonetic mistakes "
+        "(e.g. 'Stanford Asian Tech AI' or 'agent a key I' -> 'Stanford Agentic AI Course', "
+        "'publishing hardness' -> 'Publishing Harness', 'EREXO' -> 'Ericsson'). Always use clean, accurate titles.\n"
+        "2. **Decompose multi-item plans into SEPARATE Active Tasks**: When the user gives a task list or multi-part plan, "
+        "use `create_tasks_batch` with `list_type='daily'` (Active Tasks) to create a separate, well-named task for EACH goal/deliverable. "
+        "NEVER merge unrelated goals into one task, and NEVER dump a spoken task list as a raw note. "
+        "Watching/studying lectures as part of a to-do plan is a TASK (e.g. title 'Stanford Agentic AI Lectures 1-5' with checklist_items "
+        "['Lecture 1', 'Lecture 2', 'Lecture 3', 'Lecture 4', 'Lecture 5']), NOT a note. "
+        "Only use `create_note` or `append_to_note` when recording actual lecture content, ideas, or research notes.\n"
+        "3. **Always populate timelines, dates & frequencies**:\n"
+        "   - Compute exact `start_date` and `due_date` (`YYYY-MM-DD`) using the 14-day calendar above (e.g. 'next 10 days' -> start_date=today, due_date=+10d, timeline='Next 10 days').\n"
+        "   - Always fill `frequency` when a cadence or target amount is mentioned (e.g. '4x / week', '3 artworks in 10 days', '10-20 hours total').\n"
+        "   - Add concrete `checklist_items` when an item is countable (e.g. Lectures 1..5, Artwork 1..3, or subtasks).\n"
+        "   - Reserve `list_type='want_to_do'` strictly for unscheduled someday ideas with no timeline.\n"
+        "4. **Update hobby trackers too**: If the user mentions games (e.g. Elden Ring) or art projects, ALSO call `upsert_game` / `upsert_art` alongside creating any sprint tasks.\n"
+        "5. **Check existing records first**: When updating/checking off an existing task or lecture note without its ID in recent history, call `list_tasks` or `search_notes` first.\n"
+        "6. **Delete safety**: Never delete without explicit confirmation (`confirmed=false` first).\n"
+        "7. **Concise replies**: Confirm clearly what was created/updated in 1-3 short, friendly sentences. Ask a brief clarifying question only if genuinely ambiguous."
     )
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
@@ -221,7 +284,9 @@ async def run_agent_turn(
                         fn_name = str(fn.get("name") or "")
                         fn_args = _parse_tool_args(fn.get("arguments"))
                         out = tools.execute_tool(fn_name, fn_args)
-                        if out.get("action_badge"):
+                        if out.get("action_badges"):
+                            actions_taken.extend(out["action_badges"])
+                        elif out.get("action_badge"):
                             actions_taken.append(out["action_badge"])
                         if out.get("navigate_to"):
                             navigate_target = out["navigate_to"]

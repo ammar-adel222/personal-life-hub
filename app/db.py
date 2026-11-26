@@ -37,7 +37,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     list_type TEXT NOT NULL DEFAULT 'daily' CHECK(list_type IN ('daily', 'want_to_do')),
     category TEXT NOT NULL DEFAULT '',
     priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('normal', 'high')),
+    start_date TEXT,
     due_date TEXT,
+    timeline TEXT NOT NULL DEFAULT '',
+    frequency TEXT NOT NULL DEFAULT '',
     done INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'not_started'
         CHECK(status IN ('not_started', 'partially_completed', 'completed')),
@@ -160,6 +163,12 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
         )
     if "progress_note" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN progress_note TEXT NOT NULL DEFAULT ''")
+    if "start_date" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN start_date TEXT")
+    if "timeline" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN timeline TEXT NOT NULL DEFAULT ''")
+    if "frequency" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN frequency TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);")
 
 
@@ -282,13 +291,19 @@ def _row_to_task(
         "completed" if row["done"] else "not_started"
     )
     progress_note = row["progress_note"] if "progress_note" in row_keys else ""
+    start_date = row["start_date"] if "start_date" in row_keys else None
+    timeline = row["timeline"] if "timeline" in row_keys else ""
+    frequency = row["frequency"] if "frequency" in row_keys else ""
     return {
         "id": row["id"],
         "title": row["title"],
         "list_type": row["list_type"],
         "category": row["category"],
         "priority": row["priority"],
+        "start_date": start_date,
         "due_date": row["due_date"],
+        "timeline": timeline,
+        "frequency": frequency,
         "done": bool(row["done"]),
         "status": status,
         "progress_note": progress_note,
@@ -449,6 +464,9 @@ def create_task(
     status: str = "not_started",
     progress_note: str = "",
     checklist_items: list[str] | None = None,
+    start_date: str | None = None,
+    timeline: str = "",
+    frequency: str = "",
 ) -> dict[str, Any]:
     clean_title = title.strip()
     if not clean_title:
@@ -458,15 +476,30 @@ def create_task(
     st = status if status in TASK_STATUSES else "not_started"
     done_int = 1 if st == "completed" else 0
     completed_at = now_iso() if st == "completed" else None
+    start = start_date.strip() if isinstance(start_date, str) and start_date.strip() else None
     due = due_date.strip() if isinstance(due_date, str) and due_date.strip() else None
     ts = now_iso()
     with get_conn() as conn:
         cur = conn.execute(
             """
-            INSERT INTO tasks (title, list_type, category, priority, due_date, done, status, progress_note, created_at, completed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tasks (title, list_type, category, priority, start_date, due_date, timeline, frequency, done, status, progress_note, created_at, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (clean_title, lt, category.strip(), pr, due, done_int, st, progress_note.strip(), ts, completed_at),
+            (
+                clean_title,
+                lt,
+                category.strip(),
+                pr,
+                start,
+                due,
+                timeline.strip(),
+                frequency.strip(),
+                done_int,
+                st,
+                progress_note.strip(),
+                ts,
+                completed_at,
+            ),
         )
         task_id = int(cur.lastrowid)
         if checklist_items:
@@ -497,9 +530,14 @@ def update_task(task_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
         priority = patch.get("priority", existing["priority"])
         if priority not in TASK_PRIORITIES:
             priority = existing["priority"]
+        start_date = patch.get("start_date", existing["start_date"])
+        if isinstance(start_date, str):
+            start_date = start_date.strip() or None
         due_date = patch.get("due_date", existing["due_date"])
         if isinstance(due_date, str):
             due_date = due_date.strip() or None
+        timeline = str(patch.get("timeline", existing["timeline"])).strip()
+        frequency = str(patch.get("frequency", existing["frequency"])).strip()
         progress_note = str(patch.get("progress_note", existing["progress_note"])).strip()
 
         existing_status = (
@@ -524,11 +562,26 @@ def update_task(task_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
         conn.execute(
             """
             UPDATE tasks
-            SET title = ?, list_type = ?, category = ?, priority = ?, due_date = ?,
+            SET title = ?, list_type = ?, category = ?, priority = ?,
+                start_date = ?, due_date = ?, timeline = ?, frequency = ?,
                 done = ?, status = ?, progress_note = ?, completed_at = ?
             WHERE id = ?
             """,
-            (title, list_type, category, priority, due_date, int(done), status, progress_note, completed_at, task_id),
+            (
+                title,
+                list_type,
+                category,
+                priority,
+                start_date,
+                due_date,
+                timeline,
+                frequency,
+                int(done),
+                status,
+                progress_note,
+                completed_at,
+                task_id,
+            ),
         )
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         items_map = _fetch_task_items_map(conn, [task_id])
@@ -1460,10 +1513,10 @@ def search_everything(query: str, limit: int = 25) -> list[dict[str, Any]]:
         sub_items = task_items_map.get(r["id"], [])
         sub_text = " ".join(it["text"] for it in sub_items)
         t_obj = _row_to_task(r, sub_items)
-        text = f"{r['title']} {r['category']} {r['list_type']} {t_obj['progress_note']} {sub_text}"
+        text = f"{r['title']} {r['category']} {r['list_type']} {t_obj['timeline']} {t_obj['frequency']} {t_obj['progress_note']} {sub_text}"
         score = _score_match(q_lower, tokens, text, boost=0.2 if not t_obj["done"] else 0.0)
         if score > 0:
-            label = "Daily Task" if r["list_type"] == "daily" else "Want to Do"
+            label = "Active Task" if r["list_type"] == "daily" else "Want to Do"
             st_label = t_obj["status"].replace("_", " ").title()
             prog = (
                 f" · {t_obj['checklist_done']}/{t_obj['checklist_total']}"

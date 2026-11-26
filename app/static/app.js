@@ -19,7 +19,7 @@ const state = {
   captureMode: "auto",
   settings: null,
   voiceMode: "auto_ai",
-  autoSilence: true,
+  autoSilence: false,
   continuousVoice: false,
   recording: false,
   voiceBusy: false,
@@ -132,7 +132,7 @@ async function refreshSettingsBadge() {
     const s = await api("/api/settings");
     state.settings = s;
     state.voiceMode = s.voice_mode || "auto_ai";
-    state.autoSilence = s.auto_silence !== undefined ? Boolean(s.auto_silence) : true;
+    state.autoSilence = s.auto_silence !== undefined ? Boolean(s.auto_silence) : false;
     updateVoiceModeLabel();
     const pill = document.getElementById("sidebar-ai-status");
     if (s.has_api_key) {
@@ -228,6 +228,9 @@ async function playAgentSpeech(text, isQuestion = false, forceSpeak = false) {
     }
     const data = await resp.json().catch(() => ({}));
     if (data && data.fallback_local) {
+      if (forceSpeak && data.reason && String(data.reason).toLowerCase().includes("terms")) {
+        toast("Using Windows speech (accept Orpheus terms in Groq Console for AI voice)", "info");
+      }
       await speakLocal(text);
     }
   } catch {
@@ -293,7 +296,7 @@ async function handleAgentResponse(res, transcriptPrefix = "") {
   }
   const msg = res.warning ? `${res.reply} (${res.warning})` : res.reply;
   const fullToast = transcriptPrefix ? `🎙️ "${transcriptPrefix}" → ${msg}` : msg;
-  toast(fullToast || "Done!", res.warning ? "info" : "success");
+  toast(fullToast || "Done!", res.warning ? "error" : "success");
 
   if (res.navigate_to && res.navigate_to !== state.view) {
     await switchView(res.navigate_to);
@@ -464,6 +467,35 @@ function taskStatusBadge(t) {
   return "";
 }
 
+function formatDueBadge(dueDate, done) {
+  if (!dueDate) return "";
+  if (done) return `<span class="badge">Due ${esc(dueDate)}</span>`;
+  const [ty, tm, td] = localTodayStr().split("-").map(Number);
+  const [dy, dm, dd] = dueDate.split("-").map(Number);
+  if (!dy || !dm || !dd) return `<span class="badge">Due ${esc(dueDate)}</span>`;
+  const diffDays = Math.round((new Date(dy, dm - 1, dd) - new Date(ty, tm - 1, td)) / 86400000);
+  if (diffDays < 0) {
+    return `<span class="badge badge-high">Due ${esc(dueDate)} (${Math.abs(diffDays)}d overdue)</span>`;
+  }
+  if (diffDays === 0) {
+    return `<span class="badge badge-art">Due Today</span>`;
+  }
+  return `<span class="badge">Due ${esc(dueDate)} · ${diffDays}d left</span>`;
+}
+
+function taskMetaBadges(t) {
+  return `
+    ${taskStatusBadge(t)}
+    ${t.checklist_total ? `<span class="badge">${t.checklist_done}/${t.checklist_total} steps</span>` : ""}
+    ${t.timeline ? `<span class="badge badge-accent">🗓️ ${esc(t.timeline)}</span>` : ""}
+    ${t.frequency ? `<span class="badge badge-gym">🔁 ${esc(t.frequency)}</span>` : ""}
+    ${t.priority === "high" ? '<span class="badge badge-high">High</span>' : ""}
+    ${t.category ? `<span class="badge">${esc(t.category)}</span>` : ""}
+    ${formatDueBadge(t.due_date, t.done)}
+    ${t.progress_note ? `<span style="color:var(--art)">Note: ${esc(t.progress_note)}</span>` : ""}
+  `;
+}
+
 async function renderHub() {
   const data = await api("/api/dashboard");
   state.dashboard = data;
@@ -478,17 +510,12 @@ async function renderHub() {
         <button type="button" class="status-btn ${esc(t.status)}" data-hub-cycle="${t.id}" data-cur="${esc(t.status)}" title="Cycle: Not Started → Partial → Completed">${taskStatusIcon(t.status)}</button>
         <div class="row-main">
           <div class="row-title">${esc(t.title)}</div>
-          <div class="row-meta">
-            ${taskStatusBadge(t)}
-            ${t.checklist_total ? `<span class="badge">${t.checklist_done}/${t.checklist_total}</span>` : ""}
-            ${t.priority === "high" ? '<span class="badge badge-high">High</span>' : ""}
-            ${t.due_date ? `<span>Due ${esc(t.due_date)}</span>` : ""}
-          </div>
+          <div class="row-meta">${taskMetaBadges(t)}</div>
         </div>
       </div>`
         )
         .join("")
-    : `<div class="empty-state">All caught up on daily tasks!</div>`;
+    : `<div class="empty-state">All caught up on active tasks!</div>`;
 
   const wantHtml = data.want_to_do.length
     ? data.want_to_do
@@ -564,7 +591,7 @@ async function renderHub() {
 
     <div class="stat-strip">
       <div class="stat-card">
-        <span class="stat-label">Daily Tasks</span>
+        <span class="stat-label">Active Tasks</span>
         <span class="stat-value">${data.daily_open_count} open <span style="font-size:13px;color:var(--muted)">(${data.daily_done_today_count} done)</span></span>
       </div>
       <div class="stat-card">
@@ -584,7 +611,7 @@ async function renderHub() {
     <div class="grid-2">
       <div class="card">
         <div class="card-header">
-          <h2 class="card-title">✅ Daily Tasks</h2>
+          <h2 class="card-title">✅ Active Tasks</h2>
           <button class="btn btn-xs btn-ghost" data-jump-view="tasks">Open All</button>
         </div>
         <div class="item-list">${taskHtml}</div>
@@ -679,14 +706,7 @@ async function renderTasks() {
         </button>
         <div class="row-main">
           <div class="row-title">${esc(t.title)}</div>
-          <div class="row-meta">
-            ${taskStatusBadge(t)}
-            ${t.checklist_total ? `<span class="badge">${t.checklist_done}/${t.checklist_total} steps</span>` : ""}
-            ${t.priority === "high" ? '<span class="badge badge-high">High</span>' : ""}
-            ${t.category ? `<span class="badge">${esc(t.category)}</span>` : ""}
-            ${t.due_date ? `<span>Due ${esc(t.due_date)}</span>` : ""}
-            ${t.progress_note ? `<span style="color:var(--art)">Note: ${esc(t.progress_note)}</span>` : ""}
-          </div>
+          <div class="row-meta">${taskMetaBadges(t)}</div>
           ${
             t.checklist_total
               ? `<div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>`
@@ -696,7 +716,7 @@ async function renderTasks() {
         <div class="row-actions">
           ${
             isWant
-              ? `<button class="btn btn-xs btn-ghost" data-move-list="${t.id}" data-target="daily" title="Move to Daily Tasks">→ Daily</button>`
+              ? `<button class="btn btn-xs btn-ghost" data-move-list="${t.id}" data-target="daily" title="Move to Active Tasks">→ Active</button>`
               : `<button class="btn btn-xs btn-ghost" data-move-list="${t.id}" data-target="want_to_do" title="Move to Want to Do">→ Someday</button>`
           }
           <button class="btn btn-xs btn-danger" data-del-task="${t.id}" title="Delete">✕</button>
@@ -752,20 +772,22 @@ async function renderTasks() {
     <div class="grid-2">
       <div class="card">
         <div class="card-header">
-          <h2 class="card-title">Daily Tasks <span class="badge badge-accent">${daily.filter((x) => !x.done).length} open</span></h2>
+          <h2 class="card-title">Active Tasks <span class="badge badge-accent">${daily.filter((x) => !x.done).length} open</span></h2>
         </div>
         <form id="form-daily-task" class="inline-form">
           <input id="daily-title" class="input grow" type="text" placeholder="Task title…" required />
           <input id="daily-steps" class="input grow" type="text" placeholder="Checklist steps (comma-separated, optional)" />
+          <input id="daily-timeline" class="input" type="text" placeholder="Timeline (e.g. Next 10d)" style="width:145px" />
+          <input id="daily-frequency" class="input" type="text" placeholder="Frequency (e.g. 4x/wk)" style="width:140px" />
           <select id="daily-priority">
             <option value="normal">Normal</option>
             <option value="high">High</option>
           </select>
-          <input id="daily-due" class="input" type="date" />
+          <input id="daily-due" class="input" type="date" title="Due date" />
           <button type="submit" class="btn btn-primary btn-sm">Add</button>
         </form>
         <div class="item-list">
-          ${daily.length ? daily.map((t) => renderTaskRow(t, false)).join("") : '<div class="empty-state">No matching daily tasks.</div>'}
+          ${daily.length ? daily.map((t) => renderTaskRow(t, false)).join("") : '<div class="empty-state">No matching active tasks.</div>'}
         </div>
       </div>
 
@@ -809,6 +831,8 @@ async function renderTasks() {
         list_type: "daily",
         priority: el.querySelector("#daily-priority").value,
         due_date: el.querySelector("#daily-due").value || null,
+        timeline: el.querySelector("#daily-timeline").value.trim(),
+        frequency: el.querySelector("#daily-frequency").value.trim(),
         checklist_items: checklistItems,
       },
     });
@@ -2087,7 +2111,7 @@ async function renderSettings() {
         <div class="field-group">
           <label class="field-label">Groq Chat Model</label>
           <select id="set-groq-model">
-            ${(settings.allowed_models || ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"])
+            ${(settings.allowed_models || ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"])
               .map(
                 (m) =>
                   `<option value="${esc(m)}" ${settings.groq_model === m ? "selected" : ""}>${esc(m)}</option>`
@@ -2141,7 +2165,7 @@ async function renderSettings() {
           <div class="field-group">
             <label class="field-label">Silence Pause Delay</label>
             <select id="set-silence-seconds">
-              ${[1.2, 1.8, 2.5, 3.5]
+              ${[1.8, 2.5, 3.5, 5.0]
                 .map(
                   (sec) =>
                     `<option value="${sec}" ${Number(settings.silence_seconds) === sec ? "selected" : ""}>${sec}s pause</option>`
