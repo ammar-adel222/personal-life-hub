@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app import db, dialogs
+from app import ai, db, dialogs, notes_sync, voice
 from app.config import (
     get_data_dir,
     get_media_dir,
@@ -31,6 +31,12 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 async def lifespan(_app: FastAPI):
     get_data_dir()
     db.init_db()
+    notes_folder = load_settings().get("notes_folder", "").strip()
+    if notes_folder:
+        try:
+            notes_sync.sync_notes_folder(notes_folder)
+        except Exception:
+            pass
     yield
 
 
@@ -141,6 +147,28 @@ class SettingsUpdate(BaseModel):
     weight_unit: str | None = None
 
 
+class CapturePayload(BaseModel):
+    text: str
+    mode: str = "auto"
+    source: str = "text"
+
+
+class AskPayload(BaseModel):
+    question: str
+
+
+class TestGroqPayload(BaseModel):
+    api_key: str | None = None
+
+
+class NotesSyncPayload(BaseModel):
+    folder: str | None = None
+
+
+class VoiceStopPayload(BaseModel):
+    voice_mode: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Health & Dashboard
 # ---------------------------------------------------------------------------
@@ -226,7 +254,12 @@ def post_note(payload: NoteCreate) -> dict[str, Any]:
             tags=payload.tags,
             pinned=payload.pinned,
         )
-    except ValueError as exc:
+        if payload.save_to_folder:
+            folder = load_settings().get("notes_folder", "").strip()
+            if not folder:
+                raise ValueError("Configure a local notes folder in Settings first.")
+            item = notes_sync.save_new_note_to_folder(item, folder)
+    except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"item": item}
 
@@ -240,6 +273,11 @@ def patch_note(note_id: int, payload: NoteUpdate) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not item:
         raise HTTPException(status_code=404, detail="Note not found.")
+    if item.get("source_path") and any(k in patch for k in ("title", "content")):
+        try:
+            item = notes_sync.write_note_to_source(item)
+        except OSError:
+            pass
     return {"item": item}
 
 
@@ -248,6 +286,17 @@ def remove_note(note_id: int) -> dict[str, Any]:
     if not db.delete_note(note_id):
         raise HTTPException(status_code=404, detail="Note not found.")
     return {"deleted": True}
+
+
+@app.post("/api/notes/sync")
+def sync_notes(payload: NotesSyncPayload | None = None) -> dict[str, Any]:
+    folder = (payload.folder if payload and payload.folder else "") or load_settings().get("notes_folder", "")
+    try:
+        return notes_sync.sync_notes_folder(folder)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +535,93 @@ def remove_game(game_id: int) -> dict[str, Any]:
     if not db.delete_game(game_id):
         raise HTTPException(status_code=404, detail="Game not found.")
     return {"deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Smart Capture, AI Search & Voice Input
+# ---------------------------------------------------------------------------
+
+@app.post("/api/capture")
+async def post_capture(payload: CapturePayload) -> dict[str, Any]:
+    try:
+        return await ai.smart_capture(
+            raw_text=payload.text,
+            source=payload.source,
+            mode=payload.mode,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/captures")
+def get_captures(limit: int = 20) -> dict[str, Any]:
+    return {"items": db.list_captures(limit=limit)}
+
+
+@app.post("/api/ai/ask")
+async def post_ai_ask(payload: AskPayload) -> dict[str, Any]:
+    try:
+        return await ai.ask_my_life(payload.question)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/settings/test-groq")
+async def test_groq(payload: TestGroqPayload | None = None) -> dict[str, Any]:
+    key = (payload.api_key if payload and payload.api_key else "") or load_settings().get("groq_api_key", "")
+    try:
+        return await ai.verify_groq_key(key)
+    except ai.AIError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Network error contacting Groq: {exc}") from exc
+
+
+@app.get("/api/voice/devices")
+def get_voice_devices() -> dict[str, Any]:
+    return {"devices": voice.list_microphones()}
+
+
+@app.get("/api/voice/status")
+def get_voice_status() -> dict[str, Any]:
+    return voice.recorder.status()
+
+
+@app.post("/api/voice/start")
+def post_voice_start() -> dict[str, Any]:
+    settings = load_settings()
+    try:
+        return voice.recorder.start(device=settings.get("mic_device"))
+    except voice.VoiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/voice/stop")
+async def post_voice_stop(payload: VoiceStopPayload | None = None) -> dict[str, Any]:
+    settings = load_settings()
+    api_key = settings.get("groq_api_key", "").strip()
+    mode = (payload.voice_mode if payload and payload.voice_mode else "") or settings.get("voice_mode", "auto_ai")
+    try:
+        wav_bytes = voice.recorder.stop()
+        transcript = await voice.transcribe_wav_groq(wav_bytes, api_key)
+    except voice.VoiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Whisper request failed: {exc}") from exc
+
+    capture_result = None
+    if mode == "auto_ai":
+        capture_result = await ai.smart_capture(transcript, source="voice", mode="auto")
+    return {
+        "transcript": transcript,
+        "voice_mode": mode,
+        "capture": capture_result,
+    }
+
+
+@app.post("/api/voice/cancel")
+def post_voice_cancel() -> dict[str, Any]:
+    return voice.recorder.cancel()
 
 
 # ---------------------------------------------------------------------------

@@ -29,15 +29,108 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    list_type TEXT NOT NULL DEFAULT 'daily' CHECK(list_type IN ('daily', 'want_to_do')),
+    category TEXT NOT NULL DEFAULT '',
+    priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('normal', 'high')),
+    due_date TEXT,
+    done INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]',
+    pinned INTEGER NOT NULL DEFAULT 0,
+    source_path TEXT UNIQUE,
+    file_mtime REAL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS activity_days (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain TEXT NOT NULL CHECK(domain IN ('gym', 'art')),
+    date TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    UNIQUE(domain, date)
+);
+
+CREATE TABLE IF NOT EXISTS gym_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    exercise TEXT NOT NULL,
+    sets INTEGER NOT NULL DEFAULT 1,
+    reps INTEGER NOT NULL DEFAULT 0,
+    weight REAL,
+    unit TEXT NOT NULL DEFAULT 'kg',
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS art_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'idea' CHECK(status IN ('idea', 'wip', 'finished')),
+    notes TEXT NOT NULL DEFAULT '',
+    image_files TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS games (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'want_to_play'
+        CHECK(status IN ('playing', 'want_to_play', 'finished', 'on_hold')),
+    platform TEXT NOT NULL DEFAULT '',
+    rating INTEGER CHECK(rating IS NULL OR (rating >= 1 AND rating <= 10)),
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS capture_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    raw_text TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'text',
+    summary TEXT NOT NULL DEFAULT '',
+    actions_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_list_done ON tasks(list_type, done);
+CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(pinned DESC, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_activity_domain_date ON activity_days(domain, date DESC);
+CREATE INDEX IF NOT EXISTS idx_gym_logs_date ON gym_logs(date DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_gym_logs_exercise ON gym_logs(exercise COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_art_status ON art_items(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_games_status ON games(status, updated_at DESC);
+"""
+
+_initialized_db_paths: set[str] = set()
+
+
 @contextmanager
 def get_conn() -> Iterator[sqlite3.Connection]:
     """Yield a configured SQLite connection with automatic commit/rollback."""
     db_path = get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved = str(db_path.resolve())
+    existed = db_path.exists()
     conn = sqlite3.connect(str(db_path), timeout=15.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
+    if not existed or resolved not in _initialized_db_paths:
+        conn.executescript(_SCHEMA_SQL)
+        _initialized_db_paths.add(resolved)
     try:
         yield conn
         conn.commit()
@@ -51,92 +144,8 @@ def get_conn() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     """Initialize all SQLite tables and indexes if they do not exist."""
     with get_conn() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                list_type TEXT NOT NULL DEFAULT 'daily' CHECK(list_type IN ('daily', 'want_to_do')),
-                category TEXT NOT NULL DEFAULT '',
-                priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('normal', 'high')),
-                due_date TEXT,
-                done INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                completed_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS notes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL DEFAULT '',
-                content TEXT NOT NULL DEFAULT '',
-                tags TEXT NOT NULL DEFAULT '[]',
-                pinned INTEGER NOT NULL DEFAULT 0,
-                source_path TEXT UNIQUE,
-                file_mtime REAL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS activity_days (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                domain TEXT NOT NULL CHECK(domain IN ('gym', 'art')),
-                date TEXT NOT NULL,
-                note TEXT NOT NULL DEFAULT '',
-                UNIQUE(domain, date)
-            );
-
-            CREATE TABLE IF NOT EXISTS gym_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                exercise TEXT NOT NULL,
-                sets INTEGER NOT NULL DEFAULT 1,
-                reps INTEGER NOT NULL DEFAULT 0,
-                weight REAL,
-                unit TEXT NOT NULL DEFAULT 'kg',
-                notes TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS art_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'idea' CHECK(status IN ('idea', 'wip', 'finished')),
-                notes TEXT NOT NULL DEFAULT '',
-                image_files TEXT NOT NULL DEFAULT '[]',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS games (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'want_to_play'
-                    CHECK(status IN ('playing', 'want_to_play', 'finished', 'on_hold')),
-                platform TEXT NOT NULL DEFAULT '',
-                rating INTEGER CHECK(rating IS NULL OR (rating >= 1 AND rating <= 10)),
-                notes TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS capture_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                raw_text TEXT NOT NULL,
-                source TEXT NOT NULL DEFAULT 'text',
-                summary TEXT NOT NULL DEFAULT '',
-                actions_json TEXT NOT NULL DEFAULT '[]',
-                created_at TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_tasks_list_done ON tasks(list_type, done);
-            CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(pinned DESC, updated_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_activity_domain_date ON activity_days(domain, date DESC);
-            CREATE INDEX IF NOT EXISTS idx_gym_logs_date ON gym_logs(date DESC, id DESC);
-            CREATE INDEX IF NOT EXISTS idx_gym_logs_exercise ON gym_logs(exercise COLLATE NOCASE);
-            CREATE INDEX IF NOT EXISTS idx_art_status ON art_items(status, updated_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_games_status ON games(status, updated_at DESC);
-            """
-        )
+        conn.executescript(_SCHEMA_SQL)
+        _initialized_db_paths.add(str(get_db_path().resolve()))
 
 
 def _parse_json_list(raw: str | None) -> list[Any]:
