@@ -61,6 +61,12 @@ class TaskCreate(BaseModel):
     status: str = "not_started"
     progress_note: str = ""
     checklist_items: list[str] = Field(default_factory=list)
+    parent_task_id: int | None = None
+    parent_item_id: int | None = None
+    is_recurring: bool | None = None
+    target_days: int | None = None
+    daily_target_minutes: int | None = None
+    auto_link_parent: bool = True
 
 
 class TaskUpdate(BaseModel):
@@ -72,9 +78,20 @@ class TaskUpdate(BaseModel):
     due_date: str | None = None
     timeline: str | None = None
     frequency: str | None = None
+    parent_task_id: int | None = None
+    parent_item_id: int | None = None
+    is_recurring: bool | None = None
+    target_days: int | None = None
+    daily_target_minutes: int | None = None
     done: bool | None = None
     status: str | None = None
     progress_note: str | None = None
+
+
+class TaskDoneTodayPayload(BaseModel):
+    done: bool | None = None
+    date: str | None = None
+    note: str = ""
 
 
 class TaskItemCreate(BaseModel):
@@ -397,10 +414,37 @@ def post_task(payload: TaskCreate) -> dict[str, Any]:
             start_date=payload.start_date,
             timeline=payload.timeline,
             frequency=payload.frequency,
+            parent_task_id=payload.parent_task_id,
+            parent_item_id=payload.parent_item_id,
+            is_recurring=payload.is_recurring,
+            target_days=payload.target_days,
+            daily_target_minutes=payload.daily_target_minutes,
+            auto_link_parent=payload.auto_link_parent,
         )
         return {"item": item}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/tasks/auto-link")
+def post_tasks_auto_link() -> dict[str, Any]:
+    return db.auto_link_existing_tasks()
+
+
+@app.post("/api/tasks/{task_id}/done-today")
+def post_task_done_today(task_id: int, payload: TaskDoneTodayPayload | None = None) -> dict[str, Any]:
+    try:
+        item = db.toggle_task_done_today(
+            task_id,
+            day_date=payload.date if payload else None,
+            done=payload.done if payload else None,
+            note=payload.note if payload else "",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not item:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    return {"item": item}
 
 
 @app.patch("/api/tasks/{task_id}")
@@ -912,7 +956,7 @@ def get_timer_overview() -> dict[str, Any]:
 
 @app.get("/api/timer/state")
 def get_live_timer_state() -> dict[str, Any]:
-    return {"state": db.get_timer_state()}
+    return {"state": db.get_timer_state(), "stats": db.get_study_stats()}
 
 
 @app.post("/api/timer/control")
@@ -921,7 +965,7 @@ def post_timer_control(payload: TimerControlPayload) -> dict[str, Any]:
     logged_session: dict[str, Any] | None = None
     try:
         if action == "start":
-            state = db.start_timer(
+            started = db.start_timer_and_autosave(
                 mode=payload.mode,
                 duration_minutes=payload.duration_minutes,
                 break_minutes=payload.break_minutes,
@@ -931,6 +975,8 @@ def post_timer_control(payload: TimerControlPayload) -> dict[str, Any]:
                 note_id=payload.note_id,
                 notes=payload.notes or "",
             )
+            state = started["state"]
+            logged_session = started["previous_logged_session"]
         elif action == "pause":
             state = db.pause_timer()
         elif action == "resume":

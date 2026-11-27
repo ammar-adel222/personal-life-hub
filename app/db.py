@@ -50,6 +50,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     due_date TEXT,
     timeline TEXT NOT NULL DEFAULT '',
     frequency TEXT NOT NULL DEFAULT '',
+    parent_task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+    parent_item_id INTEGER,
+    is_recurring INTEGER NOT NULL DEFAULT 0,
+    target_days INTEGER NOT NULL DEFAULT 0,
+    daily_target_minutes INTEGER NOT NULL DEFAULT 0,
     done INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'not_started'
         CHECK(status IN ('not_started', 'partially_completed', 'completed')),
@@ -64,6 +69,15 @@ CREATE TABLE IF NOT EXISTS task_items (
     text TEXT NOT NULL,
     done INTEGER NOT NULL DEFAULT 0,
     position INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS task_daily_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    date TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    completed_at TEXT NOT NULL,
+    UNIQUE(task_id, date)
 );
 
 CREATE TABLE IF NOT EXISTS notes (
@@ -233,7 +247,19 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN timeline TEXT NOT NULL DEFAULT ''")
     if "frequency" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN frequency TEXT NOT NULL DEFAULT ''")
+    if "parent_task_id" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN parent_task_id INTEGER")
+    if "parent_item_id" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN parent_item_id INTEGER")
+    if "is_recurring" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN is_recurring INTEGER NOT NULL DEFAULT 0")
+    if "target_days" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN target_days INTEGER NOT NULL DEFAULT 0")
+    if "daily_target_minutes" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN daily_target_minutes INTEGER NOT NULL DEFAULT 0")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_task_daily_logs_task_date ON task_daily_logs(task_id, date DESC);")
 
     note_cols = {r["name"] for r in conn.execute("PRAGMA table_info(notes)").fetchall()}
     if "folder" not in note_cols:
@@ -357,6 +383,8 @@ def _row_to_task_item(row: sqlite3.Row) -> dict[str, Any]:
 def _row_to_task(
     row: sqlite3.Row,
     checklist_items: list[dict[str, Any]] | None = None,
+    *,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     items = checklist_items if checklist_items is not None else []
     done_count = sum(1 for item in items if item["done"])
@@ -368,6 +396,40 @@ def _row_to_task(
     start_date = row["start_date"] if "start_date" in row_keys else None
     timeline = row["timeline"] if "timeline" in row_keys else ""
     frequency = row["frequency"] if "frequency" in row_keys else ""
+    parent_task_id = row["parent_task_id"] if "parent_task_id" in row_keys else None
+    parent_item_id = row["parent_item_id"] if "parent_item_id" in row_keys else None
+    raw_rec = bool(row["is_recurring"]) if "is_recurring" in row_keys else False
+    raw_days = int(row["target_days"] or 0) if "target_days" in row_keys else 0
+    raw_daily_mins = int(row["daily_target_minutes"] or 0) if "daily_target_minutes" in row_keys else 0
+
+    inf_rec, inf_days, inf_mins = infer_recurrence_fields(
+        row["title"],
+        timeline=timeline or "",
+        frequency=frequency or "",
+        start_date=start_date,
+        due_date=row["due_date"],
+    )
+    is_rec = raw_rec or inf_rec
+    target_days = raw_days if raw_days > 0 else (inf_days if is_rec else 0)
+    daily_mins = raw_daily_mins if raw_daily_mins > 0 else (inf_mins if is_rec else 0)
+
+    ext = extra or {}
+    today = today_str()
+    due = row["due_date"]
+    tl_low = (timeline or "").lower()
+    is_today_task = False
+    if row["list_type"] == "daily":
+        if parent_task_id is not None:
+            is_today_task = True
+        elif due == today or "today" in tl_low:
+            is_today_task = True
+        elif not is_rec and target_days <= 1 and not (due and due > today) and "next " not in tl_low and len(items) < 2:
+            is_today_task = True
+
+    daily_dates = ext.get("daily_dates", [])
+    days_completed = len(daily_dates)
+    done_today = today in daily_dates
+
     return {
         "id": row["id"],
         "title": row["title"],
@@ -375,9 +437,25 @@ def _row_to_task(
         "category": row["category"],
         "priority": row["priority"],
         "start_date": start_date,
-        "due_date": row["due_date"],
+        "due_date": due,
         "timeline": timeline,
         "frequency": frequency,
+        "parent_task_id": parent_task_id,
+        "parent_task_title": ext.get("parent_task_title", ""),
+        "parent_item_id": parent_item_id,
+        "parent_item_text": ext.get("parent_item_text", ""),
+        "is_recurring": is_rec,
+        "target_days": target_days,
+        "daily_target_minutes": daily_mins,
+        "daily_dates": daily_dates,
+        "days_completed": days_completed,
+        "done_today": done_today,
+        "daily_streak": ext.get("daily_streak", 0),
+        "child_count": ext.get("child_count", 0),
+        "child_done_today_count": ext.get("child_done_today_count", 0),
+        "study_seconds_today": ext.get("study_seconds_today", 0),
+        "study_seconds_total": ext.get("study_seconds_total", 0),
+        "is_today_task": is_today_task,
         "done": bool(row["done"]),
         "status": status,
         "progress_note": progress_note,
@@ -456,6 +534,402 @@ def _row_to_gym_log(row: sqlite3.Row) -> dict[str, Any]:
 # Tasks & Want to Do
 # ---------------------------------------------------------------------------
 
+_RECURRING_TEXT_RE = re.compile(
+    r"\b(daily|every\s*day|each\s*day|a\s*day|per\s*day)\b|/\s*day\b",
+    flags=re.IGNORECASE,
+)
+_DAYS_TARGET_RE = re.compile(
+    r"(?:next\s+|for\s+|over\s+)?(\d{1,3})\s*(?:days?|d)\b",
+    flags=re.IGNORECASE,
+)
+_TASK_STOPWORDS = {
+    "the", "a", "an", "for", "of", "to", "on", "in", "at", "by", "with", "and",
+    "or", "my", "today", "todays", "today's", "daily", "task", "tasks", "todo",
+    "list", "next", "days", "day", "week", "weeks", "hour", "hours", "hr", "hrs",
+    "min", "mins", "minute", "minutes", "timer", "practice", "study", "studying",
+    "watch", "watching", "read", "reading", "complete", "completed", "finish",
+    "finished", "do", "did", "done", "make", "create", "problems", "problem",
+    "session", "sessions", "portion", "part", "item", "step", "steps", "work",
+    "some", "more", "start", "opening", "open", "bigger", "parent", "plan",
+}
+_GENERIC_TOPIC_TOKENS = {
+    "project", "projects", "course", "courses", "lecture", "lectures", "survey",
+    "surveys", "video", "videos", "notes", "note", "paper", "papers", "review",
+    "research", "coding", "learning", "goal", "goals", "track", "test", "tests",
+}
+
+
+def _extract_minutes_sum(text: str) -> int:
+    raw = (text or "").strip().lower()
+    if not raw:
+        return 0
+    total = 0.0
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|hr)\b", raw):
+        total += float(m.group(1)) * 60.0
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*(minutes?|mins?|min)\b", raw):
+        total += float(m.group(1))
+    # Shorthand like 1h or 30m when not already followed by hours/minutes
+    cleaned = re.sub(r"\d+(?:\.\d+)?\s*(?:hours?|hrs?|hr|minutes?|mins?|min)\b", " ", raw)
+    for m in re.finditer(r"(?<![a-z0-9])(\d+(?:\.\d+)?)\s*([hm])\b", cleaned):
+        val = float(m.group(1))
+        total += val * 60.0 if m.group(2) == "h" else val
+    return int(round(total)) if total > 0 else 0
+
+
+def infer_recurrence_fields(
+    title: str,
+    timeline: str = "",
+    frequency: str = "",
+    start_date: str | None = None,
+    due_date: str | None = None,
+) -> tuple[bool, int, int]:
+    """Infer (is_recurring, target_days, daily_target_minutes) from task text fields."""
+    combined = f"{title} {timeline} {frequency}".strip()
+    is_rec = bool(_RECURRING_TEXT_RE.search(combined))
+
+    target_days = 0
+    m_days = _DAYS_TARGET_RE.search(f"{timeline} {frequency} {title}")
+    if m_days:
+        val = int(m_days.group(1))
+        if 1 < val <= 365:
+            target_days = val
+    elif is_rec and start_date and due_date:
+        try:
+            diff = (dt_date.fromisoformat(due_date) - dt_date.fromisoformat(start_date)).days
+            if 1 < diff <= 365:
+                target_days = diff
+        except ValueError:
+            pass
+
+    daily_mins = _extract_minutes_sum(frequency)
+    if daily_mins == 0 and is_rec:
+        daily_mins = _extract_minutes_sum(title)
+    return is_rec, target_days, daily_mins
+
+
+def _norm_token(tok: str) -> str:
+    if len(tok) > 4 and tok.endswith("s") and not tok.endswith("ss"):
+        return tok[:-1]
+    return tok
+
+
+def _tokenize_task_text(text: str) -> set[str]:
+    raw_tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    out: set[str] = set()
+    for tok in raw_tokens:
+        if len(tok) < 2:
+            continue
+        if re.fullmatch(r"\d+[a-z]*", tok):
+            continue
+        if tok in _TASK_STOPWORDS:
+            continue
+        norm = _norm_token(tok)
+        if norm in _TASK_STOPWORDS or len(norm) < 2:
+            continue
+        out.add(norm)
+    return out
+
+
+def _analyze_parent_candidates_conn(
+    conn: sqlite3.Connection,
+    title: str,
+    *,
+    timeline: str = "",
+    frequency: str = "",
+    due_date: str | None = None,
+    exclude_task_id: int | None = None,
+) -> dict[str, Any]:
+    """Classify parent goal matches into auto-link vs ambiguous candidate prompts vs none."""
+    child_tokens = _tokenize_task_text(title)
+    if not child_tokens:
+        return {"parent_task_id": None, "parent_item_id": None, "possible_parents": []}
+
+    today = today_str()
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE list_type = 'daily' AND done = 0 AND parent_task_id IS NULL ORDER BY id DESC"
+    ).fetchall()
+    if not rows:
+        return {"parent_task_id": None, "parent_item_id": None, "possible_parents": []}
+
+    items_map = _fetch_task_items_map(conn, [r["id"] for r in rows])
+    title_norm = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+
+    scored: list[dict[str, Any]] = []
+    for r in rows:
+        pid = int(r["id"])
+        if exclude_task_id is not None and pid == exclude_task_id:
+            continue
+        r_keys = r.keys()
+        p_tl = r["timeline"] if "timeline" in r_keys else ""
+        p_freq = r["frequency"] if "frequency" in r_keys else ""
+        p_rec, p_days, _ = infer_recurrence_fields(
+            r["title"], timeline=p_tl, frequency=p_freq, start_date=r["start_date"], due_date=r["due_date"]
+        )
+        p_rec_flag = p_rec or (bool(r["is_recurring"]) if "is_recurring" in r_keys else False)
+        p_days_val = max(int(r["target_days"] or 0) if "target_days" in r_keys else 0, p_days)
+        c_items = items_map.get(pid, [])
+
+        is_goal_candidate = (
+            p_rec_flag
+            or p_days_val > 1
+            or bool(r["due_date"] and r["due_date"] > today)
+            or "next " in (p_tl or "").lower()
+            or len(c_items) >= 2
+        )
+        if not is_goal_candidate:
+            continue
+
+        parent_tokens = _tokenize_task_text(f"{r['title']} {r['category']}")
+        overlap = child_tokens & parent_tokens
+
+        # Check specific checklist item match on parent
+        best_item_id: int | None = None
+        best_item_score = 0.0
+        for sub in c_items:
+            sub_norm = re.sub(r"[^a-z0-9]+", " ", sub["text"].lower()).strip()
+            sub_toks = _tokenize_task_text(sub["text"])
+            sub_overlap = child_tokens & sub_toks
+            specific_sub = [tok for tok in sub_overlap if tok not in _GENERIC_TOPIC_TOKENS]
+            item_bonus = 0.05 if not sub["done"] else 0.0
+            if len(sub_norm.split()) >= 2 and re.search(rf"\b{re.escape(sub_norm)}\b", title_norm) and overlap:
+                cand_score = 0.94 + item_bonus
+                if cand_score > best_item_score:
+                    best_item_score = cand_score
+                    best_item_id = int(sub["id"])
+            elif sub_overlap and overlap and (
+                specific_sub or (len(sub_toks) >= 2 and len(sub_overlap) == len(sub_toks))
+            ):
+                cand_score = 0.88 + item_bonus + 0.01 * min(3, len(sub_overlap))
+                if cand_score > best_item_score:
+                    best_item_score = cand_score
+                    best_item_id = int(sub["id"])
+
+        containment = len(overlap) / max(1, min(len(child_tokens), len(parent_tokens)))
+        specific_overlap = [
+            tok for tok in overlap if len(tok) >= 5 and tok not in _GENERIC_TOPIC_TOKENS
+        ]
+        strong_specific = [
+            tok for tok in overlap if len(tok) >= 6 and tok not in _GENERIC_TOPIC_TOKENS
+        ]
+
+        title_score = 0.0
+        if len(overlap) >= 2 and containment >= 0.5:
+            title_score = 0.84 + min(0.1, 0.02 * len(overlap))
+        elif (strong_specific and containment >= 0.30) or (specific_overlap and containment >= 0.45):
+            title_score = 0.82
+        elif specific_overlap and containment >= 0.20:
+            title_score = 0.58
+        elif len(overlap) >= 1:
+            title_score = 0.46
+
+        final_score = max(best_item_score, title_score)
+        if final_score >= 0.35:
+            matched_terms = sorted(overlap)
+            scored.append(
+                {
+                    "id": pid,
+                    "title": r["title"],
+                    "timeline": p_tl,
+                    "is_recurring": bool(p_rec_flag),
+                    "item_id": best_item_id,
+                    "score": round(final_score, 3),
+                    "reason": (
+                        f"matches checklist step & keywords ({', '.join(matched_terms)})"
+                        if best_item_id
+                        else f"shares topic ({', '.join(matched_terms)})"
+                    ),
+                }
+            )
+
+    if not scored:
+        return {"parent_task_id": None, "parent_item_id": None, "possible_parents": []}
+
+    scored.sort(key=lambda s: (-s["score"], s["id"]))
+    top = scored[0]
+    second_score = scored[1]["score"] if len(scored) > 1 else 0.0
+    if top["score"] >= 0.80 and (len(scored) == 1 or (top["score"] - second_score) >= 0.15):
+        return {
+            "parent_task_id": int(top["id"]),
+            "parent_item_id": top["item_id"],
+            "possible_parents": [],
+        }
+
+    return {
+        "parent_task_id": None,
+        "parent_item_id": None,
+        "possible_parents": [
+            {
+                "id": c["id"],
+                "title": c["title"],
+                "timeline": c["timeline"],
+                "is_recurring": c["is_recurring"],
+                "suggested_item_id": c["item_id"],
+                "reason": c["reason"],
+            }
+            for c in scored[:3]
+        ],
+    }
+
+
+def _recompute_recurring_parent_status_conn(conn: sqlite3.Connection, task_id: int) -> None:
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if not row:
+        return
+    r_keys = row.keys()
+    inf_rec, inf_days, _ = infer_recurrence_fields(
+        row["title"],
+        timeline=row["timeline"] if "timeline" in r_keys else "",
+        frequency=row["frequency"] if "frequency" in r_keys else "",
+        start_date=row["start_date"] if "start_date" in r_keys else None,
+        due_date=row["due_date"],
+    )
+    is_rec = (bool(row["is_recurring"]) if "is_recurring" in r_keys else False) or inf_rec
+    stored_days = int(row["target_days"] or 0) if "target_days" in r_keys else 0
+    target_days = stored_days if stored_days > 0 else (inf_days if is_rec else 0)
+    if not is_rec and target_days <= 1:
+        return
+
+    days_count = int(
+        conn.execute(
+            "SELECT COUNT(DISTINCT date) FROM task_daily_logs WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+    )
+    sub_done_any = bool(
+        conn.execute(
+            "SELECT 1 FROM task_items WHERE task_id = ? AND done = 1 LIMIT 1", (task_id,)
+        ).fetchone()
+    )
+
+    if target_days > 0:
+        if days_count >= target_days:
+            status, done_int, comp = "completed", 1, row["completed_at"] or now_iso()
+        elif days_count > 0 or sub_done_any:
+            status, done_int, comp = "partially_completed", 0, None
+        else:
+            status, done_int, comp = "not_started", 0, None
+    else:
+        if days_count > 0 or sub_done_any:
+            status, done_int, comp = "partially_completed", 0, None
+        else:
+            status, done_int, comp = "not_started", 0, None
+
+    conn.execute(
+        "UPDATE tasks SET status = ?, done = ?, completed_at = ? WHERE id = ?",
+        (status, done_int, comp, task_id),
+    )
+
+
+def _sync_parent_progress_conn(
+    conn: sqlite3.Connection,
+    child_row: sqlite3.Row,
+    *,
+    became_done: bool = False,
+    became_undone: bool = False,
+    day_date: str | None = None,
+) -> list[dict[str, Any]]:
+    r_keys = child_row.keys()
+    parent_id = child_row["parent_task_id"] if "parent_task_id" in r_keys else None
+    if parent_id is None:
+        return []
+    parent = conn.execute("SELECT * FROM tasks WHERE id = ?", (int(parent_id),)).fetchone()
+    if not parent:
+        return []
+
+    target_date = day_date or (
+        child_row["completed_at"][:10] if child_row["completed_at"] else today_str()
+    )
+    p_item_id = child_row["parent_item_id"] if "parent_item_id" in r_keys else None
+    p_keys = parent.keys()
+    inf_rec, inf_days, _ = infer_recurrence_fields(
+        parent["title"],
+        timeline=parent["timeline"] if "timeline" in p_keys else "",
+        frequency=parent["frequency"] if "frequency" in p_keys else "",
+        start_date=parent["start_date"] if "start_date" in p_keys else None,
+        due_date=parent["due_date"],
+    )
+    parent_rec = (bool(parent["is_recurring"]) if "is_recurring" in p_keys else False) or inf_rec
+    parent_days = max(
+        int(parent["target_days"] or 0) if "target_days" in p_keys else 0,
+        inf_days if parent_rec else 0,
+    )
+
+    checked_item_text = ""
+    if became_done:
+        if p_item_id is not None:
+            it_row = conn.execute(
+                "SELECT id, text FROM task_items WHERE id = ? AND task_id = ?",
+                (int(p_item_id), int(parent_id)),
+            ).fetchone()
+            if it_row:
+                conn.execute("UPDATE task_items SET done = 1 WHERE id = ?", (it_row["id"],))
+                checked_item_text = it_row["text"]
+                _recompute_task_rollup(conn, int(parent_id))
+
+        if parent_rec or parent_days > 1 or p_item_id is None:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO task_daily_logs (task_id, date, note, completed_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (int(parent_id), target_date, child_row["title"], now_iso()),
+            )
+            _recompute_recurring_parent_status_conn(conn, int(parent_id))
+
+    elif became_undone:
+        if p_item_id is not None:
+            other_done = conn.execute(
+                "SELECT 1 FROM tasks WHERE parent_task_id = ? AND parent_item_id = ? AND done = 1 AND id != ? LIMIT 1",
+                (int(parent_id), int(p_item_id), int(child_row["id"])),
+            ).fetchone()
+            if not other_done:
+                conn.execute(
+                    "UPDATE task_items SET done = 0 WHERE id = ? AND task_id = ?",
+                    (int(p_item_id), int(parent_id)),
+                )
+                _recompute_task_rollup(conn, int(parent_id))
+
+        if parent_rec or parent_days > 1 or p_item_id is None:
+            other_today = conn.execute(
+                """
+                SELECT 1 FROM tasks
+                WHERE parent_task_id = ? AND done = 1 AND id != ?
+                  AND substr(COALESCE(completed_at, ''), 1, 10) = ?
+                LIMIT 1
+                """,
+                (int(parent_id), int(child_row["id"]), target_date),
+            ).fetchone()
+            if not other_today:
+                conn.execute(
+                    "DELETE FROM task_daily_logs WHERE task_id = ? AND date = ? AND note = ?",
+                    (int(parent_id), target_date, child_row["title"]),
+                )
+                _recompute_recurring_parent_status_conn(conn, int(parent_id))
+
+    refreshed_parent = conn.execute("SELECT * FROM tasks WHERE id = ?", (int(parent_id),)).fetchone()
+    days_cnt = int(
+        conn.execute(
+            "SELECT COUNT(DISTINCT date) FROM task_daily_logs WHERE task_id = ?", (int(parent_id),)
+        ).fetchone()[0]
+    )
+    done_today = bool(
+        conn.execute(
+            "SELECT 1 FROM task_daily_logs WHERE task_id = ? AND date = ? LIMIT 1",
+            (int(parent_id), today_str()),
+        ).fetchone()
+    )
+    return [
+        {
+            "parent_task_id": int(parent_id),
+            "parent_title": refreshed_parent["title"],
+            "status": refreshed_parent["status"],
+            "done_today": done_today,
+            "days_completed": days_cnt,
+            "target_days": parent_days,
+            "checked_item": checked_item_text,
+        }
+    ]
+
+
 def _fetch_task_items_map(
     conn: sqlite3.Connection, task_ids: list[int]
 ) -> dict[int, list[dict[str, Any]]]:
@@ -472,12 +946,160 @@ def _fetch_task_items_map(
     return grouped
 
 
+def _enrich_tasks_conn(
+    conn: sqlite3.Connection, rows: list[sqlite3.Row]
+) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    task_ids = [int(r["id"]) for r in rows]
+    placeholders = ",".join("?" for _ in task_ids)
+    items_map = _fetch_task_items_map(conn, task_ids)
+    today = today_str()
+
+    # Daily logs for listed tasks
+    daily_dates_map: dict[int, list[str]] = {tid: [] for tid in task_ids}
+    try:
+        dl_rows = conn.execute(
+            f"SELECT task_id, date FROM task_daily_logs WHERE task_id IN ({placeholders}) ORDER BY date DESC",
+            task_ids,
+        ).fetchall()
+        for r in dl_rows:
+            daily_dates_map.setdefault(int(r["task_id"]), []).append(r["date"])
+    except sqlite3.OperationalError:
+        pass
+
+    # Parent titles & matched item labels
+    parent_ids = sorted(
+        {int(r["parent_task_id"]) for r in rows if "parent_task_id" in r.keys() and r["parent_task_id"] is not None}
+    )
+    parent_titles: dict[int, str] = {}
+    if parent_ids:
+        p_ph = ",".join("?" for _ in parent_ids)
+        for pr in conn.execute(f"SELECT id, title FROM tasks WHERE id IN ({p_ph})", parent_ids).fetchall():
+            parent_titles[int(pr["id"])] = pr["title"]
+
+    p_item_ids = sorted(
+        {int(r["parent_item_id"]) for r in rows if "parent_item_id" in r.keys() and r["parent_item_id"] is not None}
+    )
+    p_item_texts: dict[int, str] = {}
+    if p_item_ids:
+        pi_ph = ",".join("?" for _ in p_item_ids)
+        for pir in conn.execute(f"SELECT id, text FROM task_items WHERE id IN ({pi_ph})", p_item_ids).fetchall():
+            p_item_texts[int(pir["id"])] = pir["text"]
+
+    # Child counts & map child -> parent for study rollup
+    child_stats: dict[int, tuple[int, int]] = {}
+    child_to_parent: dict[int, int] = {}
+    try:
+        ch_rows = conn.execute(
+            f"SELECT id, parent_task_id, done, completed_at FROM tasks WHERE parent_task_id IN ({placeholders})",
+            task_ids,
+        ).fetchall()
+        for ch in ch_rows:
+            pid = int(ch["parent_task_id"])
+            chid = int(ch["id"])
+            child_to_parent[chid] = pid
+            tot, done_t = child_stats.get(pid, (0, 0))
+            is_dt = 1 if (ch["done"] and (ch["completed_at"] or "").startswith(today)) else 0
+            child_stats[pid] = (tot + 1, done_t + is_dt)
+    except sqlite3.OperationalError:
+        pass
+
+    # Study session aggregation + active focus timer per task & rolled into parent
+    all_study_ids = sorted(set(task_ids) | set(child_to_parent.keys()))
+    study_today_map: dict[int, int] = {}
+    study_total_map: dict[int, int] = {}
+    if all_study_ids:
+        s_ph = ",".join("?" for _ in all_study_ids)
+        try:
+            st_rows = conn.execute(
+                f"""
+                SELECT task_id,
+                       SUM(duration_seconds) AS total_s,
+                       SUM(CASE WHEN date = ? THEN duration_seconds ELSE 0 END) AS today_s
+                FROM study_sessions
+                WHERE task_id IN ({s_ph})
+                GROUP BY task_id
+                """,
+                [today, *all_study_ids],
+            ).fetchall()
+            for sr in st_rows:
+                tid = int(sr["task_id"])
+                study_total_map[tid] = int(sr["total_s"] or 0)
+                study_today_map[tid] = int(sr["today_s"] or 0)
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            t_row = conn.execute("SELECT * FROM active_timer WHERE id = 1").fetchone()
+            if t_row and t_row["active"] and t_row["phase"] == "focus" and t_row["task_id"] is not None:
+                live_tid = int(t_row["task_id"])
+                if live_tid in all_study_ids:
+                    live_secs = _format_timer_row(conn, t_row)["elapsed_seconds"]
+                    study_today_map[live_tid] = study_today_map.get(live_tid, 0) + live_secs
+                    study_total_map[live_tid] = study_total_map.get(live_tid, 0) + live_secs
+        except sqlite3.OperationalError:
+            pass
+
+        for chid, pid in child_to_parent.items():
+            if chid == pid:
+                continue
+            study_today_map[pid] = study_today_map.get(pid, 0) + study_today_map.get(chid, 0)
+            study_total_map[pid] = study_total_map.get(pid, 0) + study_total_map.get(chid, 0)
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        tid = int(r["id"])
+        rk = r.keys()
+        pid = int(r["parent_task_id"]) if ("parent_task_id" in rk and r["parent_task_id"] is not None) else None
+        piid = int(r["parent_item_id"]) if ("parent_item_id" in rk and r["parent_item_id"] is not None) else None
+        d_dates = daily_dates_map.get(tid, [])
+        ch_tot, ch_done_t = child_stats.get(tid, (0, 0))
+        extra = {
+            "daily_dates": d_dates,
+            "daily_streak": _calculate_streak(d_dates, today),
+            "parent_task_title": parent_titles.get(pid, "") if pid is not None else "",
+            "parent_item_text": p_item_texts.get(piid, "") if piid is not None else "",
+            "child_count": ch_tot,
+            "child_done_today_count": ch_done_t,
+            "study_seconds_today": study_today_map.get(tid, 0),
+            "study_seconds_total": study_total_map.get(tid, 0),
+        }
+        out.append(_row_to_task(r, items_map.get(tid, []), extra=extra))
+    return out
+
+
 def _recompute_task_rollup(conn: sqlite3.Connection, task_id: int) -> None:
     rows = conn.execute(
         "SELECT done FROM task_items WHERE task_id = ?", (task_id,)
     ).fetchall()
     if not rows:
         return
+    parent_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if parent_row:
+        rk = parent_row.keys()
+        inf_rec, inf_days, _ = infer_recurrence_fields(
+            parent_row["title"],
+            timeline=parent_row["timeline"] if "timeline" in rk else "",
+            frequency=parent_row["frequency"] if "frequency" in rk else "",
+            start_date=parent_row["start_date"] if "start_date" in rk else None,
+            due_date=parent_row["due_date"],
+        )
+        is_rec = (bool(parent_row["is_recurring"]) if "is_recurring" in rk else False) or inf_rec
+        if is_rec:
+            total = len(rows)
+            done_count = sum(1 for r in rows if r["done"])
+            if done_count == total:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO task_daily_logs (task_id, date, note, completed_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (task_id, today_str(), "Completed daily checklist", now_iso()),
+                )
+            _recompute_recurring_parent_status_conn(conn, task_id)
+            return
+
     total = len(rows)
     done_count = sum(1 for r in rows if r["done"])
     if done_count == 0:
@@ -503,8 +1125,7 @@ def get_task(task_id: int) -> dict[str, Any] | None:
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if not row:
             return None
-        items_map = _fetch_task_items_map(conn, [task_id])
-        return _row_to_task(row, items_map.get(task_id, []))
+        return _enrich_tasks_conn(conn, [row])[0]
 
 
 def list_tasks(
@@ -531,8 +1152,7 @@ def list_tasks(
     )
     with get_conn() as conn:
         rows = conn.execute(sql, params).fetchall()
-        items_map = _fetch_task_items_map(conn, [r["id"] for r in rows])
-        return [_row_to_task(r, items_map.get(r["id"], [])) for r in rows]
+        return _enrich_tasks_conn(conn, rows)
 
 
 def create_task(
@@ -547,6 +1167,12 @@ def create_task(
     start_date: str | None = None,
     timeline: str = "",
     frequency: str = "",
+    parent_task_id: int | None = None,
+    parent_item_id: int | None = None,
+    is_recurring: bool | None = None,
+    target_days: int | None = None,
+    daily_target_minutes: int | None = None,
+    auto_link_parent: bool = True,
 ) -> dict[str, Any]:
     clean_title = title.strip()
     if not clean_title:
@@ -558,12 +1184,63 @@ def create_task(
     completed_at = now_iso() if st == "completed" else None
     start = start_date.strip() if isinstance(start_date, str) and start_date.strip() else None
     due = due_date.strip() if isinstance(due_date, str) and due_date.strip() else None
+    tl = timeline.strip()
+    freq = frequency.strip()
+
+    inf_rec, inf_days, inf_mins = infer_recurrence_fields(
+        clean_title, timeline=tl, frequency=freq, start_date=start, due_date=due
+    )
+    eff_rec = bool(is_recurring) if is_recurring is not None else inf_rec
+    eff_days = int(target_days) if target_days is not None and int(target_days) > 0 else inf_days
+    eff_mins = (
+        int(daily_target_minutes)
+        if daily_target_minutes is not None and int(daily_target_minutes) > 0
+        else inf_mins
+    )
+    if eff_rec and not start:
+        start = today_str()
+
     ts = now_iso()
+    today = today_str()
+    possible_parents: list[dict[str, Any]] = []
+    parent_updates: list[dict[str, Any]] = []
+
     with get_conn() as conn:
+        resolved_pid: int | None = None
+        resolved_piid: int | None = None
+        if parent_task_id is not None and int(parent_task_id) > 0:
+            if conn.execute("SELECT id FROM tasks WHERE id = ?", (int(parent_task_id),)).fetchone():
+                resolved_pid = int(parent_task_id)
+                if parent_item_id is not None and int(parent_item_id) > 0:
+                    if conn.execute(
+                        "SELECT id FROM task_items WHERE id = ? AND task_id = ?",
+                        (int(parent_item_id), resolved_pid),
+                    ).fetchone():
+                        resolved_piid = int(parent_item_id)
+        elif (
+            lt == "daily"
+            and auto_link_parent
+            and not (eff_rec or eff_days > 1 or (due and due > today) or "next " in tl.lower())
+        ):
+            match_res = _analyze_parent_candidates_conn(
+                conn,
+                clean_title,
+                timeline=tl,
+                frequency=freq,
+                due_date=due,
+            )
+            resolved_pid = match_res["parent_task_id"]
+            resolved_piid = match_res["parent_item_id"]
+            possible_parents = match_res["possible_parents"]
+
         cur = conn.execute(
             """
-            INSERT INTO tasks (title, list_type, category, priority, start_date, due_date, timeline, frequency, done, status, progress_note, created_at, completed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tasks (
+                title, list_type, category, priority, start_date, due_date, timeline, frequency,
+                parent_task_id, parent_item_id, is_recurring, target_days, daily_target_minutes,
+                done, status, progress_note, created_at, completed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 clean_title,
@@ -572,8 +1249,13 @@ def create_task(
                 pr,
                 start,
                 due,
-                timeline.strip(),
-                frequency.strip(),
+                tl,
+                freq,
+                resolved_pid,
+                resolved_piid,
+                int(eff_rec),
+                eff_days,
+                eff_mins,
                 done_int,
                 st,
                 progress_note.strip(),
@@ -591,8 +1273,14 @@ def create_task(
                         (task_id, clean_item, pos),
                     )
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        items_map = _fetch_task_items_map(conn, [task_id])
-        return _row_to_task(row, items_map.get(task_id, []))
+        if done_int and resolved_pid is not None:
+            parent_updates = _sync_parent_progress_conn(conn, row, became_done=True, day_date=today)
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        enriched = _enrich_tasks_conn(conn, [row])[0]
+        enriched["possible_parents"] = possible_parents
+        if parent_updates:
+            enriched["parent_updates"] = parent_updates
+        return enriched
 
 
 def update_task(task_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
@@ -600,6 +1288,7 @@ def update_task(task_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
         existing = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if not existing:
             return None
+        ex_keys = existing.keys()
         title = str(patch.get("title", existing["title"])).strip()
         if not title:
             raise ValueError("Task title cannot be empty.")
@@ -620,30 +1309,69 @@ def update_task(task_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
         frequency = str(patch.get("frequency", existing["frequency"])).strip()
         progress_note = str(patch.get("progress_note", existing["progress_note"])).strip()
 
+        raw_pid = patch["parent_task_id"] if "parent_task_id" in patch else (
+            existing["parent_task_id"] if "parent_task_id" in ex_keys else None
+        )
+        parent_task_id: int | None = None
+        if raw_pid is not None and str(raw_pid).strip() and int(raw_pid) > 0 and int(raw_pid) != task_id:
+            if conn.execute("SELECT id FROM tasks WHERE id = ?", (int(raw_pid),)).fetchone():
+                parent_task_id = int(raw_pid)
+
+        raw_piid = patch["parent_item_id"] if "parent_item_id" in patch else (
+            existing["parent_item_id"] if "parent_item_id" in ex_keys else None
+        )
+        parent_item_id: int | None = None
+        if parent_task_id is not None and raw_piid is not None and str(raw_piid).strip() and int(raw_piid) > 0:
+            if conn.execute(
+                "SELECT id FROM task_items WHERE id = ? AND task_id = ?",
+                (int(raw_piid), parent_task_id),
+            ).fetchone():
+                parent_item_id = int(raw_piid)
+
+        is_recurring = bool(
+            patch["is_recurring"]
+            if "is_recurring" in patch and patch["is_recurring"] is not None
+            else (existing["is_recurring"] if "is_recurring" in ex_keys else 0)
+        )
+        target_days = int(
+            patch["target_days"]
+            if "target_days" in patch and patch["target_days"] is not None
+            else (existing["target_days"] if "target_days" in ex_keys else 0)
+        )
+        daily_target_minutes = int(
+            patch["daily_target_minutes"]
+            if "daily_target_minutes" in patch and patch["daily_target_minutes"] is not None
+            else (existing["daily_target_minutes"] if "daily_target_minutes" in ex_keys else 0)
+        )
+
         existing_status = (
             existing["status"]
             if existing["status"] in TASK_STATUSES
             else ("completed" if existing["done"] else "not_started")
         )
+        was_done = existing_status == "completed" or bool(existing["done"])
         completed_at = existing["completed_at"]
 
         if "status" in patch and patch["status"] in TASK_STATUSES:
             status = patch["status"]
             done = status == "completed"
-            completed_at = now_iso() if done else None
+            completed_at = (existing["completed_at"] or now_iso()) if done else None
         elif "done" in patch:
             done = bool(patch["done"])
             status = "completed" if done else "not_started"
-            completed_at = now_iso() if done else None
+            completed_at = (existing["completed_at"] or now_iso()) if done else None
         else:
             status = existing_status
             done = bool(existing["done"])
 
+        old_pid = existing["parent_task_id"] if "parent_task_id" in ex_keys else None
         conn.execute(
             """
             UPDATE tasks
             SET title = ?, list_type = ?, category = ?, priority = ?,
                 start_date = ?, due_date = ?, timeline = ?, frequency = ?,
+                parent_task_id = ?, parent_item_id = ?, is_recurring = ?,
+                target_days = ?, daily_target_minutes = ?,
                 done = ?, status = ?, progress_note = ?, completed_at = ?
             WHERE id = ?
             """,
@@ -656,6 +1384,11 @@ def update_task(task_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
                 due_date,
                 timeline,
                 frequency,
+                parent_task_id,
+                parent_item_id,
+                int(is_recurring),
+                max(0, target_days),
+                max(0, daily_target_minutes),
                 int(done),
                 status,
                 progress_note,
@@ -664,8 +1397,22 @@ def update_task(task_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
             ),
         )
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        items_map = _fetch_task_items_map(conn, [task_id])
-        return _row_to_task(row, items_map.get(task_id, []))
+        parent_updates: list[dict[str, Any]] = []
+        if done and (not was_done or (parent_task_id is not None and old_pid != parent_task_id)):
+            parent_updates = _sync_parent_progress_conn(conn, row, became_done=True)
+        elif was_done and not done:
+            parent_updates = _sync_parent_progress_conn(
+                conn,
+                row,
+                became_undone=True,
+                day_date=(existing["completed_at"][:10] if existing["completed_at"] else today_str()),
+            )
+
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        enriched = _enrich_tasks_conn(conn, [row])[0]
+        if parent_updates:
+            enriched["parent_updates"] = parent_updates
+        return enriched
 
 
 def add_task_item(task_id: int, text: str) -> dict[str, Any] | None:
@@ -687,8 +1434,7 @@ def add_task_item(task_id: int, text: str) -> dict[str, Any] | None:
         )
         _recompute_task_rollup(conn, task_id)
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        items_map = _fetch_task_items_map(conn, [task_id])
-        return _row_to_task(row, items_map.get(task_id, []))
+        return _enrich_tasks_conn(conn, [row])[0]
 
 
 def update_task_item(
@@ -701,6 +1447,9 @@ def update_task_item(
         ).fetchone()
         if not existing:
             return None
+        parent_before = conn.execute("SELECT done, completed_at FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        was_done = bool(parent_before["done"]) if parent_before else False
+
         text = str(patch.get("text", existing["text"])).strip()
         if not text:
             raise ValueError("Checklist item text cannot be empty.")
@@ -711,8 +1460,22 @@ def update_task_item(
         )
         _recompute_task_rollup(conn, task_id)
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        items_map = _fetch_task_items_map(conn, [task_id])
-        return _row_to_task(row, items_map.get(task_id, []))
+        now_done = bool(row["done"])
+        parent_updates: list[dict[str, Any]] = []
+        if not was_done and now_done:
+            parent_updates = _sync_parent_progress_conn(conn, row, became_done=True)
+        elif was_done and not now_done:
+            parent_updates = _sync_parent_progress_conn(
+                conn,
+                row,
+                became_undone=True,
+                day_date=(parent_before["completed_at"][:10] if parent_before and parent_before["completed_at"] else today_str()),
+            )
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        enriched = _enrich_tasks_conn(conn, [row])[0]
+        if parent_updates:
+            enriched["parent_updates"] = parent_updates
+        return enriched
 
 
 def delete_task_item(task_id: int, item_id: int) -> dict[str, Any] | None:
@@ -727,8 +1490,7 @@ def delete_task_item(task_id: int, item_id: int) -> dict[str, Any] | None:
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if not row:
             return None
-        items_map = _fetch_task_items_map(conn, [task_id])
-        return _row_to_task(row, items_map.get(task_id, []))
+        return _enrich_tasks_conn(conn, [row])[0]
 
 
 def _match_task_item_rows(
@@ -760,9 +1522,10 @@ def bulk_manage_task_items(
 ) -> dict[str, Any] | None:
     """Add, check, uncheck, or remove task checklist items in a single transaction."""
     with get_conn() as conn:
-        existing_task = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        existing_task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if not existing_task:
             return None
+        was_done = bool(existing_task["done"])
 
         if add_items:
             max_pos_row = conn.execute(
@@ -798,8 +1561,108 @@ def bulk_manage_task_items(
 
         _recompute_task_rollup(conn, task_id)
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        items_map = _fetch_task_items_map(conn, [task_id])
-        return _row_to_task(row, items_map.get(task_id, []))
+        now_done = bool(row["done"])
+        parent_updates: list[dict[str, Any]] = []
+        if not was_done and now_done:
+            parent_updates = _sync_parent_progress_conn(conn, row, became_done=True)
+        elif was_done and not now_done:
+            parent_updates = _sync_parent_progress_conn(
+                conn,
+                row,
+                became_undone=True,
+                day_date=(existing_task["completed_at"][:10] if existing_task["completed_at"] else today_str()),
+            )
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        enriched = _enrich_tasks_conn(conn, [row])[0]
+        if parent_updates:
+            enriched["parent_updates"] = parent_updates
+        return enriched
+
+
+def toggle_task_done_today(
+    task_id: int,
+    day_date: str | None = None,
+    done: bool | None = None,
+    note: str = "",
+) -> dict[str, Any] | None:
+    """Toggle or set a recurring/daily goal's completion log for `day_date` (default today)."""
+    target_date = (day_date or today_str()).strip()
+    dt_date.fromisoformat(target_date)
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not row:
+            return None
+        exists = conn.execute(
+            "SELECT id FROM task_daily_logs WHERE task_id = ? AND date = ?",
+            (task_id, target_date),
+        ).fetchone()
+        want_done = (not bool(exists)) if done is None else bool(done)
+        if want_done:
+            if not exists:
+                conn.execute(
+                    """
+                    INSERT INTO task_daily_logs (task_id, date, note, completed_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (task_id, target_date, (note or "").strip(), now_iso()),
+                )
+            conn.execute("UPDATE tasks SET is_recurring = 1 WHERE id = ?", (task_id,))
+        else:
+            if exists:
+                conn.execute("DELETE FROM task_daily_logs WHERE id = ?", (exists["id"],))
+        _recompute_recurring_parent_status_conn(conn, task_id)
+        updated = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return _enrich_tasks_conn(conn, [updated])[0]
+
+
+def auto_link_existing_tasks() -> dict[str, Any]:
+    """Scan unlinked today-scoped tasks and connect strong matches to their parent goals."""
+    linked: list[dict[str, Any]] = []
+    ambiguous: list[dict[str, Any]] = []
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE list_type = 'daily' AND parent_task_id IS NULL ORDER BY id DESC"
+        ).fetchall()
+        enriched = _enrich_tasks_conn(conn, rows)
+        for task in enriched:
+            if not task["is_today_task"]:
+                continue
+            match_res = _analyze_parent_candidates_conn(
+                conn,
+                task["title"],
+                timeline=task["timeline"],
+                frequency=task["frequency"],
+                due_date=task["due_date"],
+                exclude_task_id=task["id"],
+            )
+            pid = match_res["parent_task_id"]
+            piid = match_res["parent_item_id"]
+            if pid is not None:
+                conn.execute(
+                    "UPDATE tasks SET parent_task_id = ?, parent_item_id = ? WHERE id = ?",
+                    (pid, piid, task["id"]),
+                )
+                child_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task["id"],)).fetchone()
+                if child_row["done"]:
+                    _sync_parent_progress_conn(conn, child_row, became_done=True)
+                p_row = conn.execute("SELECT title FROM tasks WHERE id = ?", (pid,)).fetchone()
+                linked.append(
+                    {
+                        "task_id": task["id"],
+                        "task_title": task["title"],
+                        "parent_task_id": pid,
+                        "parent_title": p_row["title"] if p_row else "",
+                    }
+                )
+            elif match_res["possible_parents"]:
+                ambiguous.append(
+                    {
+                        "task_id": task["id"],
+                        "task_title": task["title"],
+                        "possible_parents": match_res["possible_parents"],
+                    }
+                )
+    return {"linked": linked, "ambiguous": ambiguous, "count": len(linked)}
 
 
 def delete_task(task_id: int) -> bool:
@@ -2019,9 +2882,17 @@ def delete_agent_session(session_id: int) -> bool:
 
 def export_all_data() -> dict[str, Any]:
     """Return a full JSON-serializable backup of all user records."""
+    with get_conn() as conn:
+        dl_rows = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT id, task_id, date, note, completed_at FROM task_daily_logs ORDER BY date DESC, id DESC"
+            ).fetchall()
+        ]
     return {
         "exported_at": now_iso(),
         "tasks": list_tasks(include_done=True),
+        "task_daily_logs": dl_rows,
         "notes": list_notes(),
         "gym_activity": get_activity_summary("gym"),
         "art_activity": get_activity_summary("art"),
@@ -2144,6 +3015,51 @@ def _insert_study_session_conn(
     row = conn.execute(
         f"{_STUDY_JOIN_SELECT} WHERE s.id = ?", (cur.lastrowid,)
     ).fetchone()
+    if valid_task is not None and target_date == today_str():
+        t_row = conn.execute(
+            "SELECT id, parent_task_id, title, timeline, frequency, start_date, due_date, is_recurring, target_days, daily_target_minutes FROM tasks WHERE id = ?",
+            (valid_task,),
+        ).fetchone()
+        if t_row:
+            candidate_ids = [int(t_row["id"])]
+            if t_row["parent_task_id"] is not None:
+                candidate_ids.append(int(t_row["parent_task_id"]))
+            for gid in candidate_ids:
+                g_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (gid,)).fetchone()
+                if not g_row:
+                    continue
+                rk = g_row.keys()
+                inf_rec, _, inf_mins = infer_recurrence_fields(
+                    g_row["title"],
+                    timeline=g_row["timeline"] if "timeline" in rk else "",
+                    frequency=g_row["frequency"] if "frequency" in rk else "",
+                    start_date=g_row["start_date"] if "start_date" in rk else None,
+                    due_date=g_row["due_date"],
+                )
+                is_rec = (bool(g_row["is_recurring"]) if "is_recurring" in rk else False) or inf_rec
+                stored_mins = int(g_row["daily_target_minutes"] or 0) if "daily_target_minutes" in rk else 0
+                daily_mins = stored_mins if stored_mins > 0 else (inf_mins if is_rec else 0)
+                if is_rec and daily_mins > 0:
+                    ch_rows = conn.execute(
+                        "SELECT id FROM tasks WHERE parent_task_id = ?", (gid,)
+                    ).fetchall()
+                    rel_ids = [gid, *[int(c["id"]) for c in ch_rows]]
+                    ph = ",".join("?" for _ in rel_ids)
+                    studied_today = int(
+                        conn.execute(
+                            f"SELECT COALESCE(SUM(duration_seconds), 0) FROM study_sessions WHERE date = ? AND task_id IN ({ph})",
+                            [target_date, *rel_ids],
+                        ).fetchone()[0]
+                    )
+                    if studied_today >= max(30, daily_mins * 60 - 30):
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO task_daily_logs (task_id, date, note, completed_at)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (gid, target_date, f"Logged {round(studied_today / 60, 1):g}m focus study", ts),
+                        )
+                        _recompute_recurring_parent_status_conn(conn, gid)
     return _row_to_study_session(row)
 
 
@@ -2272,6 +3188,17 @@ def get_study_stats() -> dict[str, Any]:
         rows = conn.execute(
             "SELECT subject, duration_seconds, date FROM study_sessions ORDER BY date DESC, id DESC"
         ).fetchall()
+        today_sess_rows = conn.execute(
+            f"{_STUDY_JOIN_SELECT} WHERE s.date = ? ORDER BY s.id DESC LIMIT 20",
+            (today,),
+        ).fetchall()
+        timer_row = conn.execute("SELECT * FROM active_timer WHERE id = 1").fetchone()
+        live_focus_secs = 0
+        live_subj = ""
+        if timer_row and timer_row["active"] and timer_row["phase"] == "focus":
+            t_fmt = _format_timer_row(conn, timer_row)
+            live_focus_secs = max(0, int(t_fmt["elapsed_seconds"] or 0))
+            live_subj = (t_fmt["subject"] or "Study").strip() or "Study"
 
     today_secs = 0
     today_count = 0
@@ -2306,6 +3233,18 @@ def get_study_stats() -> dict[str, Any]:
         subj_map[key]["seconds"] += secs
         subj_map[key]["sessions"] += 1
 
+    if live_focus_secs > 0:
+        day_totals[today] = day_totals.get(today, 0) + live_focus_secs
+        l_key = live_subj.lower()
+        if l_key not in subj_map:
+            subj_map[l_key] = {"subject": live_subj, "seconds": 0, "sessions": 0}
+        subj_map[l_key]["seconds"] += live_focus_secs
+
+    today_effective = today_secs + live_focus_secs
+    week_effective = week_secs + live_focus_secs
+    month_effective = month_secs + live_focus_secs
+    total_effective = total_secs + live_focus_secs
+
     by_subject = []
     for entry in sorted(subj_map.values(), key=lambda x: (-x["seconds"], x["subject"].lower())):
         by_subject.append(
@@ -2331,16 +3270,19 @@ def get_study_stats() -> dict[str, Any]:
     ]
 
     return {
-        "today_seconds": today_secs,
-        "today_minutes": round(today_secs / 60.0, 1),
+        "today_seconds": today_effective,
+        "today_logged_seconds": today_secs,
+        "live_focus_seconds": live_focus_secs,
+        "today_minutes": round(today_effective / 60.0, 1),
         "today_sessions_count": today_count,
-        "week_seconds": week_secs,
-        "week_minutes": round(week_secs / 60.0, 1),
-        "week_hours": round(week_secs / 3600.0, 2),
-        "month_seconds": month_secs,
-        "month_hours": round(month_secs / 3600.0, 2),
-        "total_seconds": total_secs,
-        "total_hours": round(total_secs / 3600.0, 2),
+        "today_sessions": [_row_to_study_session(r) for r in today_sess_rows],
+        "week_seconds": week_effective,
+        "week_minutes": round(week_effective / 60.0, 1),
+        "week_hours": round(week_effective / 3600.0, 2),
+        "month_seconds": month_effective,
+        "month_hours": round(month_effective / 3600.0, 2),
+        "total_seconds": total_effective,
+        "total_hours": round(total_effective / 3600.0, 2),
         "total_sessions": len(rows),
         "streak_days": _calculate_streak(distinct_dates, today),
         "by_subject": by_subject,
@@ -2424,7 +3366,45 @@ def get_timer_state() -> dict[str, Any]:
         return _format_timer_row(conn, row)
 
 
-def start_timer(
+def _match_task_for_study_topic_conn(
+    conn: sqlite3.Connection, topic: str, subject: str = ""
+) -> int | None:
+    """Auto-match an open active task from timer topic/subject when task_id wasn't specified."""
+    query_tokens = _tokenize_task_text(f"{topic} {subject}")
+    if not query_tokens:
+        return None
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE list_type = 'daily' AND done = 0 ORDER BY id DESC"
+    ).fetchall()
+    if not rows:
+        return None
+    today = today_str()
+    best_id: int | None = None
+    best_score = 0.0
+    for r in rows:
+        rk = r.keys()
+        t_tokens = _tokenize_task_text(f"{r['title']} {r['category']}")
+        overlap = query_tokens & t_tokens
+        if not overlap:
+            continue
+        spec = [tok for tok in overlap if len(tok) >= 5 and tok not in _GENERIC_TOPIC_TOKENS]
+        containment = len(overlap) / max(1, min(len(query_tokens), len(t_tokens)))
+        score = 0.0
+        if len(overlap) >= 2 and containment >= 0.45:
+            score = 0.85
+        elif spec and containment >= 0.4:
+            score = 0.80
+        if score >= 0.80:
+            is_today = (r["due_date"] == today) or ("parent_task_id" in rk and r["parent_task_id"] is not None)
+            if is_today:
+                score += 0.05
+            if score > best_score:
+                best_score = score
+                best_id = int(r["id"])
+    return best_id
+
+
+def start_timer_and_autosave(
     mode: str = "countdown",
     duration_minutes: float = 25,
     break_minutes: float = 5,
@@ -2433,7 +3413,9 @@ def start_timer(
     task_id: int | None = None,
     note_id: int | None = None,
     notes: str = "",
+    save_previous: bool = True,
 ) -> dict[str, Any]:
+    """Start a timer, auto-saving any active running focus timer >=1s to today's study log."""
     clean_mode = mode if mode in TIMER_MODES else "countdown"
     target_secs = (
         max(5, int(round(float(duration_minutes or 25) * 60)))
@@ -2444,10 +3426,41 @@ def start_timer(
     clean_subject = (subject or "Study").strip()[:60] or "Study"
     now_ep = time.time()
     started_iso = now_iso()
+    previous_logged: dict[str, Any] | None = None
 
     with get_conn() as conn:
-        _ensure_active_timer_row(conn)
+        prev_row = _ensure_active_timer_row(conn)
+        prev_state = _format_timer_row(conn, prev_row)
+        if (
+            save_previous
+            and prev_state["active"]
+            and prev_state["phase"] == "focus"
+            and prev_state["elapsed_seconds"] >= 1
+        ):
+            planned = (
+                prev_state["target_seconds"]
+                if prev_state["mode"] == "countdown" and prev_state["target_seconds"] > 0
+                else None
+            )
+            previous_logged = _insert_study_session_conn(
+                conn,
+                subject=prev_state["subject"],
+                topic=prev_state["topic"],
+                duration_seconds=prev_state["elapsed_seconds"],
+                mode=prev_state["mode"],
+                planned_seconds=planned,
+                day_date=today_str(),
+                started_at=prev_state["started_at_iso"],
+                ended_at=started_iso,
+                task_id=prev_state["task_id"],
+                note_id=prev_state["note_id"],
+                notes=prev_state["notes"],
+            )
+
         valid_task, valid_note = _validate_fk_ids(conn, task_id, note_id)
+        if valid_task is None and topic.strip():
+            valid_task = _match_task_for_study_topic_conn(conn, topic, clean_subject)
+
         conn.execute(
             """
             UPDATE active_timer
@@ -2472,7 +3485,34 @@ def start_timer(
             ),
         )
         row = conn.execute("SELECT * FROM active_timer WHERE id = 1").fetchone()
-        return _format_timer_row(conn, row)
+        return {
+            "state": _format_timer_row(conn, row),
+            "previous_logged_session": previous_logged,
+        }
+
+
+def start_timer(
+    mode: str = "countdown",
+    duration_minutes: float = 25,
+    break_minutes: float = 5,
+    subject: str = "Study",
+    topic: str = "",
+    task_id: int | None = None,
+    note_id: int | None = None,
+    notes: str = "",
+    save_previous: bool = True,
+) -> dict[str, Any]:
+    return start_timer_and_autosave(
+        mode=mode,
+        duration_minutes=duration_minutes,
+        break_minutes=break_minutes,
+        subject=subject,
+        topic=topic,
+        task_id=task_id,
+        note_id=note_id,
+        notes=notes,
+        save_previous=save_previous,
+    )["state"]
 
 
 def pause_timer() -> dict[str, Any]:

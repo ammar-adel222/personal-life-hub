@@ -71,8 +71,25 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                     "frequency": {
                         "type": "string",
-                        "description": "Target cadence/volume e.g. '4x / week', '3 artworks in 10 days', '10-20 hours total'",
+                        "description": "Target cadence/volume e.g. '4x / week', '1 hour / day', '3 artworks in 10 days'",
                     },
+                    "parent_task_id": {
+                        "type": "integer",
+                        "description": "ID of a larger/recurring parent goal if this today task belongs under it. Omit to auto-detect.",
+                    },
+                    "is_recurring": {
+                        "type": "boolean",
+                        "description": "True for daily repeating habits/goals (e.g. LeetCode 1h a day for 10 days).",
+                    },
+                    "target_days": {
+                        "type": "integer",
+                        "description": "Total target days for a multi-day daily goal (e.g. 10 for 'next 10 days').",
+                    },
+                    "daily_target_minutes": {
+                        "type": "integer",
+                        "description": "Daily target minutes if recurring daily (e.g. 60 for '1 hour a day').",
+                    },
+                    "auto_link_parent": {"type": "boolean"},
                     "status": {
                         "type": "string",
                         "enum": ["not_started", "partially_completed", "completed"],
@@ -105,6 +122,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                                 "due_date": {"type": "string"},
                                 "timeline": {"type": "string"},
                                 "frequency": {"type": "string"},
+                                "parent_task_id": {"type": "integer"},
+                                "is_recurring": {"type": "boolean"},
+                                "target_days": {"type": "integer"},
+                                "daily_target_minutes": {"type": "integer"},
+                                "auto_link_parent": {"type": "boolean"},
                                 "progress_note": {"type": "string"},
                             },
                             "required": ["title"],
@@ -119,7 +141,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "update_task",
-            "description": "Update an existing task's status, title, list_type, priority, start_date, due_date, timeline, frequency, or progress_note.",
+            "description": "Update an existing task's status, parent goal link, recurring target, or mark a daily recurring goal done today.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -129,6 +151,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "string",
                         "enum": ["not_started", "partially_completed", "completed"],
                     },
+                    "mark_done_today": {
+                        "type": "boolean",
+                        "description": "Set true to log today's completion on a daily recurring goal (instead of closing all future days).",
+                    },
                     "list_type": {"type": "string", "enum": ["daily", "want_to_do"]},
                     "priority": {"type": "string", "enum": ["normal", "high"]},
                     "category": {"type": "string"},
@@ -136,6 +162,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "due_date": {"type": "string"},
                     "timeline": {"type": "string"},
                     "frequency": {"type": "string"},
+                    "parent_task_id": {
+                        "type": "integer",
+                        "description": "Link this task under a larger parent goal (use 0 to unlink).",
+                    },
+                    "is_recurring": {"type": "boolean"},
+                    "target_days": {"type": "integer"},
+                    "daily_target_minutes": {"type": "integer"},
                     "progress_note": {"type": "string"},
                 },
                 "required": ["task_id"],
@@ -620,8 +653,17 @@ def _create_single_task_from_args(args: dict[str, Any]) -> tuple[dict[str, Any],
         start_date=_clean_opt_date(args.get("start_date")),
         timeline=str(args.get("timeline") or ""),
         frequency=str(args.get("frequency") or ""),
+        parent_task_id=_coerce_int(args.get("parent_task_id")),
+        is_recurring=_coerce_bool(args.get("is_recurring"), False) if args.get("is_recurring") is not None else None,
+        target_days=_coerce_int(args.get("target_days")),
+        daily_target_minutes=_coerce_int(args.get("daily_target_minutes")),
+        auto_link_parent=_coerce_bool(args.get("auto_link_parent"), True),
     )
     meta_parts: list[str] = []
+    if item.get("parent_task_title"):
+        meta_parts.append(f"↳ {item['parent_task_title']}")
+    if item["is_recurring"]:
+        meta_parts.append(f"{item['target_days']}d habit" if item["target_days"] else "Daily")
     if item["checklist_total"]:
         meta_parts.append(f"{item['checklist_total']} steps")
     if item["frequency"]:
@@ -639,6 +681,29 @@ def _create_single_task_from_args(args: dict[str, Any]) -> tuple[dict[str, Any],
         "label": f"{prefix}: {item['title']}{suffix}",
     }
     return item, badge
+
+
+def _parent_update_badges(parent_updates: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    badges: list[dict[str, Any]] = []
+    for pu in parent_updates or []:
+        parts = []
+        if pu.get("checked_item"):
+            parts.append(f"checked '{pu['checked_item']}'")
+        if pu.get("done_today"):
+            if pu.get("target_days"):
+                parts.append(f"Done Today · {pu['days_completed']}/{pu['target_days']} days")
+            else:
+                parts.append(f"Done Today · {pu['days_completed']}d total")
+        detail = f" ({', '.join(parts)})" if parts else ""
+        badges.append(
+            {
+                "tool": "update_task",
+                "domain": "task",
+                "item_id": pu["parent_task_id"],
+                "label": f"Goal Updated: {pu['parent_title']}{detail}",
+            }
+        )
+    return badges
 
 
 def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -675,9 +740,15 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
 
         if name == "create_task":
             item, badge = _create_single_task_from_args(args)
+            badges = [badge, *_parent_update_badges(item.get("parent_updates"))]
+            res_payload: dict[str, Any] = {"task": item}
+            if item.get("possible_parents"):
+                res_payload["needs_parent_clarification"] = True
+                res_payload["possible_parents"] = item["possible_parents"]
             return {
-                "result": {"task": item},
+                "result": res_payload,
                 "action_badge": badge,
+                "action_badges": badges,
                 "navigate_to": None,
             }
 
@@ -687,14 +758,28 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
                 return {"result": {"error": "tasks array is required."}, "action_badge": None, "navigate_to": None}
             created: list[dict[str, Any]] = []
             badges: list[dict[str, Any]] = []
+            clarifications: list[dict[str, Any]] = []
             for entry in raw_list:
                 if not isinstance(entry, dict) or not str(entry.get("title") or "").strip():
                     continue
                 item, badge = _create_single_task_from_args(entry)
                 created.append(item)
                 badges.append(badge)
+                badges.extend(_parent_update_badges(item.get("parent_updates")))
+                if item.get("possible_parents"):
+                    clarifications.append(
+                        {
+                            "task_id": item["id"],
+                            "task_title": item["title"],
+                            "possible_parents": item["possible_parents"],
+                        }
+                    )
+            batch_res: dict[str, Any] = {"tasks": created, "count": len(created)}
+            if clarifications:
+                batch_res["needs_parent_clarification"] = True
+                batch_res["clarification_candidates"] = clarifications
             return {
-                "result": {"tasks": created, "count": len(created)},
+                "result": batch_res,
                 "action_badge": badges[0] if badges else None,
                 "action_badges": badges,
                 "navigate_to": None,
@@ -704,6 +789,27 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
             task_id = _coerce_int(args.get("task_id"))
             if task_id is None:
                 return {"result": {"error": "task_id is required."}, "action_badge": None, "navigate_to": None}
+            if args.get("mark_done_today") is not None:
+                want_dt = _coerce_bool(args.get("mark_done_today"), True)
+                item = db.toggle_task_done_today(task_id, done=want_dt)
+                if not item:
+                    return {"result": {"error": f"Task #{task_id} not found."}, "action_badge": None, "navigate_to": None}
+                days_sfx = (
+                    f"{item['days_completed']}/{item['target_days']} days"
+                    if item["target_days"]
+                    else f"{item['days_completed']}d"
+                )
+                badge = {
+                    "tool": name,
+                    "domain": "task",
+                    "item_id": item["id"],
+                    "label": f"{'Done Today' if item['done_today'] else 'Unmarked Today'}: {item['title']} ({days_sfx})",
+                }
+                return {
+                    "result": {"task": item},
+                    "action_badge": badge,
+                    "navigate_to": None,
+                }
             patch: dict[str, Any] = {}
             for key in (
                 "title",
@@ -722,17 +828,30 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
                     if key in ("start_date", "due_date"):
                         val = _clean_opt_date(val)
                     patch[key] = val
+            if "parent_task_id" in args and args["parent_task_id"] is not None:
+                pid_val = _coerce_int(args["parent_task_id"])
+                patch["parent_task_id"] = pid_val if pid_val and pid_val > 0 else None
+            if "is_recurring" in args and args["is_recurring"] is not None:
+                patch["is_recurring"] = _coerce_bool(args["is_recurring"], False)
+            if "target_days" in args and args["target_days"] is not None:
+                patch["target_days"] = _coerce_int(args["target_days"], 0) or 0
+            if "daily_target_minutes" in args and args["daily_target_minutes"] is not None:
+                patch["daily_target_minutes"] = _coerce_int(args["daily_target_minutes"], 0) or 0
+
             item = db.update_task(task_id, patch)
             if not item:
                 return {"result": {"error": f"Task #{task_id} not found."}, "action_badge": None, "navigate_to": None}
+            main_badge = {
+                "tool": name,
+                "domain": "task",
+                "item_id": item["id"],
+                "label": f"Task ({item['status'].replace('_', ' ')}): {item['title']}",
+            }
+            badges = [main_badge, *_parent_update_badges(item.get("parent_updates"))]
             return {
                 "result": {"task": item},
-                "action_badge": {
-                    "tool": name,
-                    "domain": "task",
-                    "item_id": item["id"],
-                    "label": f"Task ({item['status'].replace('_', ' ')}): {item['title']}",
-                },
+                "action_badge": main_badge,
+                "action_badges": badges,
                 "navigate_to": None,
             }
 
@@ -749,17 +868,20 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
             )
             if not item:
                 return {"result": {"error": f"Task #{task_id} not found."}, "action_badge": None, "navigate_to": None}
+            main_badge = {
+                "tool": name,
+                "domain": "task",
+                "item_id": item["id"],
+                "label": (
+                    f"Checklist: {item['title']} "
+                    f"({item['checklist_done']}/{item['checklist_total']} · {item['status'].replace('_', ' ')})"
+                ),
+            }
+            badges = [main_badge, *_parent_update_badges(item.get("parent_updates"))]
             return {
                 "result": {"task": item},
-                "action_badge": {
-                    "tool": name,
-                    "domain": "task",
-                    "item_id": item["id"],
-                    "label": (
-                        f"Checklist: {item['title']} "
-                        f"({item['checklist_done']}/{item['checklist_total']} · {item['status'].replace('_', ' ')})"
-                    ),
-                },
+                "action_badge": main_badge,
+                "action_badges": badges,
                 "navigate_to": None,
             }
 
@@ -1073,7 +1195,7 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
                     brk_mins = 5.0
                 subject = str(args.get("subject") or "Study").strip() or "Study"
                 topic = str(args.get("topic") or "").strip()
-                timer_state = db.start_timer(
+                started = db.start_timer_and_autosave(
                     mode=mode,
                     duration_minutes=dur_mins,
                     break_minutes=brk_mins,
@@ -1083,6 +1205,8 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
                     note_id=_coerce_int(args.get("note_id")),
                     notes=str(args.get("notes") or ""),
                 )
+                timer_state = started["state"]
+                logged_session = started["previous_logged_session"]
                 if timer_state["mode"] == "stopwatch":
                     lbl = f"Started Stopwatch: {timer_state['subject']}"
                 else:
@@ -1123,13 +1247,25 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
             else:
                 return {"result": {"error": f"Unsupported timer action: {action}"}, "action_badge": None, "navigate_to": None}
 
+            badges_out = [badge]
+            if action == "start" and logged_session:
+                badges_out.append(
+                    {
+                        "tool": name,
+                        "domain": "timer",
+                        "item_id": logged_session["id"],
+                        "label": f"Auto-Saved Prior Study: {logged_session['duration_minutes']:g}m ({logged_session['subject']})",
+                    }
+                )
             return {
                 "result": {
                     "timer": timer_state,
                     "logged_session": logged_session,
+                    "previous_logged_session": logged_session if action == "start" else None,
                     "stats": db.get_study_stats(),
                 },
                 "action_badge": badge,
+                "action_badges": badges_out,
                 "navigate_to": nav,
             }
 
