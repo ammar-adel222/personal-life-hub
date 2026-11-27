@@ -19,6 +19,10 @@ build/
 *.wav
 *.mp3
 settings.json
+google_credentials.json
+google_token.json
+tray.ico
+app.log
 user_data/
 media/
 

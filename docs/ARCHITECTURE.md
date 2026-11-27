@@ -10,7 +10,7 @@ Instead of pulling in LangChain/LangGraph abstractions, `app/agent.py` + `app/to
 
 1. **Session Context Assembly**: Loads the active session from `agent_sessions` and the last 12 `agent_messages`, injecting compact `[Executed actions: domain #id: label]` annotations onto prior assistant messages so follow-up voice turns (*"check off the first item on that lecture note"*) resolve exact database IDs across turns.
 2. **Bounded Tool Loop (`MAX_TOOL_ROUNDS = 12`)**:
-   - Sends messages + 22 JSON tool schemas (`tools.TOOL_SCHEMAS`) + a 14-day local calendar context to `openai/gpt-oss-120b` (with automatic fallback to `qwen/qwen3.8-27b`, `openai/gpt-oss-20b`, and dynamic `/models` discovery on HTTP `404`).
+   - Sends messages + 24 JSON tool schemas (`tools.TOOL_SCHEMAS`) + a 14-day local calendar context to `openai/gpt-oss-120b` (with automatic fallback to `qwen/qwen3.8-27b`, `openai/gpt-oss-20b`, and dynamic `/models` discovery on HTTP `404`).
    - Executes returned `tool_calls` synchronously in `app/tools.py`, appends structured JSON results as `"tool"` messages, and collects UI badges (`action_badge`) and navigation triggers (`navigate_to`).
    - When the model returns a natural-language response, persists both the reply and action metadata into SQLite and returns `is_question` so the UI knows whether to speak clarifications aloud.
 3. **Offline Fallback**: When no Groq key is present (or the network is unreachable), `_offline_agent_fallback` handles checklist task syntax (`steps: ...`), tagged lecture notes, gym sets, and quick captures cleanly.
@@ -41,20 +41,23 @@ Instead of pulling in LangChain/LangGraph abstractions, `app/agent.py` + `app/to
 | `control_study_timer` | Start/pause/resume/stop/reset countdown or stopwatch timer linked to a task or note |
 | `log_study_session` | Log a completed study/focus session with duration, subject, topic, and optional task/note link |
 | `get_study_stats` | Retrieve live timer state, today/7d/all-time focus hours, streak, subject breakdown, and sessions |
-| `navigate_ui` | Switch the WebView2 desktop view (`hub`, `tasks`, `notes`, `timer`, `gym`, `art`, `gaming`, `ask`, `settings`) |
-| `delete_item` | Safely delete a task, note, gym log, art item, game, or study session — requires `confirmed=true` |
+| `upsert_watchlist_item` | Save or update a playlist, video, course, podcast, or article (with URL auto-detection, tags & episode progress) |
+| `list_watchlist` | List or search saved watchlist items filtered by status, type, category, or query |
+| `navigate_ui` | Switch the WebView2 desktop view (`hub`, `tasks`, `notes`, `timer`, `watchlist`, `gym`, `art`, `gaming`, `ask`, `settings`) |
+| `delete_item` | Safely delete a task, note, gym log, art item, game, study session, or watchlist item — requires `confirmed=true` |
 
 ---
 
 ## 3. SQLite Schema & Legacy Migration (`app/db.py`)
 
-Databases use `PRAGMA journal_mode=WAL` and `PRAGMA foreign_keys=ON`. `_migrate_db()` inspects `PRAGMA table_info(tasks)` and `PRAGMA table_info(notes)` on startup so older databases automatically receive new columns (`status`, `progress_note`, `start_date`, `timeline`, `frequency`, `folder`, `summary`) without data loss.
+Databases use `PRAGMA journal_mode=WAL` and `PRAGMA foreign_keys=ON`. `_migrate_db()` inspects existing tables on startup so older databases automatically receive new columns (`status`, `progress_note`, `start_date`, `timeline`, `frequency`, `folder`, `summary`) and new tables (`study_sessions`, `active_timer`, `watchlist_items`) without data loss.
 
 ```mermaid
 erDiagram
     tasks ||--o{ task_items : "has checklist steps"
     tasks ||--o{ study_sessions : "optional task link"
     notes ||--o{ study_sessions : "optional note link"
+    notes ||--o{ watchlist_items : "optional linked note"
     agent_sessions ||--o{ agent_messages : "contains turns"
 
     tasks {
@@ -105,6 +108,18 @@ erDiagram
         int accumulated_seconds
         real started_at_epoch
     }
+    watchlist_items {
+        int id PK
+        text title
+        text url
+        text content_type "playlist | video | course | podcast | article"
+        text source
+        text category
+        text status "to_watch | watching | watched"
+        int progress_current
+        int progress_total
+        int note_id FK "ON DELETE SET NULL"
+    }
     agent_sessions {
         int id PK
         text title
@@ -137,3 +152,20 @@ erDiagram
    - Primary provider calls Groq Orpheus (`canopylabs/orpheus-v1-english`, `response_format="wav"`).
    - Any missing key, rate limit (`429`), or network error returns `{"fallback_local": true}`, causing the UI to speak via `window.speechSynthesis`.
    - To add Google Cloud TTS or Gemini TTS later, implement `_synthesize_google_tts(text)` in `app/tts.py` returning WAV bytes and add a `google_api_key` setting in `app/config.py`.
+
+---
+
+## 5. Win32 Global Hotkey, System Tray & Floating Pill (`app/desktop_host.py`)
+
+When running via `run_app.py` (skipped cleanly under `--smoke-test`), `DesktopHost` spins up a dedicated 64-bit-safe `ctypes` Win32 message-loop thread owning:
+1. **System-Wide Hotkey (`RegisterHotKey` + `MOD_NOREPEAT`)**: Parses hotkey strings such as `ctrl+shift+space` into Win32 modifier/VK codes and toggles hands-free recording from any focused app, playing subtle `winsound` feedback chimes (`start` / `stop` / `done` / `error`). Hotkey edits in `PATCH /api/settings` post `WM_RELOAD_HOTKEY` live without restarting the app.
+2. **System Tray (`Shell_NotifyIconW`)**: Uses a Pillow-generated indigo `tray.ico` saved in `%LOCALAPPDATA%\PersonalLifeHub\`. With `minimize_to_tray=true`, clicking the window close button (`window.events.closing`) returns `False` and defers `window.hide()`, keeping the tray menu (**Open**, **Toggle Recording**, **Exit**) active in the background.
+3. **Floating Indicator Pill (`WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`)**: Displays a small rounded GDI pill at top-center while recording, transcribing, or summarizing — without stealing keyboard focus from lectures, editors, or games. State is also exposed over `/api/voice/global-state` so the frontend stays synchronized.
+
+---
+
+## 6. Watchlist Metadata & Dual Cloud Sync (`app/watchlist.py`, `app/cloud_sync.py`)
+
+- **Safe URL Detection & Auto-Fill (`app/watchlist.py`)**: `is_safe_http_url()` restricts links to public `http://`/`https://` targets (blocking loopback, link-local, RFC1918 private IPs, and non-HTTP schemes). `fetch_url_metadata()` queries YouTube oEmbed and safe HTML `<meta property="og:title">` / `<title>` tags with deterministic URL fallbacks on offline errors.
+- **Instant Local Cloud Folder Mirror (`sync_to_cloud_folder`)**: Detects installed **Google Drive Desktop**, **OneDrive**, and **Dropbox** roots on Windows, rendering organized `Notes/<Notebook>/<title>-<id>.md`, `Watchlist.md`, `Tasks.md`, and `lifehub-backup.json` atomically (`*.tmp` -> `replace`) only when file content actually changes. When `cloud_auto_sync` is enabled, note/watchlist writes trigger a debounced background sync thread.
+- **Direct Google Drive OAuth (`sync_to_gdrive`)**: Uses `google-auth-oauthlib` (`InstalledAppFlow`) and `googleapiclient` with narrow `https://www.googleapis.com/auth/drive.file` scope so the app can create/update only its own `PersonalLifeHub` folder hierarchy in Drive. `google_credentials.json` and `google_token.json` never enter the Git repository.
