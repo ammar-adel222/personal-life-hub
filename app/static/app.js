@@ -49,6 +49,21 @@ const state = {
   agentMessages: [],
   askQuery: "",
   askResult: null,
+  timerState: null,
+  timerClientSyncedAt: 0,
+  timerTickId: null,
+  timerCompleting: false,
+  timerDraft: {
+    mode: "countdown",
+    focusMins: 25,
+    breakMins: 5,
+    subject: "Study",
+    topic: "",
+    taskId: "",
+    noteId: "",
+    notes: "",
+  },
+  studyData: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -125,6 +140,7 @@ async function renderCurrentView() {
     if (state.view === "hub") await renderHub();
     else if (state.view === "tasks") await renderTasks();
     else if (state.view === "notes") await renderNotes();
+    else if (state.view === "timer") await renderTimer();
     else if (state.view === "gym") await renderGym();
     else if (state.view === "art") await renderArt();
     else if (state.view === "gaming") await renderGaming();
@@ -306,6 +322,7 @@ async function handleAgentResponse(res, transcriptPrefix = "") {
   const fullToast = transcriptPrefix ? `🎙️ "${transcriptPrefix}" → ${msg}` : msg;
   toast(fullToast || "Done!", res.warning ? "error" : "success");
 
+  await syncTimerState();
   if (res.navigate_to && res.navigate_to !== state.view) {
     await switchView(res.navigate_to);
   } else {
@@ -337,6 +354,7 @@ async function submitCapture() {
       input.value = "";
       const msg = res.warning ? `${res.summary} (${res.warning})` : res.summary;
       toast(msg || "Captured!", res.warning ? "info" : "success");
+      await syncTimerState();
       await renderCurrentView();
     }
   } catch (err) {
@@ -616,6 +634,10 @@ async function renderHub() {
       <div class="stat-card">
         <span class="stat-label">Playing &amp; Art WIPs</span>
         <span class="stat-value">${data.playing_games.length + data.art_wips.length} active</span>
+      </div>
+      <div class="stat-card" data-jump-view="timer" style="cursor:pointer" title="Open Focus Timer (Alt+4)">
+        <span class="stat-label">⏱️ Study Today</span>
+        <span class="stat-value" style="color:var(--accent-hover)">${esc(formatDurationHuman(data.study?.today_seconds || 0))} <span style="font-size:13px;color:var(--muted)">(${data.study?.week_hours || 0}h / 7d)</span></span>
       </div>
     </div>
 
@@ -1991,6 +2013,698 @@ async function renderNotes() {
 }
 
 // ---------------------------------------------------------------------------
+// View 4: Focus / Study Timer & Session History
+// ---------------------------------------------------------------------------
+
+const TIMER_RING_CIRC = 2 * Math.PI * 96;
+
+function formatClock(totalSeconds) {
+  const s = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const hrs = Math.floor(s / 3600);
+  const mins = Math.floor((s % 3600) / 60);
+  const secs = s % 60;
+  const mm = String(mins).padStart(2, "0");
+  const ss = String(secs).padStart(2, "0");
+  return hrs > 0 ? `${hrs}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+function formatDurationHuman(totalSeconds) {
+  const s = Math.max(0, Math.round(Number(totalSeconds) || 0));
+  const totalMins = Math.round(s / 60);
+  if (s > 0 && totalMins === 0) return `${s}s`;
+  const hrs = Math.floor(totalMins / 60);
+  const mins = totalMins % 60;
+  if (hrs > 0 && mins > 0) return `${hrs}h ${mins}m`;
+  if (hrs > 0) return `${hrs}h`;
+  return `${totalMins}m`;
+}
+
+function playTimerChime() {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const notes = [523.25, 659.25, 783.99];
+    notes.forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      const start = ctx.currentTime + i * 0.14;
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(0.14, start + 0.03);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.45);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + 0.48);
+    });
+  } catch {
+    // ignore WebAudio restrictions
+  }
+}
+
+function computeLiveTimerValues() {
+  const t = state.timerState;
+  if (!t || !t.active) {
+    const isCd = state.timerDraft.mode === "countdown";
+    const planned = Math.max(60, Math.round((Number(state.timerDraft.focusMins) || 25) * 60));
+    return {
+      active: false,
+      paused: false,
+      mode: state.timerDraft.mode,
+      phase: "focus",
+      elapsed: 0,
+      remaining: isCd ? planned : 0,
+      displaySeconds: isCd ? planned : 0,
+      targetSeconds: planned,
+      progress: 1,
+    };
+  }
+
+  let elapsed = Number(t.accumulated_seconds || 0);
+  if (!t.paused) {
+    const delta = Math.max(0, Math.floor((performance.now() - state.timerClientSyncedAt) / 1000));
+    elapsed += delta;
+  }
+
+  if (t.mode === "countdown") {
+    const target = Math.max(1, Number(t.target_seconds || 1));
+    const remaining = Math.max(0, target - elapsed);
+    return {
+      active: true,
+      paused: Boolean(t.paused),
+      mode: "countdown",
+      phase: t.phase || "focus",
+      elapsed,
+      remaining,
+      displaySeconds: remaining,
+      targetSeconds: target,
+      progress: Math.min(1, Math.max(0, remaining / target)),
+    };
+  }
+
+  return {
+    active: true,
+    paused: Boolean(t.paused),
+    mode: "stopwatch",
+    phase: "focus",
+    elapsed,
+    remaining: null,
+    displaySeconds: elapsed,
+    targetSeconds: 0,
+    progress: (elapsed % 60) / 60,
+  };
+}
+
+function updateTimerDomInPlace() {
+  const live = computeLiveTimerValues();
+  const clockStr = formatClock(live.displaySeconds);
+
+  const pill = document.getElementById("top-timer-pill");
+  const pillReadout = document.getElementById("top-timer-readout");
+  const pillSubj = document.getElementById("top-timer-subject");
+  if (pill && pillReadout && pillSubj) {
+    pill.classList.toggle("hidden", !live.active);
+    pill.classList.toggle("paused", live.active && live.paused);
+    pill.classList.toggle("break", live.active && live.phase === "break");
+    pillReadout.textContent = clockStr;
+    const subj = state.timerState?.subject || "Study";
+    pillSubj.textContent = live.phase === "break" ? "Break" : subj;
+  }
+
+  const clockEl = document.getElementById("timer-clock-text");
+  const phaseEl = document.getElementById("timer-phase-badge");
+  const ringEl = document.getElementById("timer-ring-fg");
+  if (clockEl) clockEl.textContent = clockStr;
+  if (phaseEl) {
+    if (!live.active) {
+      phaseEl.textContent = live.mode === "countdown" ? "Ready · Focus Countdown" : "Ready · Open Stopwatch";
+    } else if (live.paused) {
+      phaseEl.textContent = live.phase === "break" ? "Break Paused" : "Paused";
+    } else if (live.phase === "break") {
+      phaseEl.textContent = "☕ Break Time";
+    } else {
+      phaseEl.textContent = live.mode === "stopwatch" ? "⏱️ Stopwatch Running" : "🎯 Deep Focus";
+    }
+  }
+  if (ringEl) {
+    const offset = TIMER_RING_CIRC * (1 - live.progress);
+    ringEl.style.strokeDashoffset = `${offset.toFixed(2)}`;
+    ringEl.classList.toggle("break", live.active && live.phase === "break");
+    ringEl.classList.toggle("paused", live.active && live.paused);
+  }
+
+  if (
+    live.active &&
+    !live.paused &&
+    live.mode === "countdown" &&
+    live.remaining <= 0 &&
+    !state.timerCompleting
+  ) {
+    state.timerCompleting = true;
+    playTimerChime();
+    api("/api/timer/control", {
+      method: "POST",
+      body: { action: "complete", start_break: true },
+    })
+      .then(async (res) => {
+        state.timerState = res.state;
+        state.timerClientSyncedAt = performance.now();
+        updateTimerDomInPlace();
+        if (res.logged_session) {
+          const msg = res.state.active
+            ? `🎉 Logged ${res.logged_session.duration_minutes}m (${res.logged_session.subject})! Break started.`
+            : `🎉 Logged ${res.logged_session.duration_minutes}m (${res.logged_session.subject})!`;
+          toast(msg, "success");
+        } else {
+          toast("☕ Break finished! Ready for your next focus block.", "info");
+        }
+        await renderCurrentView();
+      })
+      .catch(() => {
+        // ignore transient errors; ticker will recover on next sync
+      })
+      .finally(() => {
+        state.timerCompleting = false;
+      });
+  }
+}
+
+function ensureTimerTicker() {
+  if (state.timerTickId) return;
+  state.timerTickId = setInterval(updateTimerDomInPlace, 500);
+}
+
+async function syncTimerState() {
+  try {
+    const data = await api("/api/timer/state");
+    state.timerState = data.state;
+    state.timerClientSyncedAt = performance.now();
+    ensureTimerTicker();
+    updateTimerDomInPlace();
+  } catch {
+    // ignore
+  }
+}
+
+async function renderTimer() {
+  const [timerData, tasksRes, notesRes] = await Promise.all([
+    api("/api/timer"),
+    api("/api/tasks?list_type=daily&include_done=false"),
+    api("/api/notes"),
+  ]);
+  state.timerState = timerData.state;
+  state.timerClientSyncedAt = performance.now();
+  state.studyData = timerData;
+  ensureTimerTicker();
+
+  const t = timerData.state;
+  const stats = timerData.stats || {};
+  const sessions = timerData.sessions || [];
+  const openTasks = tasksRes.items || [];
+  const notes = notesRes.items || [];
+  const subjects = stats.subjects || ["Study", "Lectures", "Coding", "Projects", "Art", "Reading", "Research"];
+
+  if (t.active) {
+    state.timerDraft.mode = t.mode || "countdown";
+    state.timerDraft.subject = t.subject || "Study";
+    state.timerDraft.topic = t.topic || "";
+    state.timerDraft.taskId = t.task_id ? String(t.task_id) : "";
+    state.timerDraft.noteId = t.note_id ? String(t.note_id) : "";
+    state.timerDraft.notes = t.notes || "";
+  }
+
+  const draft = state.timerDraft;
+  const live = computeLiveTimerValues();
+  const maxDaySecs = Math.max(60, ...(stats.daily_breakdown || []).map((d) => d.seconds || 0));
+
+  const el = document.getElementById("view-timer");
+  el.innerHTML = `
+    <div class="view-header">
+      <div>
+        <h1 class="view-title">⏱️ Focus &amp; Study Timer</h1>
+        <p class="view-sub">Pomodoro / custom countdown &amp; open stopwatch linked to your tasks, notes &amp; voice agent</p>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button id="timer-voice-hint" type="button" class="btn btn-ghost btn-sm" title="Try speaking commands">
+          🎙️ Voice: "Start 25m focus on Coding"
+        </button>
+      </div>
+    </div>
+
+    <div class="stat-strip">
+      <div class="stat-card">
+        <span class="stat-label">Today's Focus</span>
+        <span class="stat-value" style="color:var(--accent-hover)">${esc(formatDurationHuman(stats.today_seconds || 0))} <span style="font-size:13px;color:var(--muted)">(${stats.today_sessions_count || 0} sessions)</span></span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Last 7 Days</span>
+        <span class="stat-value" style="color:var(--gym)">${stats.week_hours || 0}h <span style="font-size:13px;color:var(--muted)">(${esc(formatDurationHuman(stats.week_seconds || 0))})</span></span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Study Streak</span>
+        <span class="stat-value" style="color:var(--art)">${stats.streak_days || 0}d</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">All-Time Logged</span>
+        <span class="stat-value">${stats.total_hours || 0}h <span style="font-size:13px;color:var(--muted)">(${stats.total_sessions || 0} total)</span></span>
+      </div>
+    </div>
+
+    <div class="timer-layout">
+      <!-- Left: Interactive Clock, Presets & Session Tagging -->
+      <div class="card timer-hero-card">
+        <datalist id="study-subjects-datalist">
+          ${subjects.map((s) => `<option value="${esc(s)}"></option>`).join("")}
+        </datalist>
+
+        ${
+          !t.active
+            ? `
+              <div class="editor-mode-tabs" style="align-self:center;">
+                <button type="button" class="mode-tab ${draft.mode === "countdown" ? "active" : ""}" data-timer-mode="countdown">⏳ Countdown / Pomodoro</button>
+                <button type="button" class="mode-tab ${draft.mode === "stopwatch" ? "active" : ""}" data-timer-mode="stopwatch">⏱️ Open Stopwatch</button>
+              </div>
+              ${
+                draft.mode === "countdown"
+                  ? `
+                    <div class="timer-presets">
+                      <button type="button" class="mode-pill ${draft.focusMins === 25 && draft.breakMins === 5 ? "active" : ""}" data-preset-focus="25" data-preset-break="5">🍅 25 / 5</button>
+                      <button type="button" class="mode-pill ${draft.focusMins === 50 && draft.breakMins === 10 ? "active" : ""}" data-preset-focus="50" data-preset-break="10">⚡ 50 / 10</button>
+                      <button type="button" class="mode-pill ${draft.focusMins === 90 && draft.breakMins === 15 ? "active" : ""}" data-preset-focus="90" data-preset-break="15">🧠 90 / 15</button>
+                    </div>
+                    <div class="field-row" style="justify-content:center;">
+                      <label style="font-size:12px;color:var(--muted);">Focus (min)
+                        <input id="timer-custom-focus" class="input" type="number" min="1" max="360" value="${esc(draft.focusMins)}" style="width:76px;margin-left:4px;padding:5px 8px;" />
+                      </label>
+                      <label style="font-size:12px;color:var(--muted);">Break (min)
+                        <input id="timer-custom-break" class="input" type="number" min="0" max="90" value="${esc(draft.breakMins)}" style="width:72px;margin-left:4px;padding:5px 8px;" />
+                      </label>
+                    </div>`
+                  : `<div style="text-align:center;font-size:12.5px;color:var(--muted);">Open-ended study block — counts up until you click Finish &amp; Save.</div>`
+              }
+            `
+            : ""
+        }
+
+        <div class="timer-ring-wrap">
+          <svg class="timer-svg" viewBox="0 0 220 220">
+            <circle class="timer-ring-bg" cx="110" cy="110" r="96"></circle>
+            <circle id="timer-ring-fg" class="timer-ring-fg ${t.active && t.phase === "break" ? "break" : ""} ${t.active && t.paused ? "paused" : ""}" cx="110" cy="110" r="96" style="stroke-dashoffset:${(TIMER_RING_CIRC * (1 - live.progress)).toFixed(2)}"></circle>
+          </svg>
+          <div class="timer-ring-center">
+            <div id="timer-clock-text" class="timer-clock-text">${esc(formatClock(live.displaySeconds))}</div>
+            <div id="timer-phase-badge" class="timer-phase-badge">${t.active ? (t.paused ? "Paused" : t.phase === "break" ? "☕ Break Time" : "🎯 Deep Focus") : "Ready"}</div>
+          </div>
+        </div>
+
+        <div class="timer-controls-row">
+          ${
+            !t.active
+              ? `<button id="timer-start-btn" type="button" class="btn btn-primary" style="min-width:160px;">▶ Start ${draft.mode === "stopwatch" ? "Stopwatch" : "Focus"}</button>`
+              : `
+                ${
+                  t.paused
+                    ? `<button id="timer-resume-btn" type="button" class="btn btn-primary">▶ Resume</button>`
+                    : `<button id="timer-pause-btn" type="button" class="btn btn-art">⏸ Pause</button>`
+                }
+                ${
+                  t.phase === "focus"
+                    ? `<button id="timer-stop-btn" type="button" class="btn btn-gym">⏹ Finish &amp; Save</button>`
+                    : `<button id="timer-skip-break-btn" type="button" class="btn btn-primary">⏭ Skip Break</button>`
+                }
+                <button id="timer-reset-btn" type="button" class="btn btn-danger btn-sm">↺ Cancel</button>
+              `
+          }
+        </div>
+
+        <div class="timer-subject-pills">
+          ${subjects
+            .slice(0, 8)
+            .map(
+              (s) =>
+                `<button type="button" class="mode-pill ${draft.subject.toLowerCase() === s.toLowerCase() ? "active" : ""}" data-pick-subj="${esc(s)}">${esc(s)}</button>`
+            )
+            .join("")}
+        </div>
+
+        <div class="field-group" style="margin-bottom:0;">
+          <label class="field-label">Subject &amp; Topic</label>
+          <div class="field-row">
+            <input id="timer-subject-input" class="input" type="text" list="study-subjects-datalist" value="${esc(draft.subject)}" placeholder="Subject" style="max-width:140px;" />
+            <input id="timer-topic-input" class="input" type="text" value="${esc(draft.topic)}" placeholder="What are you studying? e.g. Lecture 4 ResNets" />
+          </div>
+        </div>
+
+        <div class="field-group" style="margin-bottom:0;">
+          <label class="field-label">Link Active Task &amp; Note (Optional)</label>
+          <div class="field-row" style="margin-bottom:6px;">
+            <select id="timer-task-select">
+              <option value="">No linked task</option>
+              ${openTasks
+                .map(
+                  (tk) =>
+                    `<option value="${tk.id}" ${String(tk.id) === String(draft.taskId) ? "selected" : ""}>✅ ${esc(tk.title)}</option>`
+                )
+                .join("")}
+            </select>
+          </div>
+          <div class="field-row">
+            <select id="timer-note-select">
+              <option value="">No linked note</option>
+              ${notes
+                .map(
+                  (nt) =>
+                    `<option value="${nt.id}" ${String(nt.id) === String(draft.noteId) ? "selected" : ""}>📝 ${esc(nt.title)}${nt.folder ? ` (${esc(nt.folder)})` : ""}</option>`
+                )
+                .join("")}
+            </select>
+            ${
+              draft.noteId
+                ? `<button id="timer-open-linked-note" type="button" class="btn btn-ghost btn-sm" title="Open linked note">Open</button>`
+                : ""
+            }
+          </div>
+        </div>
+
+        <div class="field-group" style="margin-bottom:0;">
+          <label class="field-label">Session Reflection / Quick Notes</label>
+          <textarea id="timer-notes-input" rows="2" style="min-height:60px;" placeholder="Key takeaways, stopping point, or follow-ups…">${esc(draft.notes)}</textarea>
+        </div>
+      </div>
+
+      <!-- Right: 7-Day Activity, Subject Breakdown, Manual Logger & Session History -->
+      <div style="display:flex;flex-direction:column;gap:16px;">
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">📊 Last 7 Days &amp; Subjects</h2>
+            <span class="badge badge-accent">${stats.week_hours || 0}h this week</span>
+          </div>
+          <div class="timer-week-bars">
+            ${(stats.daily_breakdown || [])
+              .map((d) => {
+                const pct = d.seconds > 0 ? Math.max(8, Math.round((d.seconds / maxDaySecs) * 100)) : 3;
+                const dayLbl = formatTodayLabel(d.date).split(",")[0];
+                return `
+                  <div class="timer-day-col" title="${esc(d.date)}: ${esc(formatDurationHuman(d.seconds))}">
+                    <span class="timer-day-val">${d.seconds > 0 ? esc(formatDurationHuman(d.seconds)) : "–"}</span>
+                    <div class="timer-day-bar-wrap">
+                      <div class="timer-day-bar" style="height:${pct}%;opacity:${d.seconds > 0 ? 1 : 0.25};"></div>
+                    </div>
+                    <span class="timer-day-lbl">${esc(dayLbl)}</span>
+                  </div>`;
+              })
+              .join("")}
+          </div>
+          ${
+            stats.by_subject && stats.by_subject.length
+              ? `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:12px;">
+                  ${stats.by_subject
+                    .map(
+                      (s) =>
+                        `<span class="badge badge-accent">${esc(s.subject)}: ${esc(formatDurationHuman(s.seconds))} (${s.sessions})</span>`
+                    )
+                    .join("")}
+                </div>`
+              : ""
+          }
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">📖 Log Past Session &amp; History</h2>
+            <span class="badge">${sessions.length} recent</span>
+          </div>
+          <form id="study-manual-form" class="inline-form">
+            <input id="study-man-subject" class="input" type="text" list="study-subjects-datalist" value="Study" placeholder="Subject" style="width:115px;" required />
+            <input id="study-man-topic" class="input grow" type="text" placeholder="Topic (e.g. Lecture 3 notes)" />
+            <input id="study-man-mins" class="input" type="number" min="1" max="720" value="30" placeholder="Mins" style="width:82px;" required />
+            <button type="submit" class="btn btn-primary btn-sm">+ Log</button>
+          </form>
+
+          <div class="item-list" style="max-height:360px;overflow-y:auto;">
+            ${
+              sessions.length
+                ? sessions
+                    .map((s) => {
+                      const modeIcon = s.mode === "stopwatch" ? "⏱️" : s.mode === "countdown" ? "⏳" : "📝";
+                      return `
+                        <div class="list-row">
+                          <div class="row-main">
+                            <div class="row-title">
+                              <span class="badge badge-accent">${esc(s.subject)}</span>
+                              ${s.topic ? `<span>${esc(s.topic)}</span>` : ""}
+                              <strong style="color:var(--gym)">${esc(formatDurationHuman(s.duration_seconds))}</strong>
+                            </div>
+                            <div class="row-meta">
+                              <span>${modeIcon} ${esc(s.date)}</span>
+                              ${s.task_title ? `<button type="button" class="tag-chip" data-session-task="${s.task_id}">✅ ${esc(s.task_title)}</button>` : ""}
+                              ${s.note_title ? `<button type="button" class="tag-chip" data-session-note="${s.note_id}">📝 ${esc(s.note_title)}</button>` : ""}
+                              ${s.notes ? `<span>${esc(s.notes)}</span>` : ""}
+                            </div>
+                          </div>
+                          <button type="button" class="btn btn-xs btn-danger" data-del-study="${s.id}" title="Delete session">✕</button>
+                        </div>`;
+                    })
+                    .join("")
+                : '<div class="empty-state">No study sessions recorded yet. Start a timer or log past study time above!</div>'
+            }
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  updateTimerDomInPlace();
+
+  el.querySelector("#timer-voice-hint")?.addEventListener("click", () => {
+    toast("Tap 🎙️ Speak and say e.g. 'Start a 25 minute coding timer' or 'I studied 1 hour today'", "info");
+  });
+
+  // Idle mode & preset controls
+  el.querySelectorAll("[data-timer-mode]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.timerDraft.mode = btn.dataset.timerMode;
+      renderTimer();
+    });
+  });
+
+  el.querySelectorAll("[data-preset-focus]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.timerDraft.focusMins = Number(btn.dataset.presetFocus);
+      state.timerDraft.breakMins = Number(btn.dataset.presetBreak);
+      renderTimer();
+    });
+  });
+
+  const focusInput = el.querySelector("#timer-custom-focus");
+  if (focusInput) {
+    focusInput.addEventListener("input", () => {
+      state.timerDraft.focusMins = Math.max(1, Number(focusInput.value) || 25);
+      updateTimerDomInPlace();
+    });
+  }
+  const breakInput = el.querySelector("#timer-custom-break");
+  if (breakInput) {
+    breakInput.addEventListener("input", () => {
+      state.timerDraft.breakMins = Math.max(0, Number(breakInput.value) || 0);
+    });
+  }
+
+  const syncMetaIfRunning = async () => {
+    if (!t.active) return;
+    try {
+      const res = await api("/api/timer/control", {
+        method: "POST",
+        body: {
+          action: "update_meta",
+          subject: state.timerDraft.subject,
+          topic: state.timerDraft.topic,
+          task_id: state.timerDraft.taskId ? Number(state.timerDraft.taskId) : null,
+          note_id: state.timerDraft.noteId ? Number(state.timerDraft.noteId) : null,
+          notes: state.timerDraft.notes,
+        },
+      });
+      state.timerState = res.state;
+      state.timerClientSyncedAt = performance.now();
+      updateTimerDomInPlace();
+    } catch {
+      // ignore
+    }
+  };
+
+  el.querySelectorAll("[data-pick-subj]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      state.timerDraft.subject = btn.dataset.pickSubj;
+      const inp = el.querySelector("#timer-subject-input");
+      if (inp) inp.value = state.timerDraft.subject;
+      el.querySelectorAll("[data-pick-subj]").forEach((b) =>
+        b.classList.toggle("active", b.dataset.pickSubj === state.timerDraft.subject)
+      );
+      await syncMetaIfRunning();
+    });
+  });
+
+  const subjEl = el.querySelector("#timer-subject-input");
+  const topicEl = el.querySelector("#timer-topic-input");
+  const taskEl = el.querySelector("#timer-task-select");
+  const noteEl = el.querySelector("#timer-note-select");
+  const notesEl = el.querySelector("#timer-notes-input");
+
+  subjEl?.addEventListener("input", () => {
+    state.timerDraft.subject = subjEl.value;
+  });
+  subjEl?.addEventListener("change", syncMetaIfRunning);
+  topicEl?.addEventListener("input", () => {
+    state.timerDraft.topic = topicEl.value;
+  });
+  topicEl?.addEventListener("change", syncMetaIfRunning);
+  taskEl?.addEventListener("change", async () => {
+    state.timerDraft.taskId = taskEl.value;
+    await syncMetaIfRunning();
+  });
+  noteEl?.addEventListener("change", async () => {
+    state.timerDraft.noteId = noteEl.value;
+    await syncMetaIfRunning();
+    renderTimer();
+  });
+  notesEl?.addEventListener("input", () => {
+    state.timerDraft.notes = notesEl.value;
+  });
+  notesEl?.addEventListener("change", syncMetaIfRunning);
+
+  el.querySelector("#timer-open-linked-note")?.addEventListener("click", () => {
+    if (!state.timerDraft.noteId) return;
+    state.notesFolder = "all";
+    state.notesTag = "";
+    state.notesQuery = "";
+    state.noteDraft = null;
+    state.activeNoteId = Number(state.timerDraft.noteId);
+    state.noteEditorMode = "read";
+    switchView("notes");
+  });
+
+  // Start / Pause / Resume / Finish & Save / Skip Break / Cancel controls
+  el.querySelector("#timer-start-btn")?.addEventListener("click", async () => {
+    const res = await api("/api/timer/control", {
+      method: "POST",
+      body: {
+        action: "start",
+        mode: state.timerDraft.mode,
+        duration_minutes: state.timerDraft.focusMins,
+        break_minutes: state.timerDraft.breakMins,
+        subject: state.timerDraft.subject || "Study",
+        topic: state.timerDraft.topic || "",
+        task_id: state.timerDraft.taskId ? Number(state.timerDraft.taskId) : null,
+        note_id: state.timerDraft.noteId ? Number(state.timerDraft.noteId) : null,
+        notes: state.timerDraft.notes || "",
+      },
+    });
+    state.timerState = res.state;
+    state.timerClientSyncedAt = performance.now();
+    toast("Focus timer started!", "success");
+    await renderTimer();
+  });
+
+  el.querySelector("#timer-pause-btn")?.addEventListener("click", async () => {
+    const res = await api("/api/timer/control", { method: "POST", body: { action: "pause" } });
+    state.timerState = res.state;
+    state.timerClientSyncedAt = performance.now();
+    await renderTimer();
+  });
+
+  el.querySelector("#timer-resume-btn")?.addEventListener("click", async () => {
+    const res = await api("/api/timer/control", { method: "POST", body: { action: "resume" } });
+    state.timerState = res.state;
+    state.timerClientSyncedAt = performance.now();
+    await renderTimer();
+  });
+
+  el.querySelector("#timer-stop-btn")?.addEventListener("click", async () => {
+    const res = await api("/api/timer/control", {
+      method: "POST",
+      body: {
+        action: "stop",
+        save_session: true,
+        notes: state.timerDraft.notes || "",
+      },
+    });
+    state.timerState = res.state;
+    state.timerClientSyncedAt = performance.now();
+    state.timerDraft.notes = "";
+    if (res.logged_session) {
+      toast(`Saved ${formatDurationHuman(res.logged_session.duration_seconds)} of ${res.logged_session.subject}!`, "success");
+    } else {
+      toast("Timer stopped (under 1s — not saved)", "info");
+    }
+    await renderTimer();
+  });
+
+  el.querySelector("#timer-skip-break-btn")?.addEventListener("click", async () => {
+    const res = await api("/api/timer/control", { method: "POST", body: { action: "skip_break" } });
+    state.timerState = res.state;
+    state.timerClientSyncedAt = performance.now();
+    toast("Break skipped", "info");
+    await renderTimer();
+  });
+
+  el.querySelector("#timer-reset-btn")?.addEventListener("click", async () => {
+    const res = await api("/api/timer/control", { method: "POST", body: { action: "reset" } });
+    state.timerState = res.state;
+    state.timerClientSyncedAt = performance.now();
+    toast("Timer cancelled", "info");
+    await renderTimer();
+  });
+
+  // Manual past session logging
+  el.querySelector("#study-manual-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const subj = el.querySelector("#study-man-subject").value.trim() || "Study";
+    const topic = el.querySelector("#study-man-topic").value.trim();
+    const mins = Number(el.querySelector("#study-man-mins").value || 0);
+    if (mins <= 0) return;
+    await api("/api/study/sessions", {
+      method: "POST",
+      body: {
+        subject: subj,
+        topic,
+        duration_minutes: mins,
+        mode: "manual",
+        task_id: state.timerDraft.taskId ? Number(state.timerDraft.taskId) : null,
+        note_id: state.timerDraft.noteId ? Number(state.timerDraft.noteId) : null,
+      },
+    });
+    toast(`Logged ${mins}m of ${subj}`, "success");
+    await renderTimer();
+  });
+
+  el.querySelectorAll("[data-session-task]").forEach((btn) => {
+    btn.addEventListener("click", () => switchView("tasks"));
+  });
+
+  el.querySelectorAll("[data-session-note]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.notesFolder = "all";
+      state.notesTag = "";
+      state.notesQuery = "";
+      state.noteDraft = null;
+      state.activeNoteId = Number(btn.dataset.sessionNote);
+      state.noteEditorMode = "read";
+      switchView("notes");
+    });
+  });
+
+  el.querySelectorAll("[data-del-study]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      await api(`/api/study/sessions/${btn.dataset.delStudy}`, { method: "DELETE" });
+      toast("Session deleted", "info");
+      await renderTimer();
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Reusable Monthly Activity Calendar
 // ---------------------------------------------------------------------------
 
@@ -2904,6 +3618,7 @@ async function renderAsk() {
         state.noteEditorMode = "read";
         switchView("notes");
       } else if (dom === "task" || dom === "want_to_do") switchView("tasks");
+      else if (dom === "timer" || dom === "study" || dom === "study_session") switchView("timer");
       else if (dom === "gym") switchView("gym");
       else if (dom === "art") switchView("art");
       else if (dom === "game") switchView("gaming");
@@ -3192,6 +3907,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   document.getElementById("voice-btn").addEventListener("click", toggleVoiceRecording);
+  document.getElementById("top-timer-pill").addEventListener("click", () => switchView("timer"));
   document.getElementById("voice-cancel-btn").addEventListener("click", cancelVoiceRecording);
   document.getElementById("voice-mode-toggle").addEventListener("click", async () => {
     state.voiceMode = state.voiceMode === "auto_ai" ? "fill_input" : "auto_ai";
@@ -3247,7 +3963,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       }
     }
     if (e.altKey && !e.ctrlKey && !e.shiftKey) {
-      const views = ["hub", "tasks", "notes", "gym", "art", "gaming", "ask", "settings"];
+      const views = ["hub", "tasks", "notes", "timer", "gym", "art", "gaming", "ask", "settings"];
       const idx = Number(e.key) - 1;
       if (idx >= 0 && idx < views.length) {
         e.preventDefault();
@@ -3257,5 +3973,6 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   await refreshSettingsBadge();
+  await syncTimerState();
   await renderHub();
 });

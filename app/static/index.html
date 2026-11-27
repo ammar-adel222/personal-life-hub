@@ -34,34 +34,39 @@
           <span>Notes</span>
           <kbd>3</kbd>
         </button>
-        <button class="nav-item" data-view="gym" title="Alt+4">
-          <span class="nav-icon">🏋️</span>
-          <span>Gym</span>
+        <button class="nav-item" data-view="timer" title="Alt+4">
+          <span class="nav-icon">⏱️</span>
+          <span>Focus Timer</span>
           <kbd>4</kbd>
         </button>
-        <button class="nav-item" data-view="art" title="Alt+5">
-          <span class="nav-icon">🎨</span>
-          <span>Art</span>
+        <button class="nav-item" data-view="gym" title="Alt+5">
+          <span class="nav-icon">🏋️</span>
+          <span>Gym</span>
           <kbd>5</kbd>
         </button>
-        <button class="nav-item" data-view="gaming" title="Alt+6">
-          <span class="nav-icon">🎮</span>
-          <span>Gaming</span>
+        <button class="nav-item" data-view="art" title="Alt+6">
+          <span class="nav-icon">🎨</span>
+          <span>Art</span>
           <kbd>6</kbd>
         </button>
-        <button class="nav-item" data-view="ask" title="Alt+7">
+        <button class="nav-item" data-view="gaming" title="Alt+7">
+          <span class="nav-icon">🎮</span>
+          <span>Gaming</span>
+          <kbd>7</kbd>
+        </button>
+        <button class="nav-item" data-view="ask" title="Alt+8">
           <span class="nav-icon">🎙️</span>
           <span>Voice Agent</span>
-          <kbd>7</kbd>
+          <kbd>8</kbd>
         </button>
       </nav>
 
       <div class="sidebar-footer">
         <div class="ai-pill" id="sidebar-ai-status">Groq: Checking…</div>
-        <button class="nav-item" data-view="settings" title="Alt+8">
+        <button class="nav-item" data-view="settings" title="Alt+9">
           <span class="nav-icon">⚙️</span>
           <span>Settings</span>
-          <kbd>8</kbd>
+          <kbd>9</kbd>
         </button>
       </div>
     </aside>
@@ -88,12 +93,18 @@
             <button class="mode-pill" data-mode="task">Task</button>
             <button class="mode-pill" data-mode="want_to_do">Want</button>
             <button class="mode-pill" data-mode="note">Note</button>
+            <button class="mode-pill" data-mode="study">Study</button>
             <button class="mode-pill" data-mode="gym">Gym</button>
             <button class="mode-pill" data-mode="art">Art</button>
             <button class="mode-pill" data-mode="game">Game</button>
           </div>
 
           <div class="voice-group">
+            <button id="top-timer-pill" class="top-timer-pill hidden" title="Open Focus Timer (Alt+4)">
+              <span class="timer-live-dot"></span>
+              <span id="top-timer-readout">25:00</span>
+              <span id="top-timer-subject">Study</span>
+            </button>
             <button id="voice-btn" class="btn-voice" title="Voice Capture (Alt+V or Ctrl+Space)">
               <span class="voice-dot"></span>
               <span id="voice-btn-label">🎙️ Speak</span>
@@ -120,7 +131,10 @@
         <!-- View 3: Notes -->
         <section id="view-notes" class="view"></section>
 
-        <!-- View 4: Gym -->
+        <!-- View 4: Focus Timer -->
+        <section id="view-timer" class="view"></section>
+
+        <!-- View 5: Gym -->
         <section id="view-gym" class="view"></section>
 
         <!-- View 5: Art -->
