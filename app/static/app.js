@@ -64,6 +64,8 @@ const state = {
     notes: "",
   },
   studyData: null,
+  studyLoggedTodaySeconds: 0,
+  studyTodaySessionsCount: 0,
   watchlist: [],
   watchlistStatus: "all",
   watchlistType: "all",
@@ -557,11 +559,23 @@ function formatDueBadge(dueDate, done) {
 }
 
 function taskMetaBadges(t) {
+  const studyTxt = t.study_seconds_today > 0
+    ? `<span class="badge badge-accent">⏱️ ${esc(formatDurationHuman(t.study_seconds_today))} today</span>`
+    : (t.study_seconds_total > 0 ? `<span class="badge">⏱️ ${esc(formatDurationHuman(t.study_seconds_total))} total</span>` : "");
+  const dailyBadge = t.is_recurring
+    ? `<span class="badge ${t.done_today ? "badge-done-today" : "badge-gym"}">${t.done_today ? "✓ Done Today · " : "🔁 "}${t.target_days ? `${t.days_completed}/${t.target_days} days` : `${t.days_completed}d done`}${t.daily_streak > 1 ? ` · ${t.daily_streak}d streak` : ""}</span>`
+    : "";
+  const parentBadge = t.parent_task_title
+    ? `<span class="badge badge-parent">🔗 Part of: ${esc(t.parent_task_title)}${t.parent_item_text ? ` ↳ ${esc(t.parent_item_text)}` : ""}</span>`
+    : "";
   return `
     ${taskStatusBadge(t)}
+    ${parentBadge}
+    ${dailyBadge}
     ${t.checklist_total ? `<span class="badge">${t.checklist_done}/${t.checklist_total} steps</span>` : ""}
     ${t.timeline ? `<span class="badge badge-accent">🗓️ ${esc(t.timeline)}</span>` : ""}
     ${t.frequency ? `<span class="badge badge-gym">🔁 ${esc(t.frequency)}</span>` : ""}
+    ${studyTxt}
     ${t.priority === "high" ? '<span class="badge badge-high">High</span>' : ""}
     ${t.category ? `<span class="badge">${esc(t.category)}</span>` : ""}
     ${formatDueBadge(t.due_date, t.done)}
@@ -569,9 +583,47 @@ function taskMetaBadges(t) {
   `;
 }
 
+async function startTimerForTask(task) {
+  if (!task) return;
+  let mins = Number(task.daily_target_minutes || 0);
+  if (!mins) {
+    const mHr = `${task.frequency || ""} ${task.title || ""}`.match(/(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|hr|h)\b/i);
+    const mMin = `${task.frequency || ""} ${task.title || ""}`.match(/(\d+(?:\.\d+)?)\s*(?:minutes?|mins?|min|m)\b/i);
+    if (mHr) mins = Math.round(Number(mHr[1]) * 60);
+    else if (mMin) mins = Math.round(Number(mMin[1]));
+  }
+  if (!mins || mins < 5) mins = state.timerDraft.focusMins || 25;
+
+  const res = await api("/api/timer/control", {
+    method: "POST",
+    body: {
+      action: "start",
+      mode: "countdown",
+      duration_minutes: mins,
+      break_minutes: state.timerDraft.breakMins || 5,
+      subject: task.category || "Study",
+      topic: task.title,
+      task_id: task.id,
+      note_id: state.timerDraft.noteId ? Number(state.timerDraft.noteId) : null,
+    },
+  });
+  setTimerState(res.state);
+  if (res.stats) {
+    state.studyLoggedTodaySeconds = Number(res.stats.today_logged_seconds ?? res.stats.today_seconds ?? 0);
+    state.studyTodaySessionsCount = Number(res.stats.today_sessions_count || 0);
+  }
+  const extra = res.logged_session
+    ? ` (auto-saved prior ${res.logged_session.duration_minutes}m session)`
+    : "";
+  toast(`⏱️ Started ${mins}m timer for "${task.title}"${extra}`, "success");
+  await switchView("timer");
+}
+
 async function renderHub() {
   const data = await api("/api/dashboard");
   state.dashboard = data;
+  state.studyLoggedTodaySeconds = Number(data.study?.today_logged_seconds ?? data.study?.today_seconds ?? 0);
+  state.studyTodaySessionsCount = Number(data.study?.today_sessions_count || 0);
   document.getElementById("sidebar-today").textContent = formatTodayLabel(data.today);
 
   const el = document.getElementById("view-hub");
@@ -684,7 +736,7 @@ async function renderHub() {
       </div>
       <div class="stat-card" data-jump-view="timer" style="cursor:pointer" title="Open Focus Timer (Alt+4)">
         <span class="stat-label">⏱️ Study Today</span>
-        <span class="stat-value" style="color:var(--accent-hover)">${esc(formatDurationHuman(data.study?.today_seconds || 0))} <span style="font-size:13px;color:var(--muted)">(${data.study?.week_hours || 0}h / 7d)</span></span>
+        <span id="hub-study-today-val" class="stat-value" style="color:var(--accent-hover)">${esc(formatDurationHuman(data.study?.today_seconds || 0))} <span style="font-size:13px;color:var(--muted)">(${data.study?.week_hours || 0}h / 7d)</span></span>
       </div>
     </div>
 
@@ -733,10 +785,15 @@ async function renderHub() {
   el.querySelectorAll("[data-hub-cycle]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const next = nextTaskStatus(btn.dataset.cur);
-      await api(`/api/tasks/${btn.dataset.hubCycle}`, { method: "PATCH", body: { status: next } });
+      const res = await api(`/api/tasks/${btn.dataset.hubCycle}`, { method: "PATCH", body: { status: next } });
+      for (const pu of res.item?.parent_updates || []) {
+        const sfx = pu.target_days ? ` (${pu.days_completed}/${pu.target_days} days)` : "";
+        toast(`✓ Updated parent goal: ${pu.parent_title}${sfx}`, "success");
+      }
       await renderHub();
     });
   });
+  updateTimerDomInPlace();
   el.querySelectorAll("[data-hub-promote]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       await api(`/api/tasks/${btn.dataset.hubPromote}`, { method: "PATCH", body: { list_type: "daily" } });
@@ -765,14 +822,41 @@ async function renderHub() {
 // ---------------------------------------------------------------------------
 
 async function renderTasks() {
-  const { items } = await api("/api/tasks");
+  const [{ items }, timerData] = await Promise.all([
+    api("/api/tasks"),
+    api("/api/timer"),
+  ]);
   state.tasks = items;
+  if (timerData?.state) setTimerState(timerData.state);
+  const stats = timerData?.stats || {};
+  state.studyLoggedTodaySeconds = Number(stats.today_logged_seconds ?? stats.today_seconds ?? 0);
+  state.studyTodaySessionsCount = Number(stats.today_sessions_count || 0);
+  ensureTimerTicker();
+
+  const notifyParentRollup = (taskItem) => {
+    for (const pu of taskItem?.parent_updates || []) {
+      const sfx = pu.target_days
+        ? ` (${pu.days_completed}/${pu.target_days} days)`
+        : (pu.done_today ? ` (Done Today)` : "");
+      toast(`🔗 Updated goal: ${pu.parent_title}${sfx}`, "success");
+    }
+  };
 
   const filterMatches = (t) =>
     state.taskFilter === "all" ? true : t.status === state.taskFilter;
 
-  const daily = items.filter((t) => t.list_type === "daily" && filterMatches(t));
+  const allDaily = items.filter((t) => t.list_type === "daily");
+  const allTodayAll = allDaily.filter((t) => t.is_today_task);
+  const allGoalsAll = allDaily.filter((t) => !t.is_today_task);
+  const parentCandidates = allGoalsAll.filter((t) => !t.done && t.parent_task_id == null);
+
+  const todayTasks = allTodayAll.filter(filterMatches);
+  const goalTasks = allGoalsAll.filter(filterMatches);
   const want = items.filter((t) => t.list_type === "want_to_do" && filterMatches(t));
+
+  const todayDoneCnt = allTodayAll.filter((t) => t.done).length;
+  const recGoals = allDaily.filter((t) => t.is_recurring && !t.is_today_task);
+  const recDoneTodayCnt = recGoals.filter((t) => t.done_today).length;
 
   const counts = {
     all: items.length,
@@ -781,8 +865,37 @@ async function renderTasks() {
     completed: items.filter((t) => t.status === "completed").length,
   };
 
-  const renderTaskRow = (t, isWant) => {
+  const renderTaskRow = (t, { isWant = false, isToday = false, isGoal = false } = {}) => {
     const pct = t.checklist_total ? Math.round((t.checklist_done / t.checklist_total) * 100) : 0;
+    const daysPct = t.is_recurring && t.target_days > 0
+      ? Math.min(100, Math.round((t.days_completed / t.target_days) * 100))
+      : null;
+
+    const parentSelectHtml = isToday && parentCandidates.length
+      ? `<select class="parent-link-select" data-link-parent="${t.id}" title="Link to larger goal">
+          <option value="">Independent task</option>
+          ${parentCandidates
+            .filter((p) => p.id !== t.id)
+            .map(
+              (p) =>
+                `<option value="${p.id}" ${Number(t.parent_task_id) === Number(p.id) ? "selected" : ""}>🔗 ${esc(p.title.slice(0, 34))}</option>`
+            )
+            .join("")}
+        </select>`
+      : "";
+
+    const doneTodayBtn = isGoal && t.is_recurring
+      ? `<button type="button" class="btn btn-xs btn-done-today ${t.done_today ? "active" : ""}" data-done-today="${t.id}" title="Mark today's daily session done">${t.done_today ? "✓ Done Today" : "○ Done Today"}</button>`
+      : "";
+
+    const addTodayChildBtn = isGoal && !t.done
+      ? `<button type="button" class="btn btn-xs btn-ghost" data-add-child="${t.id}" title="Add a to-do under this goal for today">+ Today</button>`
+      : "";
+
+    const studyBtn = !isWant && !t.done
+      ? `<button type="button" class="btn btn-xs btn-ghost" data-study-task="${t.id}" title="Start Focus Timer linked to this task">⏱️</button>`
+      : "";
+
     return `
     <div class="task-card ${esc(t.status)}">
       <div style="display:flex;align-items:flex-start;gap:10px;">
@@ -793,12 +906,23 @@ async function renderTasks() {
           <div class="row-title">${esc(t.title)}</div>
           <div class="row-meta">${taskMetaBadges(t)}</div>
           ${
-            t.checklist_total
-              ? `<div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>`
+            daysPct !== null
+              ? `<div class="progress-bar" title="${t.days_completed}/${t.target_days} days"><div class="progress-fill" style="width:${daysPct}%;background:var(--gym);"></div></div>`
+              : (t.checklist_total
+                ? `<div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>`
+                : "")
+          }
+          ${
+            t.daily_target_minutes > 0 && isGoal
+              ? `<div style="font-size:11.5px;color:var(--muted);margin-top:4px;">Daily study target: <strong style="color:var(--text);">${esc(formatDurationHuman(t.study_seconds_today))}</strong> / ${t.daily_target_minutes}m today</div>`
               : ""
           }
         </div>
-        <div class="row-actions">
+        <div class="row-actions" style="flex-wrap:wrap;justify-content:flex-end;">
+          ${doneTodayBtn}
+          ${studyBtn}
+          ${addTodayChildBtn}
+          ${parentSelectHtml}
           ${
             isWant
               ? `<button class="btn btn-xs btn-ghost" data-move-list="${t.id}" data-target="daily" title="Move to Active Tasks">→ Active</button>`
@@ -838,8 +962,28 @@ async function renderTasks() {
   el.innerHTML = `
     <div class="view-header">
       <div>
-        <h1 class="view-title">✅ Tasks &amp; Want to Do</h1>
-        <p class="view-sub">3-state checklist tasks (Not Started · ◐ Partial · ✓ Completed) — checking sub-steps updates progress automatically</p>
+        <h1 class="view-title">✅ Tasks, Daily Habits &amp; Goals</h1>
+        <p class="view-sub">Today's tasks automatically link to larger goals &amp; daily habits — checking off Today's step updates the parent progress</p>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button id="tasks-auto-link-btn" type="button" class="btn btn-ghost btn-sm" title="Scan Today's tasks and connect them to matching larger goals">
+          🔗 Auto-Link Today's Tasks
+        </button>
+      </div>
+    </div>
+
+    <div class="stat-strip">
+      <div class="stat-card">
+        <span class="stat-label">📌 Today's To-Do</span>
+        <span class="stat-value">${todayDoneCnt} / ${allTodayAll.length} <span style="font-size:13px;color:var(--muted)">done</span></span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">🔁 Daily Goals Done Today</span>
+        <span class="stat-value" style="color:var(--gym)">${recDoneTodayCnt} / ${recGoals.length}</span>
+      </div>
+      <div class="stat-card" id="tasks-study-card" style="cursor:pointer" title="Open Focus Timer (Alt+4)">
+        <span class="stat-label">⏱️ Studied Today</span>
+        <span id="tasks-study-today-val" class="stat-value" style="color:var(--accent-hover)">${esc(formatDurationHuman(stats.today_seconds || 0))} <span style="font-size:13px;color:var(--muted)">(${stats.today_sessions_count || 0} sessions)</span></span>
       </div>
     </div>
 
@@ -854,44 +998,84 @@ async function renderTasks() {
         .join("")}
     </div>
 
-    <div class="grid-2">
+    <div class="tasks-sections-wrap">
       <div class="card">
         <div class="card-header">
-          <h2 class="card-title">Active Tasks <span class="badge badge-accent">${daily.filter((x) => !x.done).length} open</span></h2>
+          <h2 class="card-title">📌 Today's To-Do List <span class="badge badge-accent">${todayTasks.filter((x) => !x.done).length} open</span></h2>
         </div>
-        <form id="form-daily-task" class="inline-form">
-          <input id="daily-title" class="input grow" type="text" placeholder="Task title…" required />
-          <input id="daily-steps" class="input grow" type="text" placeholder="Checklist steps (comma-separated, optional)" />
-          <input id="daily-timeline" class="input" type="text" placeholder="Timeline (e.g. Next 10d)" style="width:145px" />
-          <input id="daily-frequency" class="input" type="text" placeholder="Frequency (e.g. 4x/wk)" style="width:140px" />
-          <select id="daily-priority">
-            <option value="normal">Normal</option>
-            <option value="high">High</option>
-          </select>
-          <input id="daily-due" class="input" type="date" title="Due date" />
-          <button type="submit" class="btn btn-primary btn-sm">Add</button>
+        <form id="form-today-task" class="inline-form">
+          <input id="today-title" class="input grow" type="text" placeholder="Today's task… e.g. LeetCode today (30m) — auto-detects parent goal" required />
+          ${
+            parentCandidates.length
+              ? `<select id="today-parent-select">
+                  <option value="">Auto-detect parent goal</option>
+                  ${parentCandidates.map((p) => `<option value="${p.id}">🔗 ${esc(p.title)}</option>`).join("")}
+                </select>`
+              : ""
+          }
+          <button type="submit" class="btn btn-primary btn-sm">+ Add Today</button>
         </form>
         <div class="item-list">
-          ${daily.length ? daily.map((t) => renderTaskRow(t, false)).join("") : '<div class="empty-state">No matching active tasks.</div>'}
+          ${todayTasks.length ? todayTasks.map((t) => renderTaskRow(t, { isToday: true })).join("") : '<div class="empty-state">No Today tasks yet — add one above, speak via Voice Agent, or click + Today on any goal below.</div>'}
         </div>
       </div>
 
-      <div class="card">
-        <div class="card-header">
-          <h2 class="card-title">Want to Do / Someday <span class="badge">${want.filter((x) => !x.done).length} open</span></h2>
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">🎯 Larger Goals &amp; Daily Habits <span class="badge badge-gym">${goalTasks.filter((x) => !x.done).length} active</span></h2>
+          </div>
+          <form id="form-daily-task" class="inline-form">
+            <input id="daily-title" class="input grow" type="text" placeholder="Goal or daily habit… e.g. LeetCode 1h daily for next 10 days" required />
+            <input id="daily-steps" class="input grow" type="text" placeholder="Steps (comma-separated, optional)" />
+            <input id="daily-timeline" class="input" type="text" placeholder="Timeline (e.g. Next 10 days)" style="width:155px" />
+            <input id="daily-frequency" class="input" type="text" placeholder="Daily target (e.g. 1 hour / day)" style="width:165px" />
+            <label class="check-row" style="font-size:12px;"><input id="daily-recurring-check" type="checkbox" class="checkbox" /> Daily habit</label>
+            <select id="daily-priority">
+              <option value="normal">Normal</option>
+              <option value="high">High</option>
+            </select>
+            <input id="daily-due" class="input" type="date" title="Due date" />
+            <button type="submit" class="btn btn-primary btn-sm">Add Goal</button>
+          </form>
+          <div class="item-list">
+            ${goalTasks.length ? goalTasks.map((t) => renderTaskRow(t, { isGoal: true })).join("") : '<div class="empty-state">No multi-day plans or daily habits yet.</div>'}
+          </div>
         </div>
-        <form id="form-want-task" class="inline-form">
-          <input id="want-title" class="input grow" type="text" placeholder="Thing you want to do…" required />
-          <input id="want-steps" class="input grow" type="text" placeholder="Checklist steps (optional)" />
-          <input id="want-cat" class="input" type="text" placeholder="Tag" style="width:100px" />
-          <button type="submit" class="btn btn-primary btn-sm">Add</button>
-        </form>
-        <div class="item-list">
-          ${want.length ? want.map((t) => renderTaskRow(t, true)).join("") : '<div class="empty-state">No matching someday items.</div>'}
+
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">🌟 Want to Do / Someday <span class="badge">${want.filter((x) => !x.done).length} open</span></h2>
+          </div>
+          <form id="form-want-task" class="inline-form">
+            <input id="want-title" class="input grow" type="text" placeholder="Thing you want to do…" required />
+            <input id="want-steps" class="input grow" type="text" placeholder="Checklist steps (optional)" />
+            <input id="want-cat" class="input" type="text" placeholder="Tag" style="width:100px" />
+            <button type="submit" class="btn btn-primary btn-sm">Add</button>
+          </form>
+          <div class="item-list">
+            ${want.length ? want.map((t) => renderTaskRow(t, { isWant: true })).join("") : '<div class="empty-state">No matching someday items.</div>'}
+          </div>
         </div>
       </div>
     </div>
   `;
+
+  updateTimerDomInPlace();
+
+  el.querySelector("#tasks-study-card")?.addEventListener("click", () => switchView("timer"));
+
+  el.querySelector("#tasks-auto-link-btn")?.addEventListener("click", async () => {
+    const res = await api("/api/tasks/auto-link", { method: "POST" });
+    if (res.count > 0) {
+      toast(`🔗 Linked ${res.count} Today task${res.count === 1 ? "" : "s"} to parent goals!`, "success");
+    } else if (res.ambiguous?.length) {
+      toast(`${res.ambiguous.length} task(s) had multiple or unsure matches — pick a parent in the dropdown or ask Voice Agent.`, "info");
+    } else {
+      toast("All Today tasks are already organized.", "info");
+    }
+    await renderTasks();
+  });
 
   el.querySelectorAll("[data-task-filter]").forEach((btn) => {
     btn.addEventListener("click", async () => {
@@ -900,7 +1084,34 @@ async function renderTasks() {
     });
   });
 
-  el.querySelector("#form-daily-task").addEventListener("submit", async (e) => {
+  el.querySelector("#form-today-task")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const title = el.querySelector("#today-title").value.trim();
+    if (!title) return;
+    const selEl = el.querySelector("#today-parent-select");
+    const pid = selEl && selEl.value ? Number(selEl.value) : null;
+    const today = localTodayStr();
+    const res = await api("/api/tasks", {
+      method: "POST",
+      body: {
+        title,
+        list_type: "daily",
+        start_date: today,
+        due_date: today,
+        timeline: "Today",
+        parent_task_id: pid,
+      },
+    });
+    const created = res.item;
+    if (created?.parent_task_title) {
+      toast(`Linked "${created.title}" under "${created.parent_task_title}"`, "success");
+    } else if (created?.possible_parents?.length) {
+      toast(`Possible parent match: "${created.possible_parents[0].title}" — link via dropdown if related.`, "info");
+    }
+    await renderTasks();
+  });
+
+  el.querySelector("#form-daily-task")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     const title = el.querySelector("#daily-title").value.trim();
     if (!title) return;
@@ -909,6 +1120,7 @@ async function renderTasks() {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
+    const isRec = Boolean(el.querySelector("#daily-recurring-check")?.checked);
     await api("/api/tasks", {
       method: "POST",
       body: {
@@ -918,13 +1130,15 @@ async function renderTasks() {
         due_date: el.querySelector("#daily-due").value || null,
         timeline: el.querySelector("#daily-timeline").value.trim(),
         frequency: el.querySelector("#daily-frequency").value.trim(),
+        is_recurring: isRec ? true : null,
         checklist_items: checklistItems,
+        auto_link_parent: false,
       },
     });
     await renderTasks();
   });
 
-  el.querySelector("#form-want-task").addEventListener("submit", async (e) => {
+  el.querySelector("#form-want-task")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     const title = el.querySelector("#want-title").value.trim();
     if (!title) return;
@@ -945,20 +1159,75 @@ async function renderTasks() {
     await renderTasks();
   });
 
+  el.querySelectorAll("[data-done-today]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const res = await api(`/api/tasks/${btn.dataset.doneToday}/done-today`, { method: "POST", body: {} });
+      const it = res.item;
+      if (it?.done_today) {
+        const sfx = it.target_days ? ` (${it.days_completed}/${it.target_days} days)` : "";
+        toast(`✓ Marked "${it.title}" Done Today!${sfx}`, "success");
+      }
+      await renderTasks();
+    });
+  });
+
+  el.querySelectorAll("[data-link-parent]").forEach((sel) => {
+    sel.addEventListener("change", async () => {
+      const pid = sel.value ? Number(sel.value) : 0;
+      const res = await api(`/api/tasks/${sel.dataset.linkParent}`, {
+        method: "PATCH",
+        body: { parent_task_id: pid },
+      });
+      notifyParentRollup(res.item);
+      await renderTasks();
+    });
+  });
+
+  el.querySelectorAll("[data-study-task]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const taskObj = items.find((x) => Number(x.id) === Number(btn.dataset.studyTask));
+      await startTimerForTask(taskObj);
+    });
+  });
+
+  el.querySelectorAll("[data-add-child]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const parentObj = items.find((x) => Number(x.id) === Number(btn.dataset.addChild));
+      if (!parentObj) return;
+      const today = localTodayStr();
+      await api("/api/tasks", {
+        method: "POST",
+        body: {
+          title: `${parentObj.title} (Today)`,
+          list_type: "daily",
+          category: parentObj.category || "",
+          start_date: today,
+          due_date: today,
+          timeline: "Today",
+          parent_task_id: parentObj.id,
+        },
+      });
+      toast(`Added Today task under "${parentObj.title}"`, "success");
+      await renderTasks();
+    });
+  });
+
   el.querySelectorAll("[data-task-cycle]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const next = nextTaskStatus(btn.dataset.cur);
-      await api(`/api/tasks/${btn.dataset.taskCycle}`, { method: "PATCH", body: { status: next } });
+      const res = await api(`/api/tasks/${btn.dataset.taskCycle}`, { method: "PATCH", body: { status: next } });
+      notifyParentRollup(res.item);
       await renderTasks();
     });
   });
 
   el.querySelectorAll("[data-sub-toggle]").forEach((cb) => {
     cb.addEventListener("change", async () => {
-      await api(`/api/tasks/${cb.dataset.subToggle}/items/${cb.dataset.subId}`, {
+      const res = await api(`/api/tasks/${cb.dataset.subToggle}/items/${cb.dataset.subId}`, {
         method: "PATCH",
         body: { done: cb.checked },
       });
+      notifyParentRollup(res.item);
       await renderTasks();
     });
   });
@@ -2212,6 +2481,27 @@ function updateTimerDomInPlace() {
     ringEl.classList.toggle("paused", live.active && live.paused);
   }
 
+  // Live Today's Study totals across Timer, Hub, and Tasks views
+  const isLiveFocus = live.active && live.phase === "focus";
+  const liveAdd = isLiveFocus ? Math.max(0, live.elapsed || 0) : 0;
+  const totalTodayLive = (state.studyLoggedTodaySeconds || 0) + liveAdd;
+  const liveBadge = isLiveFocus && liveAdd > 0
+    ? ` <span class="badge badge-accent">(+${esc(formatDurationHuman(liveAdd))} live)</span>`
+    : "";
+  const timerTodayVal = document.getElementById("timer-today-focus-val");
+  if (timerTodayVal) {
+    timerTodayVal.innerHTML = `${esc(formatDurationHuman(totalTodayLive))} <span style="font-size:13px;color:var(--muted)">(${state.studyTodaySessionsCount || 0} saved)</span>${liveBadge}`;
+  }
+  const hubStudyVal = document.getElementById("hub-study-today-val");
+  if (hubStudyVal) {
+    const wkHrs = state.dashboard?.study?.week_hours || 0;
+    hubStudyVal.innerHTML = `${esc(formatDurationHuman(totalTodayLive))} <span style="font-size:13px;color:var(--muted)">(${wkHrs}h / 7d)</span>${liveBadge}`;
+  }
+  const tasksStudyVal = document.getElementById("tasks-study-today-val");
+  if (tasksStudyVal) {
+    tasksStudyVal.innerHTML = `${esc(formatDurationHuman(totalTodayLive))} <span style="font-size:13px;color:var(--muted)">(${state.studyTodaySessionsCount || 0} sessions)</span>${liveBadge}`;
+  }
+
   if (
     live.active &&
     !live.paused &&
@@ -2227,6 +2517,10 @@ function updateTimerDomInPlace() {
     })
       .then(async (res) => {
         setTimerState(res.state);
+        if (res.stats) {
+          state.studyLoggedTodaySeconds = Number(res.stats.today_logged_seconds ?? res.stats.today_seconds ?? 0);
+          state.studyTodaySessionsCount = Number(res.stats.today_sessions_count || 0);
+        }
         updateTimerDomInPlace();
         if (res.logged_session) {
           const msg = res.state.active
@@ -2256,6 +2550,10 @@ async function syncTimerState() {
   try {
     const data = await api("/api/timer/state");
     setTimerState(data.state);
+    if (data.stats) {
+      state.studyLoggedTodaySeconds = Number(data.stats.today_logged_seconds ?? data.stats.today_seconds ?? 0);
+      state.studyTodaySessionsCount = Number(data.stats.today_sessions_count || 0);
+    }
     ensureTimerTicker();
     updateTimerDomInPlace();
   } catch {
@@ -2275,6 +2573,8 @@ async function renderTimer() {
 
   const t = timerData.state;
   const stats = timerData.stats || {};
+  state.studyLoggedTodaySeconds = Number(stats.today_logged_seconds ?? stats.today_seconds ?? 0);
+  state.studyTodaySessionsCount = Number(stats.today_sessions_count || 0);
   const sessions = timerData.sessions || [];
   const openTasks = tasksRes.items || [];
   const notes = notesRes.items || [];
@@ -2310,7 +2610,7 @@ async function renderTimer() {
     <div class="stat-strip">
       <div class="stat-card">
         <span class="stat-label">Today's Focus</span>
-        <span class="stat-value" style="color:var(--accent-hover)">${esc(formatDurationHuman(stats.today_seconds || 0))} <span style="font-size:13px;color:var(--muted)">(${stats.today_sessions_count || 0} sessions)</span></span>
+        <span id="timer-today-focus-val" class="stat-value" style="color:var(--accent-hover)">${esc(formatDurationHuman(stats.today_seconds || 0))} <span style="font-size:13px;color:var(--muted)">(${stats.today_sessions_count || 0} sessions)</span></span>
       </div>
       <div class="stat-card">
         <span class="stat-label">Last 7 Days</span>
@@ -2385,10 +2685,10 @@ async function renderTimer() {
                 }
                 ${
                   t.phase === "focus"
-                    ? `<button id="timer-stop-btn" type="button" class="btn btn-gym">⏹ Finish &amp; Save</button>`
+                    ? `<button id="timer-stop-btn" type="button" class="btn btn-gym">✓ Finish &amp; Save to Today</button>`
                     : `<button id="timer-skip-break-btn" type="button" class="btn btn-primary">⏭ Skip Break</button>`
                 }
-                <button id="timer-reset-btn" type="button" class="btn btn-danger btn-sm">↺ Cancel</button>
+                <button id="timer-reset-btn" type="button" class="btn btn-danger btn-sm">Discard</button>
               `
           }
         </div>
@@ -2655,7 +2955,14 @@ async function renderTimer() {
       },
     });
     setTimerState(res.state);
-    toast("Focus timer started!", "success");
+    if (res.stats) {
+      state.studyLoggedTodaySeconds = Number(res.stats.today_logged_seconds ?? res.stats.today_seconds ?? 0);
+      state.studyTodaySessionsCount = Number(res.stats.today_sessions_count || 0);
+    }
+    const prevMsg = res.logged_session
+      ? ` Auto-saved prior ${res.logged_session.duration_minutes}m (${res.logged_session.subject}).`
+      : "";
+    toast(`Focus timer started!${prevMsg}`, "success");
     await renderTimer();
   });
 
@@ -2681,6 +2988,10 @@ async function renderTimer() {
       },
     });
     setTimerState(res.state);
+    if (res.stats) {
+      state.studyLoggedTodaySeconds = Number(res.stats.today_logged_seconds ?? res.stats.today_seconds ?? 0);
+      state.studyTodaySessionsCount = Number(res.stats.today_sessions_count || 0);
+    }
     state.timerDraft.notes = "";
     if (res.logged_session) {
       toast(`Saved ${formatDurationHuman(res.logged_session.duration_seconds)} of ${res.logged_session.subject}!`, "success");
@@ -4629,6 +4940,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           } else {
             await renderCurrentView();
           }
+          await playAgentSpeech(r.reply, Boolean(r.is_question));
         } else if (gv.phase === "error" && gv.message) {
           toast(`Global voice error: ${gv.message}`, "error");
         }
