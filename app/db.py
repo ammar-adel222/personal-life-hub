@@ -16,6 +16,7 @@ from app.config import get_db_path, get_media_dir
 TASK_LIST_TYPES = ("daily", "want_to_do")
 TASK_PRIORITIES = ("normal", "high")
 TASK_STATUSES = ("not_started", "partially_completed", "completed")
+TASK_PROGRESS_MODES = ("auto", "percent", "days", "checklist")
 DEFAULT_NOTE_FOLDERS = ("Lectures", "Projects", "Study", "Personal", "Ideas")
 NOTE_SORTS = ("updated", "created", "title")
 DEFAULT_STUDY_SUBJECTS = ("Study", "Lectures", "Coding", "Projects", "Art", "Reading", "Research")
@@ -55,6 +56,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     is_recurring INTEGER NOT NULL DEFAULT 0,
     target_days INTEGER NOT NULL DEFAULT 0,
     daily_target_minutes INTEGER NOT NULL DEFAULT 0,
+    progress_mode TEXT NOT NULL DEFAULT 'auto',
+    progress_percent INTEGER NOT NULL DEFAULT 0,
+    note_id INTEGER REFERENCES notes(id) ON DELETE SET NULL,
     done INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'not_started'
         CHECK(status IN ('not_started', 'partially_completed', 'completed')),
@@ -78,6 +82,14 @@ CREATE TABLE IF NOT EXISTS task_daily_logs (
     note TEXT NOT NULL DEFAULT '',
     completed_at TEXT NOT NULL,
     UNIQUE(task_id, date)
+);
+
+CREATE TABLE IF NOT EXISTS task_progress_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    progress_percent INTEGER NOT NULL DEFAULT 0,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS notes (
@@ -257,9 +269,17 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN target_days INTEGER NOT NULL DEFAULT 0")
     if "daily_target_minutes" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN daily_target_minutes INTEGER NOT NULL DEFAULT 0")
+    if "progress_mode" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN progress_mode TEXT NOT NULL DEFAULT 'auto'")
+    if "progress_percent" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN progress_percent INTEGER NOT NULL DEFAULT 0")
+    if "note_id" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN note_id INTEGER")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_note ON tasks(note_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_task_daily_logs_task_date ON task_daily_logs(task_id, date DESC);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_task_progress_logs_task ON task_progress_logs(task_id, id DESC);")
 
     note_cols = {r["name"] for r in conn.execute("PRAGMA table_info(notes)").fetchall()}
     if "folder" not in note_cols:
@@ -380,6 +400,76 @@ def _row_to_task_item(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _resolve_effective_progress_mode(
+    stored_mode: str,
+    is_rec: bool,
+    target_days: int,
+    items_count: int,
+    progress_percent: int,
+) -> str:
+    if stored_mode in ("percent", "days", "checklist"):
+        return stored_mode
+    if is_rec or target_days > 1:
+        return "days"
+    if items_count > 0 and progress_percent == 0:
+        return "checklist"
+    return "percent"
+
+
+def _build_day_slots(
+    start_date: str | None,
+    target_days: int,
+    daily_dates: list[str],
+    today: str,
+) -> list[dict[str, Any]]:
+    done_set = set(daily_dates)
+    today_dt = dt_date.fromisoformat(today)
+    if target_days > 1:
+        anchor_dt = today_dt
+        if start_date:
+            try:
+                anchor_dt = dt_date.fromisoformat(start_date[:10])
+            except ValueError:
+                pass
+        if daily_dates:
+            try:
+                earliest = dt_date.fromisoformat(min(daily_dates)[:10])
+                if earliest < anchor_dt:
+                    anchor_dt = earliest
+            except ValueError:
+                pass
+        count = min(int(target_days), 31)
+        slots: list[dict[str, Any]] = []
+        for idx in range(count):
+            d = anchor_dt + timedelta(days=idx)
+            iso = d.isoformat()
+            slots.append(
+                {
+                    "day_num": idx + 1,
+                    "date": iso,
+                    "label": d.strftime("%b %d"),
+                    "done": iso in done_set,
+                    "is_today": iso == today,
+                }
+            )
+        return slots
+
+    slots = []
+    for idx in range(7):
+        d = today_dt - timedelta(days=6 - idx)
+        iso = d.isoformat()
+        slots.append(
+            {
+                "day_num": idx + 1,
+                "date": iso,
+                "label": "Today" if iso == today else d.strftime("%b %d"),
+                "done": iso in done_set,
+                "is_today": iso == today,
+            }
+        )
+    return slots
+
+
 def _row_to_task(
     row: sqlite3.Row,
     checklist_items: list[dict[str, Any]] | None = None,
@@ -401,6 +491,13 @@ def _row_to_task(
     raw_rec = bool(row["is_recurring"]) if "is_recurring" in row_keys else False
     raw_days = int(row["target_days"] or 0) if "target_days" in row_keys else 0
     raw_daily_mins = int(row["daily_target_minutes"] or 0) if "daily_target_minutes" in row_keys else 0
+    raw_mode = (
+        row["progress_mode"]
+        if "progress_mode" in row_keys and row["progress_mode"] in TASK_PROGRESS_MODES
+        else "auto"
+    )
+    raw_pct = max(0, min(100, int(row["progress_percent"] or 0))) if "progress_percent" in row_keys else 0
+    note_id = row["note_id"] if "note_id" in row_keys else None
 
     inf_rec, inf_days, inf_mins = infer_recurrence_fields(
         row["title"],
@@ -412,6 +509,7 @@ def _row_to_task(
     is_rec = raw_rec or inf_rec
     target_days = raw_days if raw_days > 0 else (inf_days if is_rec else 0)
     daily_mins = raw_daily_mins if raw_daily_mins > 0 else (inf_mins if is_rec else 0)
+    effective_mode = _resolve_effective_progress_mode(raw_mode, is_rec, target_days, len(items), raw_pct)
 
     ext = extra or {}
     today = today_str()
@@ -423,12 +521,18 @@ def _row_to_task(
             is_today_task = True
         elif due == today or "today" in tl_low:
             is_today_task = True
-        elif not is_rec and target_days <= 1 and not (due and due > today) and "next " not in tl_low and len(items) < 2:
+        elif not is_rec and target_days <= 1 and not (due and due > today) and "next " not in tl_low and len(items) < 2 and raw_mode != "percent" and raw_pct == 0:
             is_today_task = True
 
     daily_dates = ext.get("daily_dates", [])
     days_completed = len(daily_dates)
     done_today = today in daily_dates
+    day_slots = (
+        _build_day_slots(start_date, target_days, daily_dates, today)
+        if effective_mode == "days"
+        else []
+    )
+    eff_pct = 100 if (status == "completed" and raw_pct == 0) else raw_pct
 
     return {
         "id": row["id"],
@@ -447,6 +551,14 @@ def _row_to_task(
         "is_recurring": is_rec,
         "target_days": target_days,
         "daily_target_minutes": daily_mins,
+        "progress_mode": raw_mode,
+        "effective_progress_mode": effective_mode,
+        "progress_percent": eff_pct,
+        "progress_logs": ext.get("progress_logs", []),
+        "day_slots": day_slots,
+        "note_id": note_id,
+        "note_title": ext.get("note_title", ""),
+        "note_preview": ext.get("note_preview", ""),
         "daily_dates": daily_dates,
         "days_completed": days_completed,
         "done_today": done_today,
@@ -1047,12 +1159,54 @@ def _enrich_tasks_conn(
             study_today_map[pid] = study_today_map.get(pid, 0) + study_today_map.get(chid, 0)
             study_total_map[pid] = study_total_map.get(pid, 0) + study_total_map.get(chid, 0)
 
+    # Progress logs & linked note previews
+    progress_logs_map: dict[int, list[dict[str, Any]]] = {tid: [] for tid in task_ids}
+    try:
+        pl_rows = conn.execute(
+            f"""
+            SELECT id, task_id, progress_percent, note, created_at
+            FROM task_progress_logs
+            WHERE task_id IN ({placeholders})
+            ORDER BY id DESC
+            """,
+            task_ids,
+        ).fetchall()
+        for r in pl_rows:
+            lst = progress_logs_map.setdefault(int(r["task_id"]), [])
+            if len(lst) < 12:
+                lst.append(
+                    {
+                        "id": int(r["id"]),
+                        "progress_percent": int(r["progress_percent"]),
+                        "note": r["note"],
+                        "created_at": r["created_at"],
+                    }
+                )
+    except sqlite3.OperationalError:
+        pass
+
+    note_ids = sorted(
+        {int(r["note_id"]) for r in rows if "note_id" in r.keys() and r["note_id"] is not None}
+    )
+    note_meta_map: dict[int, tuple[str, str]] = {}
+    if note_ids:
+        n_ph = ",".join("?" for _ in note_ids)
+        for nr in conn.execute(
+            f"SELECT id, title, summary, content FROM notes WHERE id IN ({n_ph})", note_ids
+        ).fetchall():
+            raw_prev = (nr["summary"] or nr["content"] or "").strip()
+            clean_prev = re.sub(r"[#*_>`\[\]]+", " ", raw_prev)
+            clean_prev = re.sub(r"\s+", " ", clean_prev).strip()[:140]
+            note_meta_map[int(nr["id"])] = (nr["title"] or "", clean_prev)
+
     out: list[dict[str, Any]] = []
     for r in rows:
         tid = int(r["id"])
         rk = r.keys()
         pid = int(r["parent_task_id"]) if ("parent_task_id" in rk and r["parent_task_id"] is not None) else None
         piid = int(r["parent_item_id"]) if ("parent_item_id" in rk and r["parent_item_id"] is not None) else None
+        nid = int(r["note_id"]) if ("note_id" in rk and r["note_id"] is not None) else None
+        n_title, n_prev = note_meta_map.get(nid, ("", "")) if nid is not None else ("", "")
         d_dates = daily_dates_map.get(tid, [])
         ch_tot, ch_done_t = child_stats.get(tid, (0, 0))
         extra = {
@@ -1060,6 +1214,9 @@ def _enrich_tasks_conn(
             "daily_streak": _calculate_streak(d_dates, today),
             "parent_task_title": parent_titles.get(pid, "") if pid is not None else "",
             "parent_item_text": p_item_texts.get(piid, "") if piid is not None else "",
+            "progress_logs": progress_logs_map.get(tid, []),
+            "note_title": n_title,
+            "note_preview": n_prev,
             "child_count": ch_tot,
             "child_done_today_count": ch_done_t,
             "study_seconds_today": study_today_map.get(tid, 0),
@@ -1173,6 +1330,9 @@ def create_task(
     target_days: int | None = None,
     daily_target_minutes: int | None = None,
     auto_link_parent: bool = True,
+    progress_mode: str | None = None,
+    progress_percent: int | None = None,
+    note_id: int | None = None,
 ) -> dict[str, Any]:
     clean_title = title.strip()
     if not clean_title:
@@ -1180,6 +1340,13 @@ def create_task(
     lt = list_type if list_type in TASK_LIST_TYPES else "daily"
     pr = priority if priority in TASK_PRIORITIES else "normal"
     st = status if status in TASK_STATUSES else "not_started"
+    p_mode = progress_mode if progress_mode in TASK_PROGRESS_MODES else "auto"
+    pct = max(0, min(100, int(progress_percent))) if progress_percent is not None else (100 if st == "completed" else 0)
+    if progress_percent is not None and status == "not_started":
+        if pct >= 100:
+            st = "completed"
+        elif pct > 0:
+            st = "partially_completed"
     done_int = 1 if st == "completed" else 0
     completed_at = now_iso() if st == "completed" else None
     start = start_date.strip() if isinstance(start_date, str) and start_date.strip() else None
@@ -1206,6 +1373,7 @@ def create_task(
     parent_updates: list[dict[str, Any]] = []
 
     with get_conn() as conn:
+        _, resolved_note_id = _validate_fk_ids(conn, None, note_id)
         resolved_pid: int | None = None
         resolved_piid: int | None = None
         if parent_task_id is not None and int(parent_task_id) > 0:
@@ -1220,6 +1388,7 @@ def create_task(
         elif (
             lt == "daily"
             and auto_link_parent
+            and p_mode != "percent"
             and not (eff_rec or eff_days > 1 or (due and due > today) or "next " in tl.lower())
         ):
             match_res = _analyze_parent_candidates_conn(
@@ -1238,9 +1407,10 @@ def create_task(
             INSERT INTO tasks (
                 title, list_type, category, priority, start_date, due_date, timeline, frequency,
                 parent_task_id, parent_item_id, is_recurring, target_days, daily_target_minutes,
+                progress_mode, progress_percent, note_id,
                 done, status, progress_note, created_at, completed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 clean_title,
@@ -1256,6 +1426,9 @@ def create_task(
                 int(eff_rec),
                 eff_days,
                 eff_mins,
+                p_mode,
+                pct,
+                resolved_note_id,
                 done_int,
                 st,
                 progress_note.strip(),
@@ -1264,6 +1437,14 @@ def create_task(
             ),
         )
         task_id = int(cur.lastrowid)
+        if pct > 0 or (progress_note.strip() and p_mode == "percent"):
+            conn.execute(
+                """
+                INSERT INTO task_progress_logs (task_id, progress_percent, note, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (task_id, pct, progress_note.strip(), ts),
+            )
         if checklist_items:
             for pos, text in enumerate(checklist_items):
                 clean_item = str(text).strip()
@@ -1343,7 +1524,25 @@ def update_task(task_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
             if "daily_target_minutes" in patch and patch["daily_target_minutes"] is not None
             else (existing["daily_target_minutes"] if "daily_target_minutes" in ex_keys else 0)
         )
+        progress_mode = (
+            existing["progress_mode"]
+            if "progress_mode" in ex_keys and existing["progress_mode"] in TASK_PROGRESS_MODES
+            else "auto"
+        )
+        if "progress_mode" in patch and patch["progress_mode"] is not None:
+            cand_mode = str(patch["progress_mode"]).strip().lower()
+            if cand_mode not in TASK_PROGRESS_MODES:
+                raise ValueError(f"Unsupported progress_mode: {cand_mode}")
+            progress_mode = cand_mode
 
+        raw_note_id = patch["note_id"] if "note_id" in patch else (
+            existing["note_id"] if "note_id" in ex_keys else None
+        )
+        _, note_id = _validate_fk_ids(conn, None, raw_note_id)
+
+        existing_pct = max(
+            0, min(100, int(existing["progress_percent"] or 0))
+        ) if "progress_percent" in ex_keys else 0
         existing_status = (
             existing["status"]
             if existing["status"] in TASK_STATUSES
@@ -1352,14 +1551,34 @@ def update_task(task_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
         was_done = existing_status == "completed" or bool(existing["done"])
         completed_at = existing["completed_at"]
 
+        has_pct_patch = "progress_percent" in patch and patch["progress_percent"] is not None
+        if has_pct_patch:
+            progress_percent = max(0, min(100, int(patch["progress_percent"])))
+        else:
+            progress_percent = existing_pct
+
         if "status" in patch and patch["status"] in TASK_STATUSES:
             status = patch["status"]
             done = status == "completed"
             completed_at = (existing["completed_at"] or now_iso()) if done else None
+            if not has_pct_patch:
+                if done:
+                    progress_percent = 100
+                elif status == "not_started":
+                    progress_percent = 0
         elif "done" in patch:
             done = bool(patch["done"])
             status = "completed" if done else "not_started"
             completed_at = (existing["completed_at"] or now_iso()) if done else None
+            if not has_pct_patch:
+                progress_percent = 100 if done else 0
+        elif has_pct_patch:
+            if progress_percent >= 100:
+                status, done, completed_at = "completed", True, (existing["completed_at"] or now_iso())
+            elif progress_percent > 0:
+                status, done, completed_at = "partially_completed", False, None
+            else:
+                status, done, completed_at = "not_started", False, None
         else:
             status = existing_status
             done = bool(existing["done"])
@@ -1372,6 +1591,7 @@ def update_task(task_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
                 start_date = ?, due_date = ?, timeline = ?, frequency = ?,
                 parent_task_id = ?, parent_item_id = ?, is_recurring = ?,
                 target_days = ?, daily_target_minutes = ?,
+                progress_mode = ?, progress_percent = ?, note_id = ?,
                 done = ?, status = ?, progress_note = ?, completed_at = ?
             WHERE id = ?
             """,
@@ -1389,6 +1609,9 @@ def update_task(task_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
                 int(is_recurring),
                 max(0, target_days),
                 max(0, daily_target_minutes),
+                progress_mode,
+                progress_percent,
+                note_id,
                 int(done),
                 status,
                 progress_note,
@@ -1665,6 +1888,129 @@ def auto_link_existing_tasks() -> dict[str, Any]:
     return {"linked": linked, "ambiguous": ambiguous, "count": len(linked)}
 
 
+def record_task_progress(
+    task_id: int,
+    progress_percent: int | None = None,
+    delta_percent: int | None = None,
+    note: str = "",
+) -> dict[str, Any] | None:
+    """Record a progress % update & optional improvement note on a non-countable task."""
+    with get_conn() as conn:
+        existing = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not existing:
+            return None
+        rk = existing.keys()
+        cur_pct = max(0, min(100, int(existing["progress_percent"] or 0))) if "progress_percent" in rk else (
+            100 if existing["done"] else 0
+        )
+        if progress_percent is not None:
+            new_pct = max(0, min(100, int(progress_percent)))
+        elif delta_percent is not None:
+            new_pct = max(0, min(100, cur_pct + int(delta_percent)))
+        else:
+            new_pct = cur_pct
+
+        clean_note = (note or "").strip()
+        ts = now_iso()
+        stored_mode = (
+            existing["progress_mode"]
+            if "progress_mode" in rk and existing["progress_mode"] in TASK_PROGRESS_MODES
+            else "auto"
+        )
+        new_mode = "percent" if stored_mode == "auto" else stored_mode
+        was_done = bool(existing["done"])
+
+        if new_pct >= 100:
+            status, done_int, comp_at = "completed", 1, existing["completed_at"] or ts
+        elif new_pct > 0:
+            status, done_int, comp_at = "partially_completed", 0, None
+        else:
+            status, done_int, comp_at = "not_started", 0, None
+
+        conn.execute(
+            """
+            INSERT INTO task_progress_logs (task_id, progress_percent, note, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (task_id, new_pct, clean_note, ts),
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+            SET progress_mode = ?, progress_percent = ?, status = ?, done = ?, completed_at = ?,
+                progress_note = CASE WHEN ? != '' THEN ? ELSE progress_note END
+            WHERE id = ?
+            """,
+            (new_mode, new_pct, status, done_int, comp_at, clean_note, clean_note, task_id),
+        )
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        parent_updates: list[dict[str, Any]] = []
+        if done_int and not was_done:
+            parent_updates = _sync_parent_progress_conn(conn, row, became_done=True)
+        elif was_done and not done_int:
+            parent_updates = _sync_parent_progress_conn(
+                conn,
+                row,
+                became_undone=True,
+                day_date=(existing["completed_at"][:10] if existing["completed_at"] else today_str()),
+            )
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        enriched = _enrich_tasks_conn(conn, [row])[0]
+        if parent_updates:
+            enriched["parent_updates"] = parent_updates
+        return enriched
+
+
+def ensure_task_note(task_id: int) -> dict[str, Any] | None:
+    """Return the linked Markdown note for a task, creating one cleanly if missing."""
+    task = get_task(task_id)
+    if not task:
+        return None
+    if task.get("note_id") is not None:
+        existing_note = get_note(int(task["note_id"]))
+        if existing_note:
+            return {"task": task, "note": existing_note, "created": False}
+
+    hay = f"{task['title']} {task['category']} {task['timeline']}".lower()
+    folder = (
+        "Study"
+        if any(k in hay for k in ("study", "lecture", "leetcode", "course", "read", "paper", "survey"))
+        else "Projects"
+    )
+    meta_bits = [b for b in (task["timeline"], task["frequency"], task["category"]) if b]
+    goal_line = f"- Timeline / Target: {' · '.join(meta_bits)}\n" if meta_bits else ""
+    content = (
+        f"## Goal & Context\n{goal_line}- Task Status: `{task['status']}`\n\n"
+        "## Working Notes\n- \n\n"
+        "## Progress & Follow-Ups\n- \n"
+    )
+    new_note = create_note(
+        title=task["title"],
+        content=content,
+        folder=folder,
+        summary=f"Working notes for task: {task['title']}",
+        tags=_clean_tags(["task", task["category"] or folder.lower()]),
+    )
+    updated_task = update_task(task_id, {"note_id": new_note["id"]}) or task
+    refreshed_note = get_note(new_note["id"]) or new_note
+    return {"task": updated_task, "note": refreshed_note, "created": True}
+
+
+def append_task_note(task_id: int, text: str, heading: str = "") -> dict[str, Any] | None:
+    """Append a note/remark onto the task's linked note (creating the linked note first if needed)."""
+    clean_text = (text or "").strip()
+    if not clean_text:
+        raise ValueError("Note text cannot be empty.")
+    ensured = ensure_task_note(task_id)
+    if not ensured:
+        return None
+    note_id = int(ensured["note"]["id"])
+    updated_note = append_to_note(note_id, text=clean_text, heading=heading) or ensured["note"]
+    refreshed_note = get_note(note_id) or updated_note
+    refreshed_task = get_task(task_id) or ensured["task"]
+    return {"task": refreshed_task, "note": refreshed_note, "created": ensured["created"]}
+
+
 def delete_task(task_id: int) -> bool:
     with get_conn() as conn:
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
@@ -1677,6 +2023,38 @@ def delete_task(task_id: int) -> bool:
 
 def _clean_folder(folder: str | None) -> str:
     return (folder or "").strip()[:60]
+
+
+def _attach_linked_tasks_to_notes_conn(
+    conn: sqlite3.Connection, notes: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    if not notes:
+        return notes
+    note_ids = [int(n["id"]) for n in notes]
+    ph = ",".join("?" for _ in note_ids)
+    by_note: dict[int, list[dict[str, Any]]] = {nid: [] for nid in note_ids}
+    try:
+        t_rows = conn.execute(
+            f"SELECT * FROM tasks WHERE note_id IN ({ph}) ORDER BY done ASC, id DESC",
+            note_ids,
+        ).fetchall()
+        for tr in t_rows:
+            parsed = _row_to_task(tr, [])
+            by_note.setdefault(int(tr["note_id"]), []).append(
+                {
+                    "id": parsed["id"],
+                    "title": parsed["title"],
+                    "status": parsed["status"],
+                    "done": parsed["done"],
+                    "list_type": parsed["list_type"],
+                    "is_today_task": parsed["is_today_task"],
+                }
+            )
+    except sqlite3.OperationalError:
+        pass
+    for n in notes:
+        n["linked_tasks"] = by_note.get(int(n["id"]), [])
+    return notes
 
 
 def list_notes(
@@ -1696,7 +2074,7 @@ def list_notes(
 
     with get_conn() as conn:
         rows = conn.execute(f"SELECT * FROM notes {order_sql}").fetchall()
-    notes = [_row_to_note(r) for r in rows]
+        notes = _attach_linked_tasks_to_notes_conn(conn, [_row_to_note(r) for r in rows])
 
     if pinned_only:
         notes = [n for n in notes if n["pinned"]]
@@ -1792,7 +2170,9 @@ def list_note_tags() -> list[dict[str, Any]]:
 def get_note(note_id: int) -> dict[str, Any] | None:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
-        return _row_to_note(row) if row else None
+        if not row:
+            return None
+        return _attach_linked_tasks_to_notes_conn(conn, [_row_to_note(row)])[0]
 
 
 def get_note_by_source_path(source_path: str) -> dict[str, Any] | None:
@@ -1988,6 +2368,10 @@ def toggle_note_checklist_line(
 
 def delete_note(note_id: int) -> bool:
     with get_conn() as conn:
+        try:
+            conn.execute("UPDATE tasks SET note_id = NULL WHERE note_id = ?", (note_id,))
+        except sqlite3.OperationalError:
+            pass
         cur = conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
         return cur.rowcount > 0
 
@@ -2889,10 +3273,17 @@ def export_all_data() -> dict[str, Any]:
                 "SELECT id, task_id, date, note, completed_at FROM task_daily_logs ORDER BY date DESC, id DESC"
             ).fetchall()
         ]
+        pl_rows = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT id, task_id, progress_percent, note, created_at FROM task_progress_logs ORDER BY id DESC"
+            ).fetchall()
+        ]
     return {
         "exported_at": now_iso(),
         "tasks": list_tasks(include_done=True),
         "task_daily_logs": dl_rows,
+        "task_progress_logs": pl_rows,
         "notes": list_notes(),
         "gym_activity": get_activity_summary("gym"),
         "art_activity": get_activity_summary("art"),

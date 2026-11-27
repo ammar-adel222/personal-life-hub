@@ -66,6 +66,9 @@ class TaskCreate(BaseModel):
     is_recurring: bool | None = None
     target_days: int | None = None
     daily_target_minutes: int | None = None
+    progress_mode: str | None = None
+    progress_percent: int | None = None
+    note_id: int | None = None
     auto_link_parent: bool = True
 
 
@@ -83,6 +86,9 @@ class TaskUpdate(BaseModel):
     is_recurring: bool | None = None
     target_days: int | None = None
     daily_target_minutes: int | None = None
+    progress_mode: str | None = None
+    progress_percent: int | None = None
+    note_id: int | None = None
     done: bool | None = None
     status: str | None = None
     progress_note: str | None = None
@@ -92,6 +98,17 @@ class TaskDoneTodayPayload(BaseModel):
     done: bool | None = None
     date: str | None = None
     note: str = ""
+
+
+class TaskProgressLogPayload(BaseModel):
+    progress_percent: int | None = None
+    delta_percent: int | None = None
+    note: str = ""
+
+
+class TaskNoteAppendPayload(BaseModel):
+    text: str
+    heading: str = ""
 
 
 class TaskItemCreate(BaseModel):
@@ -419,6 +436,9 @@ def post_task(payload: TaskCreate) -> dict[str, Any]:
             is_recurring=payload.is_recurring,
             target_days=payload.target_days,
             daily_target_minutes=payload.daily_target_minutes,
+            progress_mode=payload.progress_mode,
+            progress_percent=payload.progress_percent,
+            note_id=payload.note_id,
             auto_link_parent=payload.auto_link_parent,
         )
         return {"item": item}
@@ -445,6 +465,44 @@ def post_task_done_today(task_id: int, payload: TaskDoneTodayPayload | None = No
     if not item:
         raise HTTPException(status_code=404, detail="Task not found.")
     return {"item": item}
+
+
+@app.post("/api/tasks/{task_id}/progress")
+def post_task_progress(task_id: int, payload: TaskProgressLogPayload) -> dict[str, Any]:
+    try:
+        item = db.record_task_progress(
+            task_id,
+            progress_percent=payload.progress_percent,
+            delta_percent=payload.delta_percent,
+            note=payload.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not item:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    return {"item": item}
+
+
+@app.post("/api/tasks/{task_id}/open-note")
+def post_task_open_note(task_id: int) -> dict[str, Any]:
+    res = db.ensure_task_note(task_id)
+    if not res:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    if res.get("created"):
+        cloud_sync.maybe_auto_sync_cloud_folder()
+    return res
+
+
+@app.post("/api/tasks/{task_id}/notes")
+def post_task_note_append(task_id: int, payload: TaskNoteAppendPayload) -> dict[str, Any]:
+    try:
+        res = db.append_task_note(task_id, text=payload.text, heading=payload.heading)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not res:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    cloud_sync.maybe_auto_sync_cloud_folder()
+    return res
 
 
 @app.patch("/api/tasks/{task_id}")

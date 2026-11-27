@@ -89,6 +89,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "integer",
                         "description": "Daily target minutes if recurring daily (e.g. 60 for '1 hour a day').",
                     },
+                    "progress_mode": {
+                        "type": "string",
+                        "enum": ["auto", "percent", "days", "checklist"],
+                        "description": "Use 'days' for daily countable habits, 'percent' for non-countable progress bars, 'checklist' for explicit steps.",
+                    },
+                    "progress_percent": {"type": "integer"},
                     "auto_link_parent": {"type": "boolean"},
                     "status": {
                         "type": "string",
@@ -126,6 +132,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                                 "is_recurring": {"type": "boolean"},
                                 "target_days": {"type": "integer"},
                                 "daily_target_minutes": {"type": "integer"},
+                                "progress_mode": {"type": "string", "enum": ["auto", "percent", "days", "checklist"]},
+                                "progress_percent": {"type": "integer"},
                                 "auto_link_parent": {"type": "boolean"},
                                 "progress_note": {"type": "string"},
                             },
@@ -141,7 +149,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "update_task",
-            "description": "Update an existing task's status, parent goal link, recurring target, or mark a daily recurring goal done today.",
+            "description": "Update task status, progress bar percentage/updates, connected task notes, parent link, or mark a daily recurring goal done today.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -154,6 +162,19 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "mark_done_today": {
                         "type": "boolean",
                         "description": "Set true to log today's completion on a daily recurring goal (instead of closing all future days).",
+                    },
+                    "progress_mode": {"type": "string", "enum": ["auto", "percent", "days", "checklist"]},
+                    "progress_percent": {
+                        "type": "integer",
+                        "description": "Overall completion percentage (0..100) for non-countable progress-bar tasks.",
+                    },
+                    "progress_update": {
+                        "type": "string",
+                        "description": "Log an improvement/progress entry on a progress-bar task (persisted to progress history).",
+                    },
+                    "task_note": {
+                        "type": "string",
+                        "description": "Append a note directly into this task's connected Markdown note.",
                     },
                     "list_type": {"type": "string", "enum": ["daily", "want_to_do"]},
                     "priority": {"type": "string", "enum": ["normal", "high"]},
@@ -283,18 +304,19 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "append_to_note",
-            "description": "Append structured text (optionally under a new ## heading), checklist items to research later, folder, or tags to an existing note.",
+            "description": "Append structured text (optionally under a new ## heading), checklist items, folder, or tags to an existing note or a task's connected note (pass note_id or task_id).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "note_id": {"type": "integer"},
+                    "task_id": {"type": "integer", "description": "Optional task_id to append directly to that task's connected note."},
                     "heading": {"type": "string", "description": "Optional Markdown section heading above the appended block."},
                     "text": {"type": "string"},
                     "checklist_items": {"type": "array", "items": {"type": "string"}},
                     "add_tags": {"type": "array", "items": {"type": "string"}},
                     "folder": {"type": "string"},
                 },
-                "required": ["note_id"],
+                "required": [],
             },
         },
     },
@@ -657,6 +679,8 @@ def _create_single_task_from_args(args: dict[str, Any]) -> tuple[dict[str, Any],
         is_recurring=_coerce_bool(args.get("is_recurring"), False) if args.get("is_recurring") is not None else None,
         target_days=_coerce_int(args.get("target_days")),
         daily_target_minutes=_coerce_int(args.get("daily_target_minutes")),
+        progress_mode=str(args.get("progress_mode") or "auto").strip().lower(),
+        progress_percent=_coerce_int(args.get("progress_percent")),
         auto_link_parent=_coerce_bool(args.get("auto_link_parent"), True),
     )
     meta_parts: list[str] = []
@@ -799,15 +823,31 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
                     if item["target_days"]
                     else f"{item['days_completed']}d"
                 )
-                badge = {
-                    "tool": name,
-                    "domain": "task",
-                    "item_id": item["id"],
-                    "label": f"{'Done Today' if item['done_today'] else 'Unmarked Today'}: {item['title']} ({days_sfx})",
-                }
+                badges = [
+                    {
+                        "tool": name,
+                        "domain": "task",
+                        "item_id": item["id"],
+                        "label": f"{'Done Today' if item['done_today'] else 'Unmarked Today'}: {item['title']} ({days_sfx})",
+                    }
+                ]
+                task_note_txt = str(args.get("task_note") or "").strip()
+                if task_note_txt:
+                    nr = db.append_task_note(task_id, text=task_note_txt)
+                    if nr and nr.get("note"):
+                        item = nr["task"]
+                        badges.append(
+                            {
+                                "tool": name,
+                                "domain": "note",
+                                "item_id": nr["note"]["id"],
+                                "label": f"Task Note: {nr['note']['title']}",
+                            }
+                        )
                 return {
                     "result": {"task": item},
-                    "action_badge": badge,
+                    "action_badge": badges[0],
+                    "action_badges": badges,
                     "navigate_to": None,
                 }
             patch: dict[str, Any] = {}
@@ -837,19 +877,64 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
                 patch["target_days"] = _coerce_int(args["target_days"], 0) or 0
             if "daily_target_minutes" in args and args["daily_target_minutes"] is not None:
                 patch["daily_target_minutes"] = _coerce_int(args["daily_target_minutes"], 0) or 0
+            if "progress_mode" in args and args["progress_mode"] is not None:
+                patch["progress_mode"] = str(args["progress_mode"]).strip().lower()
 
-            item = db.update_task(task_id, patch)
+            has_prog_log = bool(str(args.get("progress_update") or "").strip()) or (
+                args.get("progress_percent") is not None and "status" not in patch
+            )
+            if not has_prog_log and args.get("progress_percent") is not None:
+                patch["progress_percent"] = _coerce_int(args["progress_percent"], 0) or 0
+
+            item = db.get_task(task_id)
             if not item:
                 return {"result": {"error": f"Task #{task_id} not found."}, "action_badge": None, "navigate_to": None}
+            all_parent_updates: list[dict[str, Any]] = []
+            if patch:
+                item = db.update_task(task_id, patch) or item
+                all_parent_updates.extend(item.get("parent_updates") or [])
+            if has_prog_log:
+                pct_val = _coerce_int(args.get("progress_percent")) if args.get("progress_percent") is not None else None
+                item = db.record_task_progress(
+                    task_id,
+                    progress_percent=pct_val,
+                    note=str(args.get("progress_update") or ""),
+                ) or item
+                all_parent_updates.extend(item.get("parent_updates") or [])
+
+            prog_sfx = (
+                f" · {item['progress_percent']}%"
+                if item.get("effective_progress_mode") == "percent"
+                else ""
+            )
             main_badge = {
                 "tool": name,
                 "domain": "task",
                 "item_id": item["id"],
-                "label": f"Task ({item['status'].replace('_', ' ')}): {item['title']}",
+                "label": f"Task ({item['status'].replace('_', ' ')}{prog_sfx}): {item['title']}",
             }
-            badges = [main_badge, *_parent_update_badges(item.get("parent_updates"))]
+            badges = [main_badge, *_parent_update_badges(all_parent_updates)]
+
+            task_note_txt = str(args.get("task_note") or "").strip()
+            linked_note = None
+            if task_note_txt:
+                nr = db.append_task_note(task_id, text=task_note_txt)
+                if nr and nr.get("note"):
+                    item = nr["task"]
+                    linked_note = nr["note"]
+                    badges.append(
+                        {
+                            "tool": name,
+                            "domain": "note",
+                            "item_id": linked_note["id"],
+                            "label": f"Task Note: {linked_note['title']}",
+                        }
+                    )
+            res_obj: dict[str, Any] = {"task": item}
+            if linked_note:
+                res_obj["note"] = linked_note
             return {
-                "result": {"task": item},
+                "result": res_obj,
                 "action_badge": main_badge,
                 "action_badges": badges,
                 "navigate_to": None,
@@ -983,8 +1068,28 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
 
         if name == "append_to_note":
             note_id = _coerce_int(args.get("note_id"))
+            task_id = _coerce_int(args.get("task_id"))
+            if note_id is None and task_id is not None:
+                res = db.append_task_note(
+                    task_id,
+                    text=str(args.get("text") or ""),
+                    heading=str(args.get("heading") or ""),
+                )
+                if not res:
+                    return {"result": {"error": f"Task #{task_id} not found."}, "action_badge": None, "navigate_to": None}
+                note = _sync_note_if_needed(res["note"])
+                return {
+                    "result": {"note": note, "task": res["task"]},
+                    "action_badge": {
+                        "tool": name,
+                        "domain": "note",
+                        "item_id": note["id"],
+                        "label": f"Task Note: {note['title']}",
+                    },
+                    "navigate_to": None,
+                }
             if note_id is None:
-                return {"result": {"error": "note_id is required."}, "action_badge": None, "navigate_to": None}
+                return {"result": {"error": "note_id or task_id is required."}, "action_badge": None, "navigate_to": None}
             folder_arg = str(args.get("folder") or "").strip() or None
             note = db.append_to_note(
                 note_id=note_id,
