@@ -269,6 +269,46 @@ async function playAgentSpeech(text, isQuestion = false, forceSpeak = false) {
   }
 }
 
+function formatHotkeyTooltip(hotkey) {
+  const parts = String(hotkey || "")
+    .split("+")
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (!parts.length) return "Disabled";
+  return parts
+    .map((p) =>
+      p.length === 1 || /^f\d{1,2}$/i.test(p)
+        ? p.toUpperCase()
+        : p[0].toUpperCase() + p.slice(1).toLowerCase()
+    )
+    .join("+");
+}
+
+function syncVoiceBtnWithGlobalState(gv) {
+  const btn = document.getElementById("voice-btn");
+  const label = document.getElementById("voice-btn-label");
+  const timer = document.getElementById("voice-timer");
+  if (!btn || !label || !timer || !gv) return;
+
+  const hkLabel = formatHotkeyTooltip(gv.hotkey);
+  btn.title = gv.hotkey
+    ? `Global Voice Capture (${hkLabel} anywhere · Alt+V in-app)`
+    : "Voice Capture (Alt+V or Ctrl+Space in-app)";
+
+  if (state.recording || state.voiceBusy) return;
+
+  if (gv.phase === "recording") {
+    btn.classList.add("recording");
+    label.textContent = "Global Rec…";
+    timer.classList.remove("hidden");
+    timer.textContent = `${Number(gv.elapsed_seconds || 0).toFixed(1)}s`;
+  } else {
+    btn.classList.remove("recording");
+    label.textContent = gv.phase === "processing" ? "Transcribing…" : "🎙️ Speak";
+    timer.classList.add("hidden");
+  }
+}
+
 function setRecordingUI(active, elapsed = 0, speechDetected = false) {
   state.recording = active;
   const btn = document.getElementById("voice-btn");
@@ -4577,6 +4617,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const pollGlobalVoiceOnce = async () => {
     try {
       const gv = await api("/api/voice/global-state");
+      syncVoiceBtnWithGlobalState(gv);
       if (gv.event_seq > state.lastGlobalVoiceSeq) {
         state.lastGlobalVoiceSeq = gv.event_seq;
         if (gv.phase === "done" && gv.last_result) {
@@ -4600,6 +4641,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   try {
     const initGv = await api("/api/voice/global-state");
     state.lastGlobalVoiceSeq = Number(initGv.event_seq || 0);
+    syncVoiceBtnWithGlobalState(initGv);
+    if (initGv.hotkey && !initGv.hotkey_registered && initGv.hotkey_error) {
+      toast(
+        `Global hotkey (${initGv.hotkey}) unavailable: ${initGv.hotkey_error} — check Settings (Alt+0)`,
+        "error"
+      );
+    }
   } catch {
     // ignore
   }

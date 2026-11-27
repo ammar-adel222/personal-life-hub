@@ -1426,6 +1426,12 @@ def system_open_data_dir() -> dict[str, Any]:
     return {"opened": True, "path": str(data_dir)}
 
 
+@app.post("/api/system/focus")
+def system_focus_window() -> dict[str, Any]:
+    desktop_host.host.show_main_window()
+    return {"focused": True}
+
+
 @app.get("/api/system/export")
 def system_export() -> JSONResponse:
     db.init_db()

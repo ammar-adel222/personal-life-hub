@@ -322,6 +322,10 @@ class DesktopHost:
             except Exception:
                 pass
 
+    def show_main_window(self) -> None:
+        """Bring the desktop WebView2 window back from tray or minimized state."""
+        self._trigger_window_show()
+
     def _request_pill_refresh(self, auto_hide_ms: int = 0) -> None:
         if sys.platform == "win32" and self._hwnd:
             try:
@@ -590,11 +594,18 @@ class DesktopHost:
                 return
             try:
                 mods, vk = parse_hotkey(hk)
-                ok = user32.RegisterHotKey(hwnd, HOTKEY_ID, mods | MOD_NOREPEAT, vk)
+                ok = 0
+                err = 0
+                for attempt in range(3):
+                    ok = user32.RegisterHotKey(hwnd, HOTKEY_ID, mods | MOD_NOREPEAT, vk)
+                    if ok:
+                        break
+                    err = kernel32.GetLastError()
+                    if attempt < 2:
+                        time.sleep(0.25)
                 if ok:
                     _set_global_state(hotkey=hk, hotkey_registered=True, hotkey_error="")
                 else:
-                    err = kernel32.GetLastError()
                     _set_global_state(
                         hotkey=hk,
                         hotkey_registered=False,
@@ -678,9 +689,11 @@ class DesktopHost:
                     # Status indicator dot
                     dot_brush = gdi32.CreateSolidBrush(accent)
                     dot_pen = gdi32.CreatePen(PS_SOLID, 1, accent)
-                    gdi32.SelectObject(hdc, dot_brush)
-                    gdi32.SelectObject(hdc, dot_pen)
+                    old_dot_brush = gdi32.SelectObject(hdc, dot_brush)
+                    old_dot_pen = gdi32.SelectObject(hdc, dot_pen)
                     gdi32.Ellipse(hdc, 14, 15, 24, 25)
+                    gdi32.SelectObject(hdc, old_dot_brush)
+                    gdi32.SelectObject(hdc, old_dot_pen)
                     gdi32.DeleteObject(dot_brush)
                     gdi32.DeleteObject(dot_pen)
 

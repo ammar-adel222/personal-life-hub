@@ -95,6 +95,11 @@ def get_tray_icon_path() -> Path:
     return get_data_dir() / "tray.ico"
 
 
+def get_runtime_info_path() -> Path:
+    """Return private path storing the active desktop PID/port for single-instance focus."""
+    return get_data_dir() / "runtime.json"
+
+
 def _normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     merged = dict(DEFAULT_SETTINGS)
     if raw:

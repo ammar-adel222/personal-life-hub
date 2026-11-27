@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import shutil
 import socket
@@ -71,6 +72,24 @@ def _show_error_popup(message: str) -> None:
         pass
 
 
+def _try_focus_via_runtime_file() -> bool:
+    """Wake an already-running local instance via runtime.json if Win32 FindWindowW could not see it."""
+    try:
+        from app.config import get_runtime_info_path
+
+        rt_path = get_runtime_info_path()
+        if not rt_path.exists():
+            return False
+        data = json.loads(rt_path.read_text(encoding="utf-8"))
+        port = int(data.get("port") or 0)
+        if port <= 0:
+            return False
+        resp = httpx.post(f"http://127.0.0.1:{port}/api/system/focus", timeout=0.6)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
 def main() -> int:
     smoke_mode = "--smoke-test" in sys.argv
     temp_smoke_dir: str | None = None
@@ -81,9 +100,11 @@ def main() -> int:
     log_handle, orig_out, orig_err = _ensure_std_streams()
     try:
         from app import desktop_host, dialogs
-        if not smoke_mode and desktop_host.focus_existing_instance():
+        if not smoke_mode and (
+            desktop_host.focus_existing_instance() or _try_focus_via_runtime_file()
+        ):
             return 0
-        from app.config import load_settings
+        from app.config import get_runtime_info_path, load_settings
         from app.server import app
 
         port = _find_free_port()
@@ -112,6 +133,12 @@ def main() -> int:
             thread.join(timeout=3.0)
             print("SMOKE_TEST_OK")
             return 0
+
+        rt_path = get_runtime_info_path()
+        try:
+            rt_path.write_text(json.dumps({"pid": os.getpid(), "port": port}), encoding="utf-8")
+        except Exception:
+            pass
 
         window = webview.create_window(
             "Personal Life Hub",
@@ -147,6 +174,13 @@ def main() -> int:
             desktop_host.host.stop()
             server.should_exit = True
             thread.join(timeout=3.0)
+            try:
+                if rt_path.exists():
+                    rt_data = json.loads(rt_path.read_text(encoding="utf-8"))
+                    if int(rt_data.get("pid") or 0) == os.getpid():
+                        rt_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         return 0
     except Exception as exc:
         if smoke_mode:

@@ -10,7 +10,12 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app import agent, ai, cloud_sync, db, desktop_host, tools, watchlist
-from app.config import get_gdrive_credentials_path, get_gdrive_token_path, load_settings
+from app.config import (
+    get_gdrive_credentials_path,
+    get_gdrive_token_path,
+    get_runtime_info_path,
+    load_settings,
+)
 from app.server import app
 
 
@@ -152,6 +157,11 @@ def test_hotkey_parsing_settings_and_global_state(monkeypatch, tmp_path):
         assert pub["floating_indicator"] is False
         assert pub["sound_feedback"] is False
         assert pub["gdrive_folder_name"] == "MyHub"
+
+        focus_resp = client.post("/api/system/focus")
+        assert focus_resp.status_code == 200
+        assert focus_resp.json() == {"focused": True}
+        assert get_runtime_info_path() == tmp_path / "runtime.json"
 
 
 def test_watchlist_crud_rollup_metadata_ssrf_and_note_link(monkeypatch, tmp_path):
