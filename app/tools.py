@@ -510,7 +510,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "upsert_watchlist_item",
-            "description": "Save or update a playlist, video, course, podcast, or article URL/title in the Watchlist (including episode progress).",
+            "description": (
+                "Save or update a playlist, video, course, podcast, or article URL/title in the Watchlist tab. "
+                "ONLY call when the user explicitly asks to add, save, or update an item in their Watchlist / Playlists tab "
+                "(or provides a link to save). NEVER call merely because the user says they will watch or want to watch a lecture, video, course, or show — create a task instead."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -588,6 +592,38 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
 ]
+
+
+def _enable_nullable_optional_params(schemas: list[dict[str, Any]]) -> None:
+    """Allow JSON null on optional non-enum parameters so strict validators (e.g. gpt-oss-20b) never fail with 400."""
+
+    def _patch_object(obj: dict[str, Any]) -> None:
+        props = obj.get("properties")
+        if not isinstance(props, dict):
+            return
+        req = set(obj.get("required") or [])
+        for pname, pdef in props.items():
+            if not isinstance(pdef, dict):
+                continue
+            if (
+                pdef.get("type") == "array"
+                and isinstance(pdef.get("items"), dict)
+                and pdef["items"].get("type") == "object"
+            ):
+                _patch_object(pdef["items"])
+            elif pdef.get("type") == "object":
+                _patch_object(pdef)
+            if pname not in req and isinstance(pdef.get("type"), str) and "enum" not in pdef:
+                pdef["type"] = [pdef["type"], "null"]
+
+    for entry in schemas:
+        fn = entry.get("function") or {}
+        params = fn.get("parameters")
+        if isinstance(params, dict):
+            _patch_object(params)
+
+
+_enable_nullable_optional_params(TOOL_SCHEMAS)
 
 
 def _coerce_int(val: Any, default: int | None = None) -> int | None:

@@ -15,8 +15,8 @@ from typing import Any
 APP_NAME = "PersonalLifeHub"
 ALLOWED_GROQ_MODELS = (
     "openai/gpt-oss-120b",
-    "qwen/qwen3.8-27b",
     "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
 )
 ALLOWED_TTS_MODES = ("questions_only", "all", "off")
 ALLOWED_TTS_PROVIDERS = ("groq", "local", "google")

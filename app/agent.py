@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from app import ai, db, tools
+from app import ai, db, tools, watchlist
 from app.config import ALLOWED_GROQ_MODELS, load_settings
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
@@ -80,7 +80,7 @@ async def _call_groq_agent_step(
                 for live_model in await ai.discover_live_chat_models(client, api_key):
                     if live_model not in tried and live_model not in candidates:
                         candidates.append(live_model)
-            if resp.status_code in (400, 404, 429, 500, 502, 503) and idx < len(candidates):
+            if resp.status_code in (400, 404, 413, 429, 500, 502, 503) and idx < len(candidates):
                 continue
             raise ai.AIError(last_error)
 
@@ -125,12 +125,18 @@ def _offline_agent_fallback(
             )
 
     # Only save as a lecture note if the user isn't explicitly asking for a task list / timeline
-    is_task_plan = any(
-        kw in lower
-        for kw in ("task list", "make a task", "create a task", "next 10 days", "for the next")
+    is_task_plan = bool(
+        re.search(
+            r"\b(?:today'?s?\s+tasks?|for\s+today|task\s+list|make\s+(?:a|the)\s+tasks?|create\s+(?:a|the)\s+tasks?|add\s+(?:a\s+|the\s+)?tasks?|tasks?\s+for\b|for\s+the\s+next\s+\d*\s*(?:days?|weeks?))\b",
+            lower,
+        )
+        or "next 10 days" in lower
     )
     if not is_task_plan and (
-        "note:" in lower or "tags:" in lower or ("lecture" in lower and "watch" not in lower)
+        "note:" in lower
+        or "tags:" in lower
+        or re.search(r"\bnotes?\s+(?:for|about|on)\b", lower)
+        or ("lecture" in lower and "watch" not in lower)
     ):
         tags_match = re.search(
             r"tags?\s*[:\-]?\s*([a-zA-Z0-9,\s_-]+)$", text, flags=re.IGNORECASE
@@ -208,15 +214,54 @@ def _offline_agent_fallback(
             actions_taken.append(res["action_badge"])
         return (f"Logged {mins:g} minutes of study (offline mode).", actions_taken, None)
 
-    url_m = re.search(r"https?://[^\s]+", text)
-    if url_m or lower.startswith("watchlist:") or "save playlist" in lower or "to watch" in lower:
+    if watchlist.has_explicit_watchlist_intent(text):
+        url_m = re.search(r"https?://[^\s]+", text)
         clean_url = url_m.group(0).rstrip(".,);") if url_m else ""
-        title_part = re.sub(r"^(?:watchlist\s*:|save\s+playlist\s*:?)", "", text, flags=re.IGNORECASE).strip()
+        title_part = re.sub(
+            r"^(?:(?:please\s+)?(?:add|save|put)\s+(?:this\s+)?(?:to|in|into|on)\s+(?:my\s+)?(?:watchlist|watch\s+list|playlist\s+tab|playlists?)\s*:?|(?:watchlist|playlist)\s*:|save\s+playlist\s*:?)",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
         if clean_url:
             title_part = title_part.replace(clean_url, "").strip(" -—:")
         res = tools.execute_tool(
             "upsert_watchlist_item",
             {"title": title_part or clean_url, "url": clean_url},
+        )
+        if res["action_badge"]:
+            actions_taken.append(res["action_badge"])
+            return (f"{res['action_badge']['label']} (offline mode).", actions_taken, None)
+
+    if is_task_plan:
+        tl_m = re.search(r"\b(?:for\s+the\s+)?(next\s+\d+\s+(?:days?|weeks?)|today|tonight|this\s+week)\b", lower)
+        timeline_val = tl_m.group(1).title() if tl_m else ("Today" if "today" in lower else "")
+        days_m = re.search(r"next\s+(\d+)\s+days?", lower)
+        target_days = int(days_m.group(1)) if days_m else 0
+        is_rec = bool(re.search(r"\b(daily|every\s+day)\b", lower))
+        due_val = db.today_str() if ("today" in lower or "tonight" in lower) and not days_m else None
+        clean_title = re.sub(
+            r"^(?:okay|so|well|for\s+(?:the\s+)?next\s+\d+\s+(?:days?|weeks?)|for\s+today'?s?\s+tasks?|today'?s?\s+tasks?)\s*[,:-]*\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+        clean_title = re.sub(
+            r"^(?:i\s+(?:want\s+to|need\s+to|should)\s+)?(?:make|create|add)\s+(?:a\s+|the\s+)?tasks?\s*(?:to|for)?\s*",
+            "",
+            clean_title,
+            flags=re.IGNORECASE,
+        ).strip() or text[:80]
+        res = tools.execute_tool(
+            "create_task",
+            {
+                "title": clean_title[:120],
+                "list_type": "daily",
+                "due_date": due_val,
+                "timeline": timeline_val,
+                "is_recurring": is_rec,
+                "target_days": target_days,
+            },
         )
         if res["action_badge"]:
             actions_taken.append(res["action_badge"])
@@ -313,7 +358,10 @@ async def run_agent_turn(
         "pick an appropriate `folder` (`Lectures`, `Projects`, `Study`, `Personal`, `Ideas`), and include relevant `tags`. "
         "When the user asks to organize or clean up an existing note, fetch it with `get_note` or `search_notes` and update it via `update_note`.\n"
         "5. **Focus / Study Timer & Daily Study Counting**: Every focus timer (countdown or stopwatch) counts automatically toward today's studying time (and starting a new timer auto-saves any prior running focus timer). When the user starts a timer or logs study time, look up any matching active task via `list_tasks` and link `task_id` (passing `open_timer_view=true` when starting a live timer; defaulting to 25m countdown / 5m break unless specified). Reaching a daily habit's target minutes marks it Done Today automatically.\n"
-        "6. **Watchlist & Playlists**: When the user asks to save, update progress on, or check playlists/videos/courses/podcasts/articles, call `upsert_watchlist_item` or `list_watchlist`.\n"
+        "6. **Watchlist & Playlists (STRICT OPT-IN)**: **NEVER** call `upsert_watchlist_item` just because the user says they will watch, want to watch, or plan to watch a lecture, video, course, movie, or show. "
+        "**ONLY** call `upsert_watchlist_item` when the user **explicitly asks** to add, save, put, or update something in their **Watchlist / Playlists** tab (or pastes a URL to save). "
+        "If they mention watching lectures/videos/courses as part of today's plan or a multi-day goal, create a Task (`create_task` / `create_tasks_batch`) instead; if ambiguous, ask briefly before adding to Playlists/Watchlist. "
+        "Omit optional tool parameters instead of passing null unless needed.\n"
         "7. **Update hobby trackers too**: If the user mentions games (e.g. Elden Ring) or art projects, ALSO call `upsert_game` / `upsert_art` alongside creating any sprint tasks.\n"
         "8. **Check existing records first**: When updating/checking off an existing task or lecture note without its ID in recent history, call `list_tasks` or `search_notes` first.\n"
         "9. **Delete safety**: Never delete without explicit confirmation (`confirmed=false` first).\n"
@@ -321,9 +369,11 @@ async def run_agent_turn(
     )
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
-    for msg in prior_messages[-12:]:
-        content = msg["content"]
-        if msg["role"] == "assistant" and msg.get("actions"):
+    for msg in prior_messages[-8:]:
+        content = str(msg["content"] or "")
+        if len(content) > 450:
+            content = content[:450] + "…"
+        if msg["role"] == "assistant" and msg.get("actions") and "(offline mode" not in content:
             act_notes = "; ".join(
                 f"{a.get('domain', '')} #{a.get('item_id')}: {a.get('label', '')}"
                 if a.get("item_id") is not None
@@ -364,7 +414,24 @@ async def run_agent_turn(
                         fn = tc.get("function") or {}
                         fn_name = str(fn.get("name") or "")
                         fn_args = _parse_tool_args(fn.get("arguments"))
-                        out = tools.execute_tool(fn_name, fn_args)
+                        if fn_name == "upsert_watchlist_item" and not watchlist.has_explicit_watchlist_intent(
+                            clean, prior_messages
+                        ):
+                            out = {
+                                "result": {
+                                    "blocked": True,
+                                    "error": (
+                                        "Blocked: Do NOT add or modify items in the Watchlist/Playlists tab unless "
+                                        "the user explicitly asked to put it in their playlist or watchlist (or provided "
+                                        "a link to save). If they plan to watch a lecture/video/course, create a Task "
+                                        "instead or ask the user how they want to track it."
+                                    ),
+                                },
+                                "action_badge": None,
+                                "navigate_to": None,
+                            }
+                        else:
+                            out = tools.execute_tool(fn_name, fn_args)
                         if out.get("action_badges"):
                             actions_taken.extend(out["action_badges"])
                         elif out.get("action_badge"):

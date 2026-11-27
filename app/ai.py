@@ -212,6 +212,11 @@ def _fallback_parse(raw_text: str, today: str, default_unit: str = "kg") -> dict
             if u:
                 t_clean = t_clean.replace(u, "").strip(" -—:")
             actions.append({"type": "watchlist", "title": t_clean or u, "url": u, "content_type": "playlist"})
+        elif not lower.startswith("note:") and re.search(
+            r"\b(?:today'?s?\s+tasks?|for\s+today|task\s+list|make\s+(?:a|the)\s+tasks?|create\s+(?:a|the)\s+tasks?|add\s+(?:a\s+|the\s+)?tasks?|for\s+the\s+next\s+\d*\s*(?:days?|weeks?))\b",
+            lower,
+        ):
+            actions.append({"type": "task", "title": text[:120], "priority": "normal", "category": ""})
         elif lower.startswith("note:") or "\n" in text or len(text) > 120:
             clean_note = text[5:].strip() if lower.startswith("note:") else text
             actions.append({"type": "note", "title": "", "content": clean_note, "tags": []})
@@ -750,7 +755,8 @@ async def smart_capture(
             "7. {\"type\": \"art_item\", \"title\": \"...\", \"status\": \"idea|wip|finished\", \"notes\": \"\"}\n"
             "8. {\"type\": \"game\", \"title\": \"...\", \"status\": \"playing|want_to_play|finished|on_hold\", \"platform\": \"\", \"rating\": null, \"notes\": \"\"}\n"
             "9. {\"type\": \"study_session\", \"subject\": \"Study|Lectures|Coding|Reading|Research|Art\", \"topic\": \"...\", \"duration_minutes\": 45, \"date\": \"YYYY-MM-DD\", \"notes\": \"\"}\n"
-            "10. {\"type\": \"watchlist\", \"title\": \"...\", \"url\": \"https://...\", \"content_type\": \"playlist|video|course|podcast|article\", \"category\": \"\", \"tags\": [\"...\"], \"notes\": \"\"}\n"
+            "10. {\"type\": \"watchlist\", \"title\": \"...\", \"url\": \"https://...\", \"content_type\": \"playlist|video|course|podcast|article\", \"category\": \"\", \"tags\": [\"...\"], \"notes\": \"\"} "
+            "(ONLY emit watchlist when the user explicitly asks to add/save to their playlist or watchlist or pastes a playlist/video URL to bookmark — NEVER for statements like 'I will watch X' or 'watch 5 lectures', use 'task' instead)\n"
             f"Default weight unit if unspecified: {default_unit}. "
             "If the user mentions multiple things in one sentence, output multiple actions."
         )
@@ -775,7 +781,24 @@ async def smart_capture(
     else:
         parsed = _fallback_parse(clean, today, default_unit)
 
-    results = execute_actions(parsed.get("actions", []), default_unit=default_unit)
+    raw_actions = parsed.get("actions", [])
+    if mode == "auto" and not watchlist.has_explicit_watchlist_intent(clean):
+        sanitized_actions: list[dict[str, Any]] = []
+        for act in raw_actions:
+            if isinstance(act, dict) and str(act.get("type") or "").strip().lower() == "watchlist":
+                sanitized_actions.append(
+                    {
+                        "type": "task",
+                        "title": str(act.get("title") or clean[:120]).strip(),
+                        "priority": "normal",
+                        "category": str(act.get("category") or ""),
+                    }
+                )
+            else:
+                sanitized_actions.append(act)
+        raw_actions = sanitized_actions
+
+    results = execute_actions(raw_actions, default_unit=default_unit)
     if not results:
         results = execute_actions([{"type": "note", "title": "", "content": clean}], default_unit=default_unit)
 

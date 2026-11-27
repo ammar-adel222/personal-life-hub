@@ -155,3 +155,71 @@ async def fetch_url_metadata(url: str) -> dict[str, Any]:
         "content_type": info["content_type"],
         "fetched": fetched,
     }
+
+
+_WATCHLIST_EXPLICIT_RE = re.compile(
+    r"\b(?:playlist|playlists|watchlist|watch\s+list)\b",
+    re.IGNORECASE,
+)
+_WATCHLIST_NEGATION_RE = re.compile(
+    r"\b(?:don'?t|do\s+not|never|not|stop|avoid)\b[^.!?\n]{0,40}\b(?:playlist|playlists|watchlist|watch\s+list)\b",
+    re.IGNORECASE,
+)
+_WATCHLIST_AFFIRMATIVE_RE = re.compile(
+    r"\b(?:add|save|put)\b[^.!?\n]{0,30}\b(?:to|in|into|on)\b[^.!?\n]{0,20}\b(?:playlist|playlists|watchlist|watch\s+list)\b",
+    re.IGNORECASE,
+)
+_HTTP_URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+
+
+def has_explicit_watchlist_intent(
+    user_text: str,
+    prior_messages: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Return True only when the user explicitly asks for the Watchlist/Playlists tab (or pastes a link to save)."""
+    text = (user_text or "").strip()
+    if not text:
+        return False
+    lower = text.lower()
+
+    neg_match = _WATCHLIST_NEGATION_RE.search(lower)
+    if neg_match:
+        aff_match = _WATCHLIST_AFFIRMATIVE_RE.search(lower)
+        if not (aff_match and aff_match.start() > neg_match.end()):
+            return False
+
+    if _WATCHLIST_EXPLICIT_RE.search(lower):
+        return True
+
+    if _HTTP_URL_RE.search(text):
+        if not lower.startswith("note:") and not re.search(
+            r"\b(?:add|create|make|save)\s+(?:a\s+|this\s+)?(?:task|note)\b",
+            lower,
+        ):
+            return True
+
+    if prior_messages:
+        last_assistant = next(
+            (m for m in reversed(prior_messages) if m.get("role") == "assistant"),
+            None,
+        )
+        if last_assistant:
+            last_content = str(last_assistant.get("content") or "")
+            if "?" in last_content and _WATCHLIST_EXPLICIT_RE.search(last_content):
+                is_yes = bool(
+                    re.search(
+                        r"^(?:yes|yeah|yep|yup|sure|ok|okay|please|do it|go ahead|confirm|add it|save it|put it)\b",
+                        lower,
+                    )
+                    or (
+                        re.search(r"\b(?:yes|go ahead|add it|save it|put it)\b", lower)
+                        and not re.search(
+                            r"\b(?:no|nope|don'?t|do not|cancel|never mind|instead)\b",
+                            lower,
+                        )
+                    )
+                )
+                if is_yes:
+                    return True
+
+    return False
