@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import uuid
+import webbrowser
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -14,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app import agent, ai, db, dialogs, notes_sync, tts, voice
+from app import agent, ai, cloud_sync, db, desktop_host, dialogs, notes_sync, tts, voice, watchlist
 from app.config import (
     get_data_dir,
     get_media_dir,
@@ -243,6 +245,62 @@ class SettingsUpdate(BaseModel):
     tts_voice: str | None = None
     auto_silence: bool | None = None
     silence_seconds: float | None = None
+    global_hotkey: str | None = None
+    minimize_to_tray: bool | None = None
+    floating_indicator: bool | None = None
+    sound_feedback: bool | None = None
+    cloud_folder: str | None = None
+    cloud_auto_sync: bool | None = None
+    cloud_sync_notes: bool | None = None
+    cloud_sync_watchlist: bool | None = None
+    cloud_sync_backup: bool | None = None
+    gdrive_folder_name: str | None = None
+
+
+class WatchlistCreate(BaseModel):
+    title: str = ""
+    url: str = ""
+    content_type: str = "playlist"
+    source: str = ""
+    category: str = ""
+    status: str = "to_watch"
+    progress_current: int = 0
+    progress_total: int = 0
+    tags: list[str] | str = Field(default_factory=list)
+    notes: str = ""
+
+
+class WatchlistUpdate(BaseModel):
+    title: str | None = None
+    url: str | None = None
+    content_type: str | None = None
+    source: str | None = None
+    category: str | None = None
+    status: str | None = None
+    progress_current: int | None = None
+    progress_total: int | None = None
+    tags: list[str] | str | None = None
+    notes: str | None = None
+
+
+class WatchlistFetchMetaPayload(BaseModel):
+    url: str
+
+
+class CloudSyncFolderPayload(BaseModel):
+    folder: str | None = None
+
+
+class GDriveCredentialsPathPayload(BaseModel):
+    path: str
+
+
+class GDriveCredentialsRawPayload(BaseModel):
+    credentials_json: str
+
+
+class OpenUrlPayload(BaseModel):
+    url: str
 
 
 class CapturePayload(BaseModel):
@@ -456,6 +514,7 @@ async def post_note(payload: NoteCreate) -> dict[str, Any]:
             item = notes_sync.save_new_note_to_folder(item, notes_dir)
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    cloud_sync.maybe_auto_sync_cloud_folder()
     return {"item": item}
 
 
@@ -498,6 +557,7 @@ def patch_note(note_id: int, payload: NoteUpdate) -> dict[str, Any]:
             item = notes_sync.write_note_to_source(item)
         except OSError:
             pass
+    cloud_sync.maybe_auto_sync_cloud_folder()
     return {"item": item}
 
 
@@ -540,6 +600,7 @@ async def post_note_organize(note_id: int, payload: NoteOrganizePayload) -> dict
                     item = notes_sync.write_note_to_source(item)
                 except OSError:
                     pass
+        cloud_sync.maybe_auto_sync_cloud_folder()
     return {
         "item": item,
         "organized": org,
@@ -573,6 +634,7 @@ def post_note_append(note_id: int, payload: NoteAppendPayload) -> dict[str, Any]
             item = notes_sync.write_note_to_source(item)
         except OSError:
             pass
+    cloud_sync.maybe_auto_sync_cloud_folder()
     return {"item": item}
 
 
@@ -593,6 +655,7 @@ def post_note_checklist_toggle(
             item = notes_sync.write_note_to_source(item)
         except OSError:
             pass
+    cloud_sync.maybe_auto_sync_cloud_folder()
     return {"item": item}
 
 
@@ -957,6 +1020,177 @@ def remove_study_session(session_id: int) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Watchlist & Playlists
+# ---------------------------------------------------------------------------
+
+@app.get("/api/watchlist")
+def get_watchlist(
+    status: str | None = None,
+    content_type: str | None = None,
+    category: str = "",
+    q: str = "",
+) -> dict[str, Any]:
+    return {
+        "items": db.list_watchlist(
+            status=status,
+            content_type=content_type,
+            category=category,
+            query=q,
+        )
+    }
+
+
+@app.post("/api/watchlist/fetch-meta")
+async def post_watchlist_fetch_meta(payload: WatchlistFetchMetaPayload) -> dict[str, Any]:
+    try:
+        return await watchlist.fetch_url_metadata(payload.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/watchlist", status_code=201)
+async def post_watchlist(payload: WatchlistCreate) -> dict[str, Any]:
+    title = payload.title.strip()
+    url = payload.url.strip()
+    content_type = payload.content_type
+    source = payload.source.strip()
+    if url and not watchlist.is_safe_http_url(url):
+        raise HTTPException(status_code=400, detail="Please enter a valid public http:// or https:// URL.")
+    if url and (not title or not source):
+        try:
+            meta = await watchlist.fetch_url_metadata(url)
+            if not title:
+                title = meta["title"]
+            if not source:
+                source = meta["source"]
+            if content_type == "playlist" and meta.get("content_type"):
+                content_type = meta["content_type"]
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        item = db.create_watchlist_item(
+            title=title,
+            url=url,
+            content_type=content_type,
+            source=source,
+            category=payload.category,
+            status=payload.status,
+            progress_current=payload.progress_current,
+            progress_total=payload.progress_total,
+            tags=payload.tags,
+            notes=payload.notes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    cloud_sync.maybe_auto_sync_cloud_folder()
+    return {"item": item}
+
+
+@app.patch("/api/watchlist/{item_id}")
+def patch_watchlist(item_id: int, payload: WatchlistUpdate) -> dict[str, Any]:
+    patch = payload.model_dump(exclude_unset=True)
+    if "url" in patch and patch["url"] and not watchlist.is_safe_http_url(str(patch["url"])):
+        raise HTTPException(status_code=400, detail="Please enter a valid public http:// or https:// URL.")
+    try:
+        item = db.update_watchlist_item(item_id, patch)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not item:
+        raise HTTPException(status_code=404, detail="Watchlist item not found.")
+    cloud_sync.maybe_auto_sync_cloud_folder()
+    return {"item": item}
+
+
+@app.post("/api/watchlist/{item_id}/open-note")
+def post_watchlist_open_note(item_id: int) -> dict[str, Any]:
+    res = db.ensure_watchlist_note(item_id)
+    if not res:
+        raise HTTPException(status_code=404, detail="Watchlist item not found.")
+    if res.get("created"):
+        cloud_sync.maybe_auto_sync_cloud_folder()
+    return res
+
+
+@app.delete("/api/watchlist/{item_id}")
+def remove_watchlist(item_id: int) -> dict[str, Any]:
+    if not db.delete_watchlist_item(item_id):
+        raise HTTPException(status_code=404, detail="Watchlist item not found.")
+    cloud_sync.maybe_auto_sync_cloud_folder()
+    return {"deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Cloud Folder Sync & Direct Google Drive OAuth
+# ---------------------------------------------------------------------------
+
+@app.get("/api/cloud/status")
+def get_cloud_status() -> dict[str, Any]:
+    s = load_settings()
+    return {
+        "local_folder": s.get("cloud_folder", ""),
+        "auto_sync": bool(s.get("cloud_auto_sync", False)),
+        "sync_notes": bool(s.get("cloud_sync_notes", True)),
+        "sync_watchlist": bool(s.get("cloud_sync_watchlist", True)),
+        "sync_backup": bool(s.get("cloud_sync_backup", True)),
+        "last_sync": s.get("cloud_last_sync", ""),
+        "detected_folders": cloud_sync.detect_local_cloud_folders(),
+        "gdrive": cloud_sync.get_gdrive_status(),
+    }
+
+
+@app.post("/api/cloud/sync-folder")
+def post_cloud_sync_folder(payload: CloudSyncFolderPayload | None = None) -> dict[str, Any]:
+    try:
+        folder_arg = payload.folder if payload else None
+        return cloud_sync.sync_to_cloud_folder(folder_arg)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/cloud/gdrive/credentials-file")
+def post_gdrive_credentials_file(payload: GDriveCredentialsPathPayload) -> dict[str, Any]:
+    try:
+        return cloud_sync.import_gdrive_credentials_file(payload.path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/cloud/gdrive/credentials-raw")
+def post_gdrive_credentials_raw(payload: GDriveCredentialsRawPayload) -> dict[str, Any]:
+    try:
+        return cloud_sync.save_gdrive_credentials_raw(payload.credentials_json)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/cloud/gdrive/connect")
+async def post_gdrive_connect() -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(cloud_sync.connect_gdrive_oauth)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Google Drive auth failed: {exc}") from exc
+
+
+@app.post("/api/cloud/gdrive/disconnect")
+def post_gdrive_disconnect() -> dict[str, Any]:
+    return cloud_sync.disconnect_gdrive()
+
+
+@app.post("/api/cloud/gdrive/sync")
+async def post_gdrive_sync() -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(cloud_sync.sync_to_gdrive)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Google Drive sync failed: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
 # Smart Capture, AI Search & Voice Input
 # ---------------------------------------------------------------------------
 
@@ -1044,6 +1278,11 @@ def get_voice_devices() -> dict[str, Any]:
 @app.get("/api/voice/status")
 def get_voice_status() -> dict[str, Any]:
     return voice.recorder.status()
+
+
+@app.get("/api/voice/global-state")
+def get_voice_global_state() -> dict[str, Any]:
+    return desktop_host.get_global_voice_state()
 
 
 @app.post("/api/voice/start")
@@ -1138,7 +1377,17 @@ def patch_settings(payload: SettingsUpdate) -> dict[str, Any]:
     # Only overwrite API key if a non-empty value is provided, or if explicitly cleared via ""
     if "groq_api_key" in patch and patch["groq_api_key"] is None:
         patch.pop("groq_api_key")
+    if "global_hotkey" in patch and patch["global_hotkey"] is not None:
+        hk = str(patch["global_hotkey"]).strip().lower()
+        if hk:
+            try:
+                desktop_host.parse_hotkey(hk)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        patch["global_hotkey"] = hk
     update_settings(patch)
+    if "global_hotkey" in patch:
+        desktop_host.host.reload_hotkey(patch["global_hotkey"])
     return get_public_settings()
 
 
@@ -1152,6 +1401,21 @@ def system_pick_folder() -> dict[str, Any]:
 def system_pick_image() -> dict[str, Any]:
     selected = dialogs.pick_image_file()
     return {"path": selected}
+
+
+@app.post("/api/system/pick-json")
+def system_pick_json() -> dict[str, Any]:
+    selected = dialogs.pick_json_file()
+    return {"path": selected}
+
+
+@app.post("/api/system/open-url")
+def system_open_url(payload: OpenUrlPayload) -> dict[str, Any]:
+    clean = (payload.url or "").strip()
+    if not watchlist.is_safe_http_url(clean):
+        raise HTTPException(status_code=400, detail="Only valid public http:// or https:// URLs can be opened.")
+    webbrowser.open(clean)
+    return {"opened": True, "url": clean}
 
 
 @app.post("/api/system/open-data-dir")

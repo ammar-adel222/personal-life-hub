@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from app import db
+from app import db, watchlist
 from app.config import ALLOWED_GROQ_MODELS, load_settings
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
@@ -205,6 +205,13 @@ def _fallback_parse(raw_text: str, today: str, default_unit: str = "kg") -> dict
             )
         elif lower.startswith("want to ") or lower.startswith("someday "):
             actions.append({"type": "want_to_do", "title": text, "category": ""})
+        elif lower.startswith("watchlist:") or lower.startswith("playlist:") or "youtube.com/playlist" in lower or "youtu.be/" in lower:
+            url_m = re.search(r"https?://[^\s]+", text)
+            u = url_m.group(0).rstrip(".,)") if url_m else ""
+            t_clean = re.sub(r"^(?:watchlist|playlist)\s*:\s*", "", text, flags=re.IGNORECASE)
+            if u:
+                t_clean = t_clean.replace(u, "").strip(" -—:")
+            actions.append({"type": "watchlist", "title": t_clean or u, "url": u, "content_type": "playlist"})
         elif lower.startswith("note:") or "\n" in text or len(text) > 120:
             clean_note = text[5:].strip() if lower.startswith("note:") else text
             actions.append({"type": "note", "title": "", "content": clean_note, "tags": []})
@@ -477,6 +484,14 @@ def _explicit_mode_actions(raw_text: str, mode: str, today: str, unit: str) -> d
                 }
             ],
         }
+    if mode == "watchlist":
+        url_m = re.search(r"https?://[^\s]+", text)
+        u = url_m.group(0).rstrip(".,)") if url_m else ""
+        t_clean = text.replace(u, "").strip(" -—:") if u else text
+        return {
+            "summary": f"Saved to Watchlist: {t_clean or u}",
+            "actions": [{"type": "watchlist", "title": t_clean or u, "url": u, "content_type": "playlist"}],
+        }
     return _fallback_parse(text, today, unit)
 
 
@@ -653,6 +668,30 @@ def execute_actions(actions: list[dict[str, Any]], default_unit: str = "kg") -> 
                     }
                 )
 
+        elif atype == "watchlist":
+            w_url = str(act.get("url") or "").strip()
+            w_title = str(act.get("title") or "").strip()
+            if w_url and not watchlist.is_safe_http_url(w_url):
+                continue
+            if w_title or w_url:
+                info = watchlist.detect_url_info(w_url) if w_url else {"source": "", "content_type": "playlist"}
+                item = db.create_watchlist_item(
+                    title=w_title,
+                    url=w_url,
+                    content_type=str(act.get("content_type") or info["content_type"] or "playlist"),
+                    source=info["source"],
+                    category=str(act.get("category") or ""),
+                    tags=act.get("tags") or [],
+                    notes=str(act.get("notes") or ""),
+                )
+                executed.append(
+                    {
+                        "type": "watchlist",
+                        "label": f"Watchlist: {item['title']}",
+                        "item": item,
+                    }
+                )
+
     return executed
 
 
@@ -711,6 +750,7 @@ async def smart_capture(
             "7. {\"type\": \"art_item\", \"title\": \"...\", \"status\": \"idea|wip|finished\", \"notes\": \"\"}\n"
             "8. {\"type\": \"game\", \"title\": \"...\", \"status\": \"playing|want_to_play|finished|on_hold\", \"platform\": \"\", \"rating\": null, \"notes\": \"\"}\n"
             "9. {\"type\": \"study_session\", \"subject\": \"Study|Lectures|Coding|Reading|Research|Art\", \"topic\": \"...\", \"duration_minutes\": 45, \"date\": \"YYYY-MM-DD\", \"notes\": \"\"}\n"
+            "10. {\"type\": \"watchlist\", \"title\": \"...\", \"url\": \"https://...\", \"content_type\": \"playlist|video|course|podcast|article\", \"category\": \"\", \"tags\": [\"...\"], \"notes\": \"\"}\n"
             f"Default weight unit if unspecified: {default_unit}. "
             "If the user mentions multiple things in one sentence, output multiple actions."
         )
@@ -822,6 +862,13 @@ def _build_life_context(question: str) -> tuple[str, list[dict[str, Any]]]:
             lines.append(
                 f"- {rs['date']}: {rs['subject']} ({rs['duration_minutes']}m) {rs['topic']} {rs['notes']}"
             )
+
+    watchlist_items = db.list_watchlist()[:8]
+    if watchlist_items:
+        lines.append("\n[Watchlist & Playlists]")
+        for w in watchlist_items:
+            prog = f" ({w['progress_current']}/{w['progress_total']})" if w["progress_total"] > 0 else ""
+            lines.append(f"- [{w['status']}] {w['title']}{prog}: {w['url']} {w['notes'][:100]}")
 
     return "\n".join(lines), hits
 

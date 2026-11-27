@@ -34,6 +34,19 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "tts_voice": "troy",
     "auto_silence": False,
     "silence_seconds": 3.5,
+    "global_hotkey": "ctrl+shift+space",
+    "minimize_to_tray": True,
+    "floating_indicator": True,
+    "sound_feedback": True,
+    "cloud_folder": "",
+    "cloud_auto_sync": False,
+    "cloud_sync_notes": True,
+    "cloud_sync_watchlist": True,
+    "cloud_sync_backup": True,
+    "cloud_last_sync": "",
+    "gdrive_folder_name": "PersonalLifeHub",
+    "gdrive_account_email": "",
+    "gdrive_last_sync": "",
 }
 
 
@@ -67,6 +80,21 @@ def get_settings_path() -> Path:
     return get_data_dir() / "settings.json"
 
 
+def get_gdrive_credentials_path() -> Path:
+    """Return private path for the user's Google Drive OAuth client secrets JSON."""
+    return get_data_dir() / "google_credentials.json"
+
+
+def get_gdrive_token_path() -> Path:
+    """Return private path for the user's Google Drive OAuth user token JSON."""
+    return get_data_dir() / "google_token.json"
+
+
+def get_tray_icon_path() -> Path:
+    """Return private path for cached System Tray .ico file."""
+    return get_data_dir() / "tray.ico"
+
+
 def _normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     merged = dict(DEFAULT_SETTINGS)
     if raw:
@@ -95,6 +123,25 @@ def _normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     except (TypeError, ValueError):
         sil = 3.5
     merged["silence_seconds"] = max(0.6, min(6.0, round(sil, 1)))
+    hk = str(merged.get("global_hotkey", "ctrl+shift+space") or "").strip().lower()
+    merged["global_hotkey"] = hk
+    for bkey in (
+        "minimize_to_tray",
+        "floating_indicator",
+        "sound_feedback",
+        "cloud_auto_sync",
+        "cloud_sync_notes",
+        "cloud_sync_watchlist",
+        "cloud_sync_backup",
+    ):
+        merged[bkey] = bool(merged.get(bkey, DEFAULT_SETTINGS[bkey]))
+    for skey in ("cloud_folder", "cloud_last_sync", "gdrive_account_email", "gdrive_last_sync"):
+        if not isinstance(merged.get(skey), str):
+            merged[skey] = ""
+        else:
+            merged[skey] = merged[skey].strip()
+    gdir = str(merged.get("gdrive_folder_name") or "PersonalLifeHub").strip()
+    merged["gdrive_folder_name"] = gdir[:80] or "PersonalLifeHub"
     return merged
 
 
@@ -130,8 +177,10 @@ def update_settings(patch: dict[str, Any]) -> dict[str, Any]:
             continue
         if key == "groq_api_key" and isinstance(value, str):
             current[key] = value.strip()
-        elif key == "notes_folder" and isinstance(value, str):
+        elif key in ("notes_folder", "cloud_folder", "gdrive_folder_name") and isinstance(value, str):
             current[key] = value.strip()
+        elif key == "global_hotkey" and isinstance(value, str):
+            current[key] = value.strip().lower()
         else:
             current[key] = value
     return save_settings(current)
@@ -165,6 +214,19 @@ def get_public_settings() -> dict[str, Any]:
         "tts_voice": settings["tts_voice"],
         "auto_silence": settings["auto_silence"],
         "silence_seconds": settings["silence_seconds"],
+        "global_hotkey": settings["global_hotkey"],
+        "minimize_to_tray": settings["minimize_to_tray"],
+        "floating_indicator": settings["floating_indicator"],
+        "sound_feedback": settings["sound_feedback"],
+        "cloud_folder": settings["cloud_folder"],
+        "cloud_auto_sync": settings["cloud_auto_sync"],
+        "cloud_sync_notes": settings["cloud_sync_notes"],
+        "cloud_sync_watchlist": settings["cloud_sync_watchlist"],
+        "cloud_sync_backup": settings["cloud_sync_backup"],
+        "cloud_last_sync": settings["cloud_last_sync"],
+        "gdrive_folder_name": settings["gdrive_folder_name"],
+        "gdrive_account_email": settings["gdrive_account_email"],
+        "gdrive_last_sync": settings["gdrive_last_sync"],
         "allowed_tts_modes": list(ALLOWED_TTS_MODES),
         "allowed_tts_providers": list(ALLOWED_TTS_PROVIDERS),
         "allowed_tts_voices": list(ALLOWED_ORPHEUS_VOICES),

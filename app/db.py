@@ -25,6 +25,8 @@ TIMER_PHASES = ("focus", "break")
 ACTIVITY_DOMAINS = ("gym", "art")
 ART_STATUSES = ("idea", "wip", "finished")
 GAME_STATUSES = ("playing", "want_to_play", "finished", "on_hold")
+WATCHLIST_TYPES = ("playlist", "video", "course", "podcast", "article")
+WATCHLIST_STATUSES = ("to_watch", "watching", "watched")
 
 
 def today_str() -> str:
@@ -180,6 +182,25 @@ CREATE TABLE IF NOT EXISTS active_timer (
     notes TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS watchlist_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL DEFAULT '',
+    content_type TEXT NOT NULL DEFAULT 'playlist'
+        CHECK(content_type IN ('playlist', 'video', 'course', 'podcast', 'article')),
+    source TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'to_watch'
+        CHECK(status IN ('to_watch', 'watching', 'watched')),
+    progress_current INTEGER NOT NULL DEFAULT 0,
+    progress_total INTEGER NOT NULL DEFAULT 0,
+    tags TEXT NOT NULL DEFAULT '[]',
+    notes TEXT NOT NULL DEFAULT '',
+    note_id INTEGER REFERENCES notes(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_list_done ON tasks(list_type, done);
 CREATE INDEX IF NOT EXISTS idx_task_items_task ON task_items(task_id, position ASC, id ASC);
 CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(pinned DESC, updated_at DESC);
@@ -222,6 +243,7 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(folder COLLATE NOCASE);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_study_sessions_date ON study_sessions(date DESC, id DESC);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_study_sessions_subject ON study_sessions(subject COLLATE NOCASE);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_status ON watchlist_items(status, updated_at DESC);")
 
 
 @contextmanager
@@ -1680,6 +1702,7 @@ def search_everything(query: str, limit: int = 25) -> list[dict[str, Any]]:
         art_rows = conn.execute("SELECT * FROM art_items ORDER BY updated_at DESC").fetchall()
         game_rows = conn.execute("SELECT * FROM games ORDER BY updated_at DESC").fetchall()
         study_rows = conn.execute("SELECT * FROM study_sessions ORDER BY date DESC, id DESC").fetchall()
+        watch_rows = conn.execute("SELECT * FROM watchlist_items ORDER BY updated_at DESC").fetchall()
 
     for r in note_rows:
         tags = _parse_json_list(r["tags"])
@@ -1794,6 +1817,23 @@ def search_everything(query: str, limit: int = 25) -> list[dict[str, Any]]:
                 }
             )
 
+    for r in watch_rows:
+        tags = _parse_json_list(r["tags"])
+        text = f"watch watchlist playlist {r['title']} {r['url']} {r['content_type']} {r['source']} {r['category']} {r['notes']} {' '.join(tags)}"
+        score = _score_match(q_lower, tokens, text, boost=0.25 if r["status"] == "watching" else 0.1)
+        if score > 0:
+            prog = f" · {r['progress_current']}/{r['progress_total']}" if r["progress_total"] > 0 else ""
+            results.append(
+                {
+                    "type": "watchlist",
+                    "id": r["id"],
+                    "title": r["title"],
+                    "snippet": r["notes"] or r["url"] or f"{r['content_type'].title()}{prog}",
+                    "meta": f"{r['status'].replace('_', ' ').title()}{prog}",
+                    "score": score,
+                }
+            )
+
     results.sort(key=lambda item: item["score"], reverse=True)
     return results[: max(1, min(limit, 50))]
 
@@ -1816,6 +1856,8 @@ def get_dashboard() -> dict[str, Any]:
     recent_captures = list_captures(limit=8)
     study_stats = get_study_stats()
     timer_state = get_timer_state()
+    watchlist_all = list_watchlist()
+    watchlist_active = [w for w in watchlist_all if w["status"] == "watching"][:4]
 
     return {
         "today": today,
@@ -1831,6 +1873,8 @@ def get_dashboard() -> dict[str, Any]:
         },
         "study": study_stats,
         "timer": timer_state,
+        "watchlist_active": watchlist_active,
+        "watchlist_count": len(watchlist_all),
         "daily_tasks": open_daily[:12],
         "daily_done_today_count": len(done_today),
         "daily_open_count": len(open_daily),
@@ -1986,6 +2030,7 @@ def export_all_data() -> dict[str, Any]:
         "games": list_games(),
         "study_sessions": list_study_sessions(limit=500),
         "study_stats": get_study_stats(),
+        "watchlist": list_watchlist(),
         "captures": list_captures(limit=100),
         "agent_sessions": list_agent_sessions(limit=50),
     }
@@ -2571,3 +2616,289 @@ def complete_countdown_phase(start_break: bool = True) -> dict[str, Any]:
             "state": _format_timer_row(conn, updated_row),
             "logged_session": logged_session,
         }
+
+
+# ---------------------------------------------------------------------------
+# Watchlist & Playlists
+# ---------------------------------------------------------------------------
+
+def _row_to_watchlist(row: sqlite3.Row) -> dict[str, Any]:
+    row_keys = row.keys()
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "url": row["url"],
+        "content_type": row["content_type"],
+        "source": row["source"],
+        "category": row["category"],
+        "status": row["status"],
+        "progress_current": int(row["progress_current"] or 0),
+        "progress_total": int(row["progress_total"] or 0),
+        "tags": _parse_json_list(row["tags"]),
+        "notes": row["notes"],
+        "note_id": row["note_id"],
+        "note_title": (row["note_title"] if "note_title" in row_keys and row["note_title"] else ""),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+_WATCHLIST_SELECT = """
+    SELECT w.*, n.title AS note_title
+    FROM watchlist_items w
+    LEFT JOIN notes n ON n.id = w.note_id
+"""
+
+
+def list_watchlist(
+    status: str | None = None,
+    content_type: str | None = None,
+    category: str = "",
+    query: str = "",
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status in WATCHLIST_STATUSES:
+        clauses.append("w.status = ?")
+        params.append(status)
+    if content_type in WATCHLIST_TYPES:
+        clauses.append("w.content_type = ?")
+        params.append(content_type)
+    if category and category.strip():
+        clauses.append("LOWER(w.category) = LOWER(?)")
+        params.append(category.strip())
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    sql = (
+        f"{_WATCHLIST_SELECT} {where_sql} "
+        "ORDER BY CASE w.status WHEN 'watching' THEN 0 WHEN 'to_watch' THEN 1 ELSE 2 END ASC, "
+        "w.updated_at DESC, w.id DESC"
+    )
+    with get_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    items = [_row_to_watchlist(r) for r in rows]
+    q = (query or "").strip().lower()
+    if q:
+        tokens = [tok for tok in re.split(r"\s+", q) if tok]
+        items = [
+            it
+            for it in items
+            if all(
+                tok
+                in (
+                    f"{it['title']} {it['url']} {it['source']} {it['category']} "
+                    f"{it['notes']} {' '.join(it['tags'])}"
+                ).lower()
+                for tok in tokens
+            )
+        ]
+    return items
+
+
+def get_watchlist_item(item_id: int) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            f"{_WATCHLIST_SELECT} WHERE w.id = ?", (item_id,)
+        ).fetchone()
+        return _row_to_watchlist(row) if row else None
+
+
+def find_watchlist_by_url_or_title(url: str = "", title: str = "") -> dict[str, Any] | None:
+    clean_url = (url or "").strip()
+    clean_title = (title or "").strip()
+    with get_conn() as conn:
+        if clean_url:
+            row = conn.execute(
+                f"{_WATCHLIST_SELECT} WHERE LOWER(w.url) = LOWER(?) LIMIT 1",
+                (clean_url,),
+            ).fetchone()
+            if row:
+                return _row_to_watchlist(row)
+        if clean_title:
+            row = conn.execute(
+                f"{_WATCHLIST_SELECT} WHERE LOWER(w.title) = LOWER(?) LIMIT 1",
+                (clean_title,),
+            ).fetchone()
+            if row:
+                return _row_to_watchlist(row)
+    return None
+
+
+def _rollup_watchlist_status(
+    current: int, total: int, fallback_status: str
+) -> str:
+    if total > 0:
+        if current >= total:
+            return "watched"
+        if current > 0:
+            return "watching"
+        return "to_watch" if fallback_status not in WATCHLIST_STATUSES else fallback_status
+    return fallback_status if fallback_status in WATCHLIST_STATUSES else "to_watch"
+
+
+def create_watchlist_item(
+    title: str = "",
+    url: str = "",
+    content_type: str = "playlist",
+    source: str = "",
+    category: str = "",
+    status: str = "to_watch",
+    progress_current: int = 0,
+    progress_total: int = 0,
+    tags: list[str] | str | None = None,
+    notes: str = "",
+    note_id: int | None = None,
+) -> dict[str, Any]:
+    clean_url = (url or "").strip()
+    clean_title = (title or "").strip()
+    if not clean_title and not clean_url:
+        raise ValueError("Provide a title or URL for the watchlist item.")
+    if not clean_title:
+        clean_title = clean_url[:90]
+    ct = content_type if content_type in WATCHLIST_TYPES else "playlist"
+    p_total = max(0, int(progress_total or 0))
+    p_cur = max(0, int(progress_current or 0))
+    if p_total > 0 and p_cur > p_total:
+        p_cur = p_total
+    st = _rollup_watchlist_status(p_cur, p_total, status if status in WATCHLIST_STATUSES else "to_watch")
+    cleaned_tags = _clean_tags(tags)
+    ts = now_iso()
+
+    with get_conn() as conn:
+        _, valid_note = _validate_fk_ids(conn, None, note_id)
+        cur = conn.execute(
+            """
+            INSERT INTO watchlist_items (
+                title, url, content_type, source, category, status,
+                progress_current, progress_total, tags, notes, note_id,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                clean_title[:160],
+                clean_url[:500],
+                ct,
+                (source or "").strip()[:60],
+                (category or "").strip()[:60],
+                st,
+                p_cur,
+                p_total,
+                json.dumps(cleaned_tags),
+                (notes or "").strip(),
+                valid_note,
+                ts,
+                ts,
+            ),
+        )
+        row = conn.execute(
+            f"{_WATCHLIST_SELECT} WHERE w.id = ?", (cur.lastrowid,)
+        ).fetchone()
+        return _row_to_watchlist(row)
+
+
+def update_watchlist_item(item_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM watchlist_items WHERE id = ?", (item_id,)
+        ).fetchone()
+        if not existing:
+            return None
+        title = str(patch.get("title", existing["title"])).strip()
+        if not title:
+            raise ValueError("Watchlist title cannot be empty.")
+        url = str(patch.get("url", existing["url"])).strip()
+        ct = patch.get("content_type", existing["content_type"])
+        if ct not in WATCHLIST_TYPES:
+            ct = existing["content_type"]
+        source = str(patch.get("source", existing["source"])).strip()
+        category = str(patch.get("category", existing["category"])).strip()
+
+        p_total = max(0, int(patch.get("progress_total", existing["progress_total"]) or 0))
+        p_cur = max(0, int(patch.get("progress_current", existing["progress_current"]) or 0))
+        if p_total > 0 and p_cur > p_total:
+            p_cur = p_total
+
+        if "status" in patch and patch["status"] in WATCHLIST_STATUSES:
+            st = patch["status"]
+        elif ("progress_current" in patch or "progress_total" in patch) and p_total > 0:
+            st = _rollup_watchlist_status(p_cur, p_total, existing["status"])
+        else:
+            st = existing["status"]
+
+        tags = (
+            _clean_tags(patch["tags"])
+            if "tags" in patch
+            else _parse_json_list(existing["tags"])
+        )
+        notes = str(patch.get("notes", existing["notes"])).strip()
+        raw_note = patch["note_id"] if "note_id" in patch else existing["note_id"]
+        _, valid_note = _validate_fk_ids(conn, None, raw_note)
+
+        conn.execute(
+            """
+            UPDATE watchlist_items
+            SET title = ?, url = ?, content_type = ?, source = ?, category = ?,
+                status = ?, progress_current = ?, progress_total = ?,
+                tags = ?, notes = ?, note_id = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                title[:160],
+                url[:500],
+                ct,
+                source[:60],
+                category[:60],
+                st,
+                p_cur,
+                p_total,
+                json.dumps(tags),
+                notes,
+                valid_note,
+                now_iso(),
+                item_id,
+            ),
+        )
+        row = conn.execute(
+            f"{_WATCHLIST_SELECT} WHERE w.id = ?", (item_id,)
+        ).fetchone()
+        return _row_to_watchlist(row)
+
+
+def delete_watchlist_item(item_id: int) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM watchlist_items WHERE id = ?", (item_id,))
+        return cur.rowcount > 0
+
+
+def ensure_watchlist_note(item_id: int) -> dict[str, Any] | None:
+    """Return the linked structured note for a watchlist item, creating it if missing."""
+    item = get_watchlist_item(item_id)
+    if not item:
+        return None
+    if item["note_id"] is not None:
+        existing_note = get_note(int(item["note_id"]))
+        if existing_note:
+            return {"item": item, "note": existing_note, "created": False}
+
+    folder = "Lectures" if item["content_type"] in ("playlist", "course", "video") else "Study"
+    tags = _clean_tags([*item["tags"], item["content_type"], item["category"] or "watchlist"])
+    url_line = f"- Source: [{item['url']}]({item['url']})" if item["url"] else ""
+    overview_lines = [ln for ln in (url_line, item["notes"]) if ln]
+    content = (
+        "## Overview\n"
+        + ("\n".join(overview_lines) if overview_lines else f"Tracking {item['content_type']} notes.")
+        + "\n\n## Key Notes\n- \n\n## To Research / Follow-Up\n- [ ] Review main takeaways\n"
+    )
+    summary = (
+        f"Notes for {item['content_type']}: {item['title']}"
+        + (f" ({item['source']})" if item["source"] else "")
+    )
+    new_note = create_note(
+        title=item["title"],
+        content=content,
+        folder=folder,
+        summary=summary,
+        tags=tags,
+    )
+    updated_item = update_watchlist_item(item_id, {"note_id": new_note["id"]}) or item
+    return {"item": updated_item, "note": new_note, "created": True}

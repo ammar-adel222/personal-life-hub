@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from app import db, notes_sync
+from app import cloud_sync, db, notes_sync, watchlist
 from app.config import load_settings
 
-ALLOWED_VIEWS = ("hub", "tasks", "notes", "timer", "gym", "art", "gaming", "ask", "agent", "settings")
+ALLOWED_VIEWS = ("hub", "tasks", "notes", "timer", "watchlist", "gym", "art", "gaming", "ask", "agent", "settings")
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -454,6 +454,51 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "upsert_watchlist_item",
+            "description": "Save or update a playlist, video, course, podcast, or article URL/title in the Watchlist (including episode progress).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "url": {"type": "string", "description": "Optional http(s) link to the playlist/video/course."},
+                    "content_type": {
+                        "type": "string",
+                        "enum": ["playlist", "video", "course", "podcast", "article"],
+                    },
+                    "category": {"type": "string", "description": "e.g. AI, Coding, Art, Gaming, Lecture."},
+                    "status": {
+                        "type": "string",
+                        "enum": ["to_watch", "watching", "watched"],
+                    },
+                    "progress_current": {"type": "integer"},
+                    "progress_total": {"type": "integer"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "notes": {"type": "string"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_watchlist",
+            "description": "List saved playlists, videos, courses, podcasts, or articles in the Watchlist.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["to_watch", "watching", "watched"]},
+                    "content_type": {"type": "string", "enum": ["playlist", "video", "course", "podcast", "article"]},
+                    "category": {"type": "string"},
+                    "query": {"type": "string"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "navigate_ui",
             "description": "Switch the desktop app screen to a specific view when the user asks to open or show a section.",
             "parameters": {
@@ -461,7 +506,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "view": {
                         "type": "string",
-                        "enum": ["hub", "tasks", "notes", "timer", "gym", "art", "gaming", "agent", "settings"],
+                        "enum": ["hub", "tasks", "notes", "timer", "watchlist", "gym", "art", "gaming", "agent", "settings"],
                     }
                 },
                 "required": ["view"],
@@ -472,13 +517,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "delete_item",
-            "description": "Delete a task, note, gym log, art item, game, or study_session. Only set confirmed=true after the user has explicitly confirmed deletion.",
+            "description": "Delete a task, note, gym log, art item, game, study_session, or watchlist item. Only set confirmed=true after explicit confirmation.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "domain": {
                         "type": "string",
-                        "enum": ["task", "note", "gym_log", "art", "game", "study_session"],
+                        "enum": ["task", "note", "gym_log", "art", "game", "study_session", "watchlist"],
                     },
                     "item_id": {"type": "integer"},
                     "confirmed": {"type": "boolean"},
@@ -1130,6 +1175,78 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
                 "navigate_to": None,
             }
 
+        if name == "upsert_watchlist_item":
+            title = str(args.get("title") or "").strip()
+            url = str(args.get("url") or "").strip()
+            if url and not watchlist.is_safe_http_url(url):
+                return {"result": {"error": "Watchlist URL must be a valid public http(s) URL."}, "action_badge": None, "navigate_to": None}
+            if not title and not url:
+                return {"result": {"error": "Provide title or url for the watchlist item."}, "action_badge": None, "navigate_to": None}
+
+            url_info = watchlist.detect_url_info(url) if url else {"source": "", "content_type": "playlist"}
+            content_type = str(args.get("content_type") or url_info["content_type"] or "playlist").lower()
+            source = url_info["source"]
+            existing = db.find_watchlist_by_url_or_title(url=url, title=title)
+            if existing:
+                patch: dict[str, Any] = {}
+                if title:
+                    patch["title"] = title
+                if url:
+                    patch["url"] = url
+                if args.get("content_type"):
+                    patch["content_type"] = content_type
+                if source and not existing["source"]:
+                    patch["source"] = source
+                for fkey in ("category", "status", "notes"):
+                    if args.get(fkey) is not None and str(args.get(fkey)).strip():
+                        patch[fkey] = str(args.get(fkey)).strip()
+                if args.get("progress_current") is not None:
+                    patch["progress_current"] = _coerce_int(args.get("progress_current"), existing["progress_current"])
+                if args.get("progress_total") is not None:
+                    patch["progress_total"] = _coerce_int(args.get("progress_total"), existing["progress_total"])
+                if args.get("tags") is not None:
+                    merged_tags = list(existing["tags"])
+                    for t in _coerce_str_list(args.get("tags")):
+                        if t.lower() not in {x.lower() for x in merged_tags}:
+                            merged_tags.append(t)
+                    patch["tags"] = merged_tags
+                item = db.update_watchlist_item(existing["id"], patch) or existing
+                badge_lbl = f"Updated Watchlist: {item['title']}"
+            else:
+                item = db.create_watchlist_item(
+                    title=title,
+                    url=url,
+                    content_type=content_type,
+                    source=source,
+                    category=str(args.get("category") or ""),
+                    status=str(args.get("status") or "to_watch").lower(),
+                    progress_current=_coerce_int(args.get("progress_current"), 0) or 0,
+                    progress_total=_coerce_int(args.get("progress_total"), 0) or 0,
+                    tags=_coerce_str_list(args.get("tags")),
+                    notes=str(args.get("notes") or ""),
+                )
+                badge_lbl = f"Watchlist ({item['content_type']}): {item['title']}"
+            cloud_sync.maybe_auto_sync_cloud_folder()
+            return {
+                "result": {"watchlist_item": item},
+                "action_badge": {
+                    "tool": name,
+                    "domain": "watchlist",
+                    "item_id": item["id"],
+                    "label": badge_lbl,
+                },
+                "navigate_to": None,
+            }
+
+        if name == "list_watchlist":
+            items = db.list_watchlist(
+                status=args.get("status"),
+                content_type=args.get("content_type"),
+                category=str(args.get("category") or ""),
+                query=str(args.get("query") or ""),
+            )
+            return {"result": {"items": items[:25]}, "action_badge": None, "navigate_to": None}
+
         if name == "navigate_ui":
             view = str(args.get("view") or "hub").strip().lower()
             if view == "agent":
@@ -1177,6 +1294,8 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
                 deleted = db.delete_game(item_id)
             elif domain == "study_session":
                 deleted = db.delete_study_session(item_id)
+            elif domain == "watchlist":
+                deleted = db.delete_watchlist_item(item_id)
             else:
                 return {"result": {"error": f"Unknown domain: {domain}"}, "action_badge": None, "navigate_to": None}
             if not deleted:

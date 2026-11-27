@@ -208,6 +208,20 @@ def _offline_agent_fallback(
             actions_taken.append(res["action_badge"])
         return (f"Logged {mins:g} minutes of study (offline mode).", actions_taken, None)
 
+    url_m = re.search(r"https?://[^\s]+", text)
+    if url_m or lower.startswith("watchlist:") or "save playlist" in lower or "to watch" in lower:
+        clean_url = url_m.group(0).rstrip(".,);") if url_m else ""
+        title_part = re.sub(r"^(?:watchlist\s*:|save\s+playlist\s*:?)", "", text, flags=re.IGNORECASE).strip()
+        if clean_url:
+            title_part = title_part.replace(clean_url, "").strip(" -—:")
+        res = tools.execute_tool(
+            "upsert_watchlist_item",
+            {"title": title_part or clean_url, "url": clean_url},
+        )
+        if res["action_badge"]:
+            actions_taken.append(res["action_badge"])
+            return (f"{res['action_badge']['label']} (offline mode).", actions_taken, None)
+
     parsed = ai._fallback_parse(text, db.today_str(), default_unit)
     executed = ai.execute_actions(parsed.get("actions", []), default_unit=default_unit)
     for ex in executed:
@@ -301,10 +315,11 @@ async def run_agent_turn(
         "call `control_study_timer` (defaulting to 25m countdown / 5m break unless they specify duration or stopwatch; set `open_timer_view=true` when starting or when asked to open the timer). "
         "When the user reports completed study time in the past (*'I studied Transformers for 90 minutes'*), call `log_study_session`. "
         "When asked how much they studied, call `get_study_stats`. If they mention an existing task or lecture note, look up its ID first and link `task_id`/`note_id`.\n"
-        "6. **Update hobby trackers too**: If the user mentions games (e.g. Elden Ring) or art projects, ALSO call `upsert_game` / `upsert_art` alongside creating any sprint tasks.\n"
-        "7. **Check existing records first**: When updating/checking off an existing task or lecture note without its ID in recent history, call `list_tasks` or `search_notes` first.\n"
-        "8. **Delete safety**: Never delete without explicit confirmation (`confirmed=false` first).\n"
-        "9. **Concise replies**: Confirm clearly what was created/updated in 1-3 short, friendly sentences. Ask a brief clarifying question only if genuinely ambiguous."
+        "6. **Watchlist & Playlists**: When the user asks to save, update progress on, or check playlists/videos/courses/podcasts/articles, call `upsert_watchlist_item` or `list_watchlist`.\n"
+        "7. **Update hobby trackers too**: If the user mentions games (e.g. Elden Ring) or art projects, ALSO call `upsert_game` / `upsert_art` alongside creating any sprint tasks.\n"
+        "8. **Check existing records first**: When updating/checking off an existing task or lecture note without its ID in recent history, call `list_tasks` or `search_notes` first.\n"
+        "9. **Delete safety**: Never delete without explicit confirmation (`confirmed=false` first).\n"
+        "10. **Concise replies**: Confirm clearly what was created/updated in 1-3 short, friendly sentences. Ask a brief clarifying question only if genuinely ambiguous."
     )
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]

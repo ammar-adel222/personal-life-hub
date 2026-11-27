@@ -77,3 +77,30 @@ def pick_image_file() -> str | None:
         "print(p or ''); r.destroy()"
     )
     return _run_tk_dialog(script)
+
+
+def pick_json_file() -> str | None:
+    """Prompt the user to select a .json file (e.g. Google Drive OAuth credentials.json)."""
+    if _active_window is not None:
+        try:
+            import webview
+
+            result = _active_window.create_file_dialog(
+                webview.FileDialog.OPEN,
+                allow_multiple=False,
+                file_types=("JSON files (*.json)", "All files (*.*)"),
+            )
+            if result and len(result) > 0:
+                return str(result[0])
+            return None
+        except Exception:
+            pass
+
+    script = (
+        "import tkinter as tk; from tkinter import filedialog; "
+        "r = tk.Tk(); r.withdraw(); r.attributes('-topmost', True); "
+        "p = filedialog.askopenfilename(title='Select Google credentials.json', "
+        "filetypes=[('JSON files', '*.json'), ('All files', '*.*')]); "
+        "print(p or ''); r.destroy()"
+    )
+    return _run_tk_dialog(script)

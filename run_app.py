@@ -80,7 +80,8 @@ def main() -> int:
 
     log_handle, orig_out, orig_err = _ensure_std_streams()
     try:
-        from app import dialogs
+        from app import desktop_host, dialogs
+        from app.config import load_settings
         from app.server import app
 
         port = _find_free_port()
@@ -119,9 +120,29 @@ def main() -> int:
             background_color="#0d1017",
         )
         dialogs.set_active_window(window)
+
+        exiting = [False]
+
+        def _request_exit() -> None:
+            exiting[0] = True
+            try:
+                window.destroy()
+            except Exception:
+                pass
+
+        def _on_closing() -> bool | None:
+            if not exiting[0] and load_settings().get("minimize_to_tray", True):
+                threading.Timer(0.05, window.hide).start()
+                return False
+            return True
+
+        window.events.closing += _on_closing
+        desktop_host.host.start(window=window, on_quit=_request_exit)
         try:
             webview.start()
         finally:
+            exiting[0] = True
+            desktop_host.host.stop()
             server.should_exit = True
             thread.join(timeout=3.0)
         return 0
