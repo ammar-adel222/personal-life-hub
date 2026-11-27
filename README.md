@@ -14,7 +14,7 @@ flowchart LR
     W -->|"Transcript"| AG["Pure-Python Tool Agent\n(app/agent.py)"]
     U -->|"Typed Text"| AG
     AG <-->|"OpenAI Tool Schemas\n(gpt-oss-120b / qwen3.8-27b)"| G["Groq Chat API"]
-    AG -->|"18 Typed Tools\n(app/tools.py)"| DB[("SQLite WAL\n%LOCALAPPDATA%\\PersonalLifeHub")]
+    AG -->|"19 Typed Tools\n(app/tools.py)"| DB[("SQLite WAL\n%LOCALAPPDATA%\\PersonalLifeHub")]
     DB -->|"Sync .md/.txt"| FS["Local Notes Folder"]
     AG -->|"Reply"| TTS["Groq Orpheus TTS\n(orpheus-v1-english)"]
     TTS -->|"Fallback on offline/429"| LOCAL["Windows / Edge Speech"]
@@ -34,8 +34,11 @@ flowchart LR
   - Every task supports **`not_started` (`○`)**, **`partially_completed` (`◐`)**, and **`completed` (`✓`)** states plus optional progress notes.
   - Tasks can contain nested checklist steps — checking `1..N-1` steps automatically sets the parent task to **`partially_completed`** with a progress bar; checking all steps completes it.
   - **Active Tasks** and **Want to Do / Someday** lists with timelines (`start_date` / `due_date` / `timeline`), target frequencies (`frequency`), and 1-click promotion.
-- **📝 Interactive Lecture Notes & Folder Sync**:
-  - Supports tags, pinning, instant cross-app search, clickable `- [ ]` / `- [x]` Markdown checklists inside the editor, and safe synchronization with a local `.md`/`.txt` folder.
+- **📝 Structured Markdown Notes, Notebooks & ✨ AI Organizer**:
+  - **Read / Split / Edit Modes + Formatting Toolbar**: Render headings, callouts (`> [!NOTE]`, `> [!IMPORTANT]`), fenced code blocks, tables, highlighted text, links, and clickable `- [ ]` / `- [x]` checkboxes directly in preview.
+  - **Notebooks & Filtering**: Organize notes into folders (`Lectures`, `Projects`, `Study`, `Personal`, `Ideas`, or custom notebooks), filter by pinned or `#tag`, search across summaries/titles/bodies, and sort by Updated, Created, or Title.
+  - **✨ Organize with AI & Auto-Structured Voice Notes**: 1-click button (`Structured`, `Lecture Note`, `Concise TL;DR`) turns messy voice transcripts into crisp Markdown headings, bullets, summaries, tags, and follow-up checklists; Voice Agent also auto-structures dictated notes.
+  - **Subfolder Sync**: Bidirectional synchronization with a local `.md`/`.txt` folder (mapping subfolders to note notebooks).
 - **🏋️ Simple Gym Tracker**:
   - 1-click **"Went to Gym Today"** toggle, monthly consistency calendar, fast sets/reps/weight logger (auto-marks Gym Day), 1-click repeat last set, and Personal Best history — zero routine-builder clutter.
 - **🎨 Simple Art & 🎮 Gaming Trackers**:
@@ -84,6 +87,7 @@ All personal data stays outside this repository in:
 | `Alt+V` | Start or stop voice recording |
 | `Ctrl+Space` | Start or stop voice recording (when not typing in a field) |
 | `Esc` | Cancel active voice recording or close image modal |
+| `Ctrl+S` | Save current or new note (when in Notes view) |
 | `Alt+1` .. `Alt+8` | Jump to Hub, Tasks, Notes, Gym, Art, Gaming, Voice Agent, or Settings |
 
 ---
@@ -95,4 +99,4 @@ All personal data stays outside this repository in:
 .\.venv\Scripts\python.exe run_app.py --smoke-test
 ```
 
-For deeper technical details (agent loop, 18-tool catalog, SQLite ER schema, RMS VAD, and extending TTS with Google TTS), see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+For deeper technical details (agent loop, 19-tool catalog, SQLite ER schema, RMS VAD, and extending TTS with Google TTS), see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

@@ -10,7 +10,7 @@ Instead of pulling in LangChain/LangGraph abstractions, `app/agent.py` + `app/to
 
 1. **Session Context Assembly**: Loads the active session from `agent_sessions` and the last 12 `agent_messages`, injecting compact `[Executed actions: domain #id: label]` annotations onto prior assistant messages so follow-up voice turns (*"check off the first item on that lecture note"*) resolve exact database IDs across turns.
 2. **Bounded Tool Loop (`MAX_TOOL_ROUNDS = 12`)**:
-   - Sends messages + 18 JSON tool schemas (`tools.TOOL_SCHEMAS`) + a 14-day local calendar context to `openai/gpt-oss-120b` (with automatic fallback to `qwen/qwen3.8-27b`, `openai/gpt-oss-20b`, and dynamic `/models` discovery on HTTP `404`).
+   - Sends messages + 19 JSON tool schemas (`tools.TOOL_SCHEMAS`) + a 14-day local calendar context to `openai/gpt-oss-120b` (with automatic fallback to `qwen/qwen3.8-27b`, `openai/gpt-oss-20b`, and dynamic `/models` discovery on HTTP `404`).
    - Executes returned `tool_calls` synchronously in `app/tools.py`, appends structured JSON results as `"tool"` messages, and collects UI badges (`action_badge`) and navigation triggers (`navigate_to`).
    - When the model returns a natural-language response, persists both the reply and action metadata into SQLite and returns `is_question` so the UI knows whether to speak clarifications aloud.
 3. **Offline Fallback**: When no Groq key is present (or the network is unreachable), `_offline_agent_fallback` handles checklist task syntax (`steps: ...`), tagged lecture notes, gym sets, and quick captures cleanly.
@@ -27,10 +27,11 @@ Instead of pulling in LangChain/LangGraph abstractions, `app/agent.py` + `app/to
 | `create_tasks_batch` | Decompose a multi-item spoken plan into multiple Active Tasks in one call |
 | `update_task` | Update title, priority, start/due dates, timeline, frequency, `progress_note`, or 3-state `status` |
 | `manage_task_checklist` | Add, check, uncheck, or remove sub-items with automatic parent rollup |
-| `search_notes` | Search notes by keywords and `#tags` |
-| `get_note` | Read full note content, tags, and Markdown checklist stats |
-| `create_note` | Create a note with tags, Markdown `- [ ]` checklists, and optional disk sync |
-| `append_to_note` | Append lecture remarks, research checklist items, or tags to an existing note |
+| `search_notes` | Search notes by keywords, folder, pinned status, and `#tags` |
+| `get_note` | Read full note content, folder, summary, tags, and Markdown checklist stats |
+| `create_note` | Create a structured Markdown note with folder, TL;DR summary, tags, `- [ ]` checklists, and optional disk sync |
+| `update_note` | Rewrite or organize an existing note's title, structured Markdown content, folder, summary, tags, or pin status |
+| `append_to_note` | Append structured remarks (optionally under a `## heading`), research checklist items, folder, or tags to a note |
 | `update_note_checklist` | Toggle `- [ ]` / `- [x]` lines inside a note by substring match |
 | `log_gym_day` | Mark a date on the Gym consistency calendar |
 | `log_gym_exercise` | Log sets/reps/weight and automatically mark that date as a Gym Day |
@@ -44,7 +45,7 @@ Instead of pulling in LangChain/LangGraph abstractions, `app/agent.py` + `app/to
 
 ## 3. SQLite Schema & Legacy Migration (`app/db.py`)
 
-Databases use `PRAGMA journal_mode=WAL` and `PRAGMA foreign_keys=ON`. `_migrate_db()` inspects `PRAGMA table_info(tasks)` on startup so older v0.1 databases automatically receive `status` and `progress_note` without data loss.
+Databases use `PRAGMA journal_mode=WAL` and `PRAGMA foreign_keys=ON`. `_migrate_db()` inspects `PRAGMA table_info(tasks)` and `PRAGMA table_info(notes)` on startup so older databases automatically receive new columns (`status`, `progress_note`, `start_date`, `timeline`, `frequency`, `folder`, `summary`) without data loss.
 
 ```mermaid
 erDiagram
@@ -73,7 +74,9 @@ erDiagram
     notes {
         int id PK
         text title
-        text content "Markdown + - [ ] checklists"
+        text folder "Notebook category (e.g. Lectures, Projects)"
+        text summary "1-2 sentence TL;DR"
+        text content "Structured Markdown + - [ ] checklists"
         text tags "JSON array"
         text source_path "Optional synced .md/.txt path"
     }

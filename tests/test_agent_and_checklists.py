@@ -59,7 +59,7 @@ def test_legacy_tasks_db_migration(monkeypatch, tmp_path):
 
 def test_tasks_batch_timeline_and_frequency(monkeypatch, tmp_path):
     monkeypatch.setenv("LIFEHUB_DATA_DIR", str(tmp_path))
-    assert len(tools.TOOL_SCHEMAS) == 18
+    assert len(tools.TOOL_SCHEMAS) == 19
 
     with TestClient(app) as client:
         res = tools.execute_tool(
