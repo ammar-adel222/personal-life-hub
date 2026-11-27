@@ -14,7 +14,7 @@ flowchart LR
     W -->|"Transcript"| AG["Pure-Python Tool Agent\n(app/agent.py)"]
     U -->|"Typed Text"| AG
     AG <-->|"OpenAI Tool Schemas\n(gpt-oss-120b / qwen3.8-27b)"| G["Groq Chat API"]
-    AG -->|"19 Typed Tools\n(app/tools.py)"| DB[("SQLite WAL\n%LOCALAPPDATA%\\PersonalLifeHub")]
+    AG -->|"22 Typed Tools\n(app/tools.py)"| DB[("SQLite WAL\n%LOCALAPPDATA%\\PersonalLifeHub")]
     DB -->|"Sync .md/.txt"| FS["Local Notes Folder"]
     AG -->|"Reply"| TTS["Groq Orpheus TTS\n(orpheus-v1-english)"]
     TTS -->|"Fallback on offline/429"| LOCAL["Windows / Edge Speech"]
@@ -39,6 +39,9 @@ flowchart LR
   - **Notebooks & Filtering**: Organize notes into folders (`Lectures`, `Projects`, `Study`, `Personal`, `Ideas`, or custom notebooks), filter by pinned or `#tag`, search across summaries/titles/bodies, and sort by Updated, Created, or Title.
   - **✨ Organize with AI & Auto-Structured Voice Notes**: 1-click button (`Structured`, `Lecture Note`, `Concise TL;DR`) turns messy voice transcripts into crisp Markdown headings, bullets, summaries, tags, and follow-up checklists; Voice Agent also auto-structures dictated notes.
   - **Subfolder Sync**: Bidirectional synchronization with a local `.md`/`.txt` folder (mapping subfolders to note notebooks).
+- **⏱️ Focus / Study Timer & Session History (`Alt+4`)**:
+  - **Countdown / Pomodoro (`25/5`, `50/10`, `90/15`, or custom) & Open Stopwatch** with live top-bar timer pill visible across every view and gentle WebAudio completion chime.
+  - **Tagging, Linking & Stats**: Categorize by subject (`Study`, `Lectures`, `Coding`, `Projects`, `Art`, `Reading`, `Research`, or custom), link sessions to any **Active Task** or **Note**, log past sessions manually, track streaks & 7-day charts, and control everything by voice (*"Start a 25 minute coding timer"*, *"I studied neural nets for 90 minutes"*).
 - **🏋️ Simple Gym Tracker**:
   - 1-click **"Went to Gym Today"** toggle, monthly consistency calendar, fast sets/reps/weight logger (auto-marks Gym Day), 1-click repeat last set, and Personal Best history — zero routine-builder clutter.
 - **🎨 Simple Art & 🎮 Gaming Trackers**:
@@ -74,7 +77,7 @@ All personal data stays outside this repository in:
    .\.venv\Scripts\python.exe run_app.py
    ```
 3. **Configure Groq Free API**:
-   - Open **⚙️ Settings** (`Alt+8`), paste your free API key from [Groq Console](https://console.groq.com/keys), click **Test Key**, and click **Save Settings**.
+   - Open **⚙️ Settings** (`Alt+9`), paste your free API key from [Groq Console](https://console.groq.com/keys), click **Test Key**, and click **Save Settings**.
    - *(Everything also works offline via deterministic fallback heuristics if no key is configured.)*
 
 ---
@@ -88,7 +91,7 @@ All personal data stays outside this repository in:
 | `Ctrl+Space` | Start or stop voice recording (when not typing in a field) |
 | `Esc` | Cancel active voice recording or close image modal |
 | `Ctrl+S` | Save current or new note (when in Notes view) |
-| `Alt+1` .. `Alt+8` | Jump to Hub, Tasks, Notes, Gym, Art, Gaming, Voice Agent, or Settings |
+| `Alt+1` .. `Alt+9` | Jump to Hub, Tasks, Notes, Focus Timer, Gym, Art, Gaming, Voice Agent, or Settings |
 
 ---
 
@@ -99,4 +102,4 @@ All personal data stays outside this repository in:
 .\.venv\Scripts\python.exe run_app.py --smoke-test
 ```
 
-For deeper technical details (agent loop, 19-tool catalog, SQLite ER schema, RMS VAD, and extending TTS with Google TTS), see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+For deeper technical details (agent loop, 22-tool catalog, SQLite ER schema, RMS VAD, and extending TTS with Google TTS), see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

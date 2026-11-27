@@ -10,7 +10,7 @@ Instead of pulling in LangChain/LangGraph abstractions, `app/agent.py` + `app/to
 
 1. **Session Context Assembly**: Loads the active session from `agent_sessions` and the last 12 `agent_messages`, injecting compact `[Executed actions: domain #id: label]` annotations onto prior assistant messages so follow-up voice turns (*"check off the first item on that lecture note"*) resolve exact database IDs across turns.
 2. **Bounded Tool Loop (`MAX_TOOL_ROUNDS = 12`)**:
-   - Sends messages + 19 JSON tool schemas (`tools.TOOL_SCHEMAS`) + a 14-day local calendar context to `openai/gpt-oss-120b` (with automatic fallback to `qwen/qwen3.8-27b`, `openai/gpt-oss-20b`, and dynamic `/models` discovery on HTTP `404`).
+   - Sends messages + 22 JSON tool schemas (`tools.TOOL_SCHEMAS`) + a 14-day local calendar context to `openai/gpt-oss-120b` (with automatic fallback to `qwen/qwen3.8-27b`, `openai/gpt-oss-20b`, and dynamic `/models` discovery on HTTP `404`).
    - Executes returned `tool_calls` synchronously in `app/tools.py`, appends structured JSON results as `"tool"` messages, and collects UI badges (`action_badge`) and navigation triggers (`navigate_to`).
    - When the model returns a natural-language response, persists both the reply and action metadata into SQLite and returns `is_question` so the UI knows whether to speak clarifications aloud.
 3. **Offline Fallback**: When no Groq key is present (or the network is unreachable), `_offline_agent_fallback` handles checklist task syntax (`steps: ...`), tagged lecture notes, gym sets, and quick captures cleanly.
@@ -38,8 +38,11 @@ Instead of pulling in LangChain/LangGraph abstractions, `app/agent.py` + `app/to
 | `get_gym_stats` | Retrieve recent workout logs and Personal Bests per exercise |
 | `upsert_art` | Mark Art Day and/or create or update an Idea, WIP, or Finished piece |
 | `upsert_game` | Create or update game status, platform, rating (`1–10`), and notes |
-| `navigate_ui` | Switch the WebView2 desktop view (`hub`, `tasks`, `notes`, `gym`, `art`, `gaming`, `ask`, `settings`) |
-| `delete_item` | Safely delete an item — requires `confirmed=true` after explicit user confirmation |
+| `control_study_timer` | Start/pause/resume/stop/reset countdown or stopwatch timer linked to a task or note |
+| `log_study_session` | Log a completed study/focus session with duration, subject, topic, and optional task/note link |
+| `get_study_stats` | Retrieve live timer state, today/7d/all-time focus hours, streak, subject breakdown, and sessions |
+| `navigate_ui` | Switch the WebView2 desktop view (`hub`, `tasks`, `notes`, `timer`, `gym`, `art`, `gaming`, `ask`, `settings`) |
+| `delete_item` | Safely delete a task, note, gym log, art item, game, or study session — requires `confirmed=true` |
 
 ---
 
@@ -50,6 +53,8 @@ Databases use `PRAGMA journal_mode=WAL` and `PRAGMA foreign_keys=ON`. `_migrate_
 ```mermaid
 erDiagram
     tasks ||--o{ task_items : "has checklist steps"
+    tasks ||--o{ study_sessions : "optional task link"
+    notes ||--o{ study_sessions : "optional note link"
     agent_sessions ||--o{ agent_messages : "contains turns"
 
     tasks {
@@ -79,6 +84,26 @@ erDiagram
         text content "Structured Markdown + - [ ] checklists"
         text tags "JSON array"
         text source_path "Optional synced .md/.txt path"
+    }
+    study_sessions {
+        int id PK
+        text subject
+        text topic
+        text mode "countdown | stopwatch | manual"
+        int duration_seconds
+        text date
+        int task_id FK "ON DELETE SET NULL"
+        int note_id FK "ON DELETE SET NULL"
+    }
+    active_timer {
+        int id PK "Singleton row id = 1"
+        int active
+        int paused
+        text mode "countdown | stopwatch"
+        text phase "focus | break"
+        int target_seconds
+        int accumulated_seconds
+        real started_at_epoch
     }
     agent_sessions {
         int id PK
