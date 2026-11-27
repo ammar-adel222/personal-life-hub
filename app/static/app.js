@@ -28,7 +28,9 @@ const state = {
   currentAudio: null,
   dashboard: null,
   tasks: [],
+  taskTab: "today",
   taskFilter: "all",
+  expandedTaskNotes: {},
   notes: [],
   noteFolders: null,
   noteTags: [],
@@ -568,10 +570,18 @@ function taskMetaBadges(t) {
   const parentBadge = t.parent_task_title
     ? `<span class="badge badge-parent">🔗 Part of: ${esc(t.parent_task_title)}${t.parent_item_text ? ` ↳ ${esc(t.parent_item_text)}` : ""}</span>`
     : "";
+  const pctBadge = t.effective_progress_mode === "percent" && !t.is_today_task
+    ? `<span class="badge badge-accent">📊 ${Number(t.progress_percent || 0)}%</span>`
+    : "";
+  const noteBadge = t.note_title
+    ? `<span class="badge">📝 ${esc(t.note_title.slice(0, 26))}</span>`
+    : "";
   return `
     ${taskStatusBadge(t)}
     ${parentBadge}
     ${dailyBadge}
+    ${pctBadge}
+    ${noteBadge}
     ${t.checklist_total ? `<span class="badge">${t.checklist_done}/${t.checklist_total} steps</span>` : ""}
     ${t.timeline ? `<span class="badge badge-accent">🗓️ ${esc(t.timeline)}</span>` : ""}
     ${t.frequency ? `<span class="badge badge-gym">🔁 ${esc(t.frequency)}</span>` : ""}
@@ -855,19 +865,18 @@ async function renderTasks() {
   const want = items.filter((t) => t.list_type === "want_to_do" && filterMatches(t));
 
   const todayDoneCnt = allTodayAll.filter((t) => t.done).length;
-  const recGoals = allDaily.filter((t) => t.is_recurring && !t.is_today_task);
-  const recDoneTodayCnt = recGoals.filter((t) => t.done_today).length;
-
+  const activeTabItems = state.taskTab === "today" ? allTodayAll : allGoalsAll;
   const counts = {
-    all: items.length,
-    not_started: items.filter((t) => t.status === "not_started").length,
-    partially_completed: items.filter((t) => t.status === "partially_completed").length,
-    completed: items.filter((t) => t.status === "completed").length,
+    all: activeTabItems.length,
+    not_started: activeTabItems.filter((t) => t.status === "not_started").length,
+    partially_completed: activeTabItems.filter((t) => t.status === "partially_completed").length,
+    completed: activeTabItems.filter((t) => t.status === "completed").length,
   };
 
   const renderTaskRow = (t, { isWant = false, isToday = false, isGoal = false } = {}) => {
-    const pct = t.checklist_total ? Math.round((t.checklist_done / t.checklist_total) * 100) : 0;
-    const daysPct = t.is_recurring && t.target_days > 0
+    const mode = t.effective_progress_mode || "percent";
+    const stepPct = t.checklist_total ? Math.round((t.checklist_done / t.checklist_total) * 100) : 0;
+    const daysPct = t.target_days > 0
       ? Math.min(100, Math.round((t.days_completed / t.target_days) * 100))
       : null;
 
@@ -884,16 +893,125 @@ async function renderTasks() {
         </select>`
       : "";
 
-    const doneTodayBtn = isGoal && t.is_recurring
-      ? `<button type="button" class="btn btn-xs btn-done-today ${t.done_today ? "active" : ""}" data-done-today="${t.id}" title="Mark today's daily session done">${t.done_today ? "✓ Done Today" : "○ Done Today"}</button>`
-      : "";
-
     const addTodayChildBtn = isGoal && !t.done
       ? `<button type="button" class="btn btn-xs btn-ghost" data-add-child="${t.id}" title="Add a to-do under this goal for today">+ Today</button>`
       : "";
 
     const studyBtn = !isWant && !t.done
       ? `<button type="button" class="btn btn-xs btn-ghost" data-study-task="${t.id}" title="Start Focus Timer linked to this task">⏱️</button>`
+      : "";
+
+    const hasLinkedNote = Boolean(t.note_id);
+    const noteDrawerOpen = Boolean(state.expandedTaskNotes[t.id]);
+    const noteToggleBtn = `<button type="button" class="btn btn-xs ${hasLinkedNote ? "btn-primary" : "btn-ghost"}" data-toggle-task-note="${t.id}" title="${hasLinkedNote ? `Connected note: ${esc(t.note_title)}` : "Record notes connected to this task"}">${hasLinkedNote ? "📝 Note ✓" : "📝 Note"}</button>`;
+
+    const modeSwitcherHtml = isGoal
+      ? `<div class="mode-mini-switch">
+          <button type="button" class="mode-mini-btn ${mode === "percent" ? "active" : ""}" data-set-mode="${t.id}" data-mode="percent" title="Non-countable progress bar & log">📊 Bar</button>
+          <button type="button" class="mode-mini-btn ${mode === "days" ? "active" : ""}" data-set-mode="${t.id}" data-mode="days" title="Daily countable checkboxes">📅 Days</button>
+          <button type="button" class="mode-mini-btn ${mode === "checklist" ? "active" : ""}" data-set-mode="${t.id}" data-mode="checklist" title="Step checklist">☑️ Steps</button>
+        </div>`
+      : "";
+
+    let trackingBodyHtml = "";
+    if (isGoal || (!isWant && mode === "days")) {
+      if (mode === "days") {
+        const slots = t.day_slots || [];
+        trackingBodyHtml = `
+          ${daysPct !== null ? `<div class="progress-bar" title="${t.days_completed}/${t.target_days} days"><div class="progress-fill" style="width:${daysPct}%;background:var(--gym);"></div></div>` : ""}
+          <div class="day-checks-grid">
+            ${slots
+              .map(
+                (slot) => `
+              <label class="day-check-pill ${slot.done ? "done" : ""} ${slot.is_today ? "is-today" : ""}" title="${esc(slot.date)}">
+                <input type="checkbox" class="checkbox" data-day-slot-task="${t.id}" data-day-date="${esc(slot.date)}" ${slot.done ? "checked" : ""} />
+                <span>D${slot.day_num} · ${esc(slot.label)}</span>
+              </label>`
+              )
+              .join("")}
+          </div>
+          ${
+            t.daily_target_minutes > 0
+              ? `<div style="font-size:11.5px;color:var(--muted);margin-top:5px;">Daily study target: <strong style="color:var(--text);">${esc(formatDurationHuman(t.study_seconds_today))}</strong> / ${t.daily_target_minutes}m today</div>`
+              : ""
+          }`;
+      } else if (mode === "percent") {
+        const pctVal = Number(t.progress_percent || 0);
+        const logs = (t.progress_logs || []).slice(0, 4);
+        trackingBodyHtml = `
+          <div class="progress-control-box">
+            <div class="progress-slider-row">
+              <strong style="min-width:38px;color:var(--accent-hover);">${pctVal}%</strong>
+              <div class="progress-bar" style="flex:1;margin:0;min-width:120px;"><div class="progress-fill" style="width:${pctVal}%;"></div></div>
+              <button type="button" class="btn btn-xs btn-ghost" data-prog-delta="${t.id}" data-delta="10">+10%</button>
+              <button type="button" class="btn btn-xs btn-ghost" data-prog-delta="${t.id}" data-delta="25">+25%</button>
+            </div>
+            <div class="progress-slider-row">
+              <input type="range" min="0" max="100" step="5" value="${pctVal}" class="progress-slider" data-prog-slider="${t.id}" />
+            </div>
+            <form class="inline-form" data-prog-form="${t.id}" style="margin:0;">
+              <input class="input grow" name="prog_note" type="text" placeholder="Record improvement or milestone on this task…" />
+              <input class="input" name="prog_pct" type="number" min="0" max="100" value="${pctVal}" style="width:70px;" title="Percent (0-100)" />
+              <button type="submit" class="btn btn-xs btn-primary">Log Progress</button>
+            </form>
+            ${
+              logs.length
+                ? `<div class="progress-log-list">
+                    ${logs
+                      .map(
+                        (lg) =>
+                          `<div><span class="badge">${lg.progress_percent}%</span> <span>${esc((lg.created_at || "").slice(0, 10))}</span>${lg.note ? ` — <span style="color:var(--text);">${esc(lg.note)}</span>` : ""}</div>`
+                      )
+                      .join("")}
+                  </div>`
+                : ""
+            }
+          </div>`;
+      }
+    }
+
+    if (mode === "checklist" || (!isGoal && t.checklist_total > 0)) {
+      trackingBodyHtml += `
+        ${t.checklist_total ? `<div class="progress-bar"><div class="progress-fill" style="width:${stepPct}%"></div></div>` : ""}
+        <div class="checklist-box">
+          ${(t.checklist_items || [])
+            .map(
+              (sub) => `
+            <div class="sub-item-row ${sub.done ? "done" : ""}">
+              <input type="checkbox" class="checkbox" data-sub-toggle="${t.id}" data-sub-id="${sub.id}" ${sub.done ? "checked" : ""} />
+              <span style="flex:1">${esc(sub.text)}</span>
+              <button type="button" class="btn btn-xs btn-ghost" data-sub-del="${t.id}" data-sub-id="${sub.id}" title="Remove step">✕</button>
+            </div>`
+            )
+            .join("")}
+          <form class="sub-add-form" data-sub-add-form="${t.id}">
+            <input class="input" type="text" placeholder="+ Add checklist step…" />
+            <button type="submit" class="btn btn-xs btn-ghost">Add</button>
+          </form>
+        </div>`;
+    }
+
+    const noteDrawerHtml = noteDrawerOpen || hasLinkedNote
+      ? `<div class="task-note-drawer" ${noteDrawerOpen ? "" : 'style="padding:7px 10px;"'}>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+            <span style="font-size:12px;">
+              ${
+                hasLinkedNote
+                  ? `<strong>📝 Connected Note:</strong> ${esc(t.note_title)}${t.note_preview ? ` <span style="color:var(--muted);">— ${esc(t.note_preview)}</span>` : ""}`
+                  : `<span style="color:var(--muted);">No connected note yet — recording below automatically creates &amp; links one in Notes.</span>`
+              }
+            </span>
+            <button type="button" class="btn btn-xs btn-ghost" data-open-task-note="${t.id}">Open in Notes ↗</button>
+          </div>
+          ${
+            noteDrawerOpen
+              ? `<form class="inline-form" data-task-note-form="${t.id}" style="margin:0;">
+                  <input class="input grow" name="task_note_text" type="text" placeholder="Write a quick note for this task (saved directly to its Markdown note)…" required />
+                  <button type="submit" class="btn btn-xs btn-primary">Save Note</button>
+                </form>`
+              : ""
+          }
+        </div>`
       : "";
 
     return `
@@ -905,48 +1023,22 @@ async function renderTasks() {
         <div class="row-main">
           <div class="row-title">${esc(t.title)}</div>
           <div class="row-meta">${taskMetaBadges(t)}</div>
-          ${
-            daysPct !== null
-              ? `<div class="progress-bar" title="${t.days_completed}/${t.target_days} days"><div class="progress-fill" style="width:${daysPct}%;background:var(--gym);"></div></div>`
-              : (t.checklist_total
-                ? `<div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>`
-                : "")
-          }
-          ${
-            t.daily_target_minutes > 0 && isGoal
-              ? `<div style="font-size:11.5px;color:var(--muted);margin-top:4px;">Daily study target: <strong style="color:var(--text);">${esc(formatDurationHuman(t.study_seconds_today))}</strong> / ${t.daily_target_minutes}m today</div>`
-              : ""
-          }
+          ${modeSwitcherHtml}
+          ${trackingBodyHtml}
+          ${noteDrawerHtml}
         </div>
         <div class="row-actions" style="flex-wrap:wrap;justify-content:flex-end;">
-          ${doneTodayBtn}
+          ${noteToggleBtn}
           ${studyBtn}
           ${addTodayChildBtn}
           ${parentSelectHtml}
           ${
             isWant
-              ? `<button class="btn btn-xs btn-ghost" data-move-list="${t.id}" data-target="daily" title="Move to Active Tasks">→ Active</button>`
-              : `<button class="btn btn-xs btn-ghost" data-move-list="${t.id}" data-target="want_to_do" title="Move to Want to Do">→ Someday</button>`
+              ? `<button class="btn btn-xs btn-ghost" data-move-list="${t.id}" data-target="daily" title="Move to Tasks">→ Tasks</button>`
+              : `<button class="btn btn-xs btn-ghost" data-move-list="${t.id}" data-target="want_to_do" title="Move to Someday">→ Someday</button>`
           }
           <button class="btn btn-xs btn-danger" data-del-task="${t.id}" title="Delete">✕</button>
         </div>
-      </div>
-
-      <div class="checklist-box">
-        ${(t.checklist_items || [])
-          .map(
-            (sub) => `
-          <div class="sub-item-row ${sub.done ? "done" : ""}">
-            <input type="checkbox" class="checkbox" data-sub-toggle="${t.id}" data-sub-id="${sub.id}" ${sub.done ? "checked" : ""} />
-            <span style="flex:1">${esc(sub.text)}</span>
-            <button type="button" class="btn btn-xs btn-ghost" data-sub-del="${t.id}" data-sub-id="${sub.id}" title="Remove step">✕</button>
-          </div>`
-          )
-          .join("")}
-        <form class="sub-add-form" data-sub-add-form="${t.id}">
-          <input class="input" type="text" placeholder="+ Add checklist step…" />
-          <button type="submit" class="btn btn-xs btn-ghost">Add</button>
-        </form>
       </div>
     </div>`;
   };
@@ -958,15 +1050,16 @@ async function renderTasks() {
     { key: "completed", label: "✓ Completed" },
   ];
 
+  const isTodayTab = state.taskTab === "today";
   const el = document.getElementById("view-tasks");
   el.innerHTML = `
     <div class="view-header">
       <div>
-        <h1 class="view-title">✅ Tasks, Daily Habits &amp; Goals</h1>
-        <p class="view-sub">Today's tasks automatically link to larger goals &amp; daily habits — checking off Today's step updates the parent progress</p>
+        <h1 class="view-title">✅ Tasks</h1>
+        <p class="view-sub">Switch between Tasks for Today and Tasks in General — with daily checkboxes, progress bars, and connected Notes</p>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <button id="tasks-auto-link-btn" type="button" class="btn btn-ghost btn-sm" title="Scan Today's tasks and connect them to matching larger goals">
+        <button id="tasks-auto-link-btn" type="button" class="btn btn-ghost btn-sm" title="Scan Today's tasks and connect them to matching General tasks">
           🔗 Auto-Link Today's Tasks
         </button>
       </div>
@@ -974,17 +1067,26 @@ async function renderTasks() {
 
     <div class="stat-strip">
       <div class="stat-card">
-        <span class="stat-label">📌 Today's To-Do</span>
+        <span class="stat-label">📌 Tasks for Today</span>
         <span class="stat-value">${todayDoneCnt} / ${allTodayAll.length} <span style="font-size:13px;color:var(--muted)">done</span></span>
       </div>
       <div class="stat-card">
-        <span class="stat-label">🔁 Daily Goals Done Today</span>
-        <span class="stat-value" style="color:var(--gym)">${recDoneTodayCnt} / ${recGoals.length}</span>
+        <span class="stat-label">🎯 Tasks in General</span>
+        <span class="stat-value" style="color:var(--gym)">${allGoalsAll.filter((t) => !t.done).length} <span style="font-size:13px;color:var(--muted)">active (${allGoalsAll.length} total)</span></span>
       </div>
       <div class="stat-card" id="tasks-study-card" style="cursor:pointer" title="Open Focus Timer (Alt+4)">
         <span class="stat-label">⏱️ Studied Today</span>
         <span id="tasks-study-today-val" class="stat-value" style="color:var(--accent-hover)">${esc(formatDurationHuman(stats.today_seconds || 0))} <span style="font-size:13px;color:var(--muted)">(${stats.today_sessions_count || 0} sessions)</span></span>
       </div>
+    </div>
+
+    <div class="task-primary-tabs">
+      <button type="button" class="task-primary-tab ${isTodayTab ? "active" : ""}" data-task-tab="today">
+        📌 Tasks for Today <span class="badge badge-accent">${allTodayAll.length}</span>
+      </button>
+      <button type="button" class="task-primary-tab ${!isTodayTab ? "active" : ""}" data-task-tab="general">
+        🎯 Tasks in General <span class="badge badge-gym">${allGoalsAll.length}</span>
+      </button>
     </div>
 
     <div class="tab-bar">
@@ -999,65 +1101,73 @@ async function renderTasks() {
     </div>
 
     <div class="tasks-sections-wrap">
-      <div class="card">
-        <div class="card-header">
-          <h2 class="card-title">📌 Today's To-Do List <span class="badge badge-accent">${todayTasks.filter((x) => !x.done).length} open</span></h2>
-        </div>
-        <form id="form-today-task" class="inline-form">
-          <input id="today-title" class="input grow" type="text" placeholder="Today's task… e.g. LeetCode today (30m) — auto-detects parent goal" required />
-          ${
-            parentCandidates.length
-              ? `<select id="today-parent-select">
-                  <option value="">Auto-detect parent goal</option>
-                  ${parentCandidates.map((p) => `<option value="${p.id}">🔗 ${esc(p.title)}</option>`).join("")}
-                </select>`
-              : ""
-          }
-          <button type="submit" class="btn btn-primary btn-sm">+ Add Today</button>
-        </form>
-        <div class="item-list">
-          ${todayTasks.length ? todayTasks.map((t) => renderTaskRow(t, { isToday: true })).join("") : '<div class="empty-state">No Today tasks yet — add one above, speak via Voice Agent, or click + Today on any goal below.</div>'}
-        </div>
-      </div>
+      ${
+        isTodayTab
+          ? `
+            <div class="card">
+              <div class="card-header">
+                <h2 class="card-title">📌 Tasks for Today <span class="badge badge-accent">${todayTasks.filter((x) => !x.done).length} open</span></h2>
+              </div>
+              <form id="form-today-task" class="inline-form">
+                <input id="today-title" class="input grow" type="text" placeholder="Today's task… e.g. LeetCode today (30m) — auto-links to general tasks" required />
+                ${
+                  parentCandidates.length
+                    ? `<select id="today-parent-select">
+                        <option value="">Auto-detect general task</option>
+                        ${parentCandidates.map((p) => `<option value="${p.id}">🔗 ${esc(p.title)}</option>`).join("")}
+                      </select>`
+                    : ""
+                }
+                <button type="submit" class="btn btn-primary btn-sm">+ Add for Today</button>
+              </form>
+              <div class="item-list">
+                ${todayTasks.length ? todayTasks.map((t) => renderTaskRow(t, { isToday: true })).join("") : '<div class="empty-state">No tasks for today yet — add one above, or click + Today inside Tasks in General.</div>'}
+              </div>
+            </div>
+          `
+          : `
+            <div class="card">
+              <div class="card-header">
+                <h2 class="card-title">🎯 Tasks in General <span class="badge badge-gym">${goalTasks.filter((x) => !x.done).length} active</span></h2>
+              </div>
+              <form id="form-general-task" class="inline-form">
+                <input id="daily-title" class="input grow" type="text" placeholder="General task… e.g. 'Graduation Project Surveys' or 'LeetCode 1h daily for 10 days'" required />
+                <select id="gen-mode" title="Progress style" style="width:155px;">
+                  <option value="auto">Auto progress style</option>
+                  <option value="percent">📊 Progress bar</option>
+                  <option value="days">📅 Daily checkboxes</option>
+                  <option value="checklist">☑️ Step checklist</option>
+                </select>
+                <input id="daily-timeline" class="input" type="text" placeholder="Timeline (e.g. Next 10 days)" style="width:155px" />
+                <input id="daily-frequency" class="input" type="text" placeholder="Daily target / notes" style="width:145px" />
+                <input id="daily-steps" class="input grow" type="text" placeholder="Steps (comma-separated, if checklist)" />
+                <select id="daily-priority">
+                  <option value="normal">Normal</option>
+                  <option value="high">High</option>
+                </select>
+                <input id="daily-due" class="input" type="date" title="Due date" />
+                <button type="submit" class="btn btn-primary btn-sm">+ Add General Task</button>
+              </form>
+              <div class="item-list">
+                ${goalTasks.length ? goalTasks.map((t) => renderTaskRow(t, { isGoal: true })).join("") : '<div class="empty-state">No general tasks or ongoing projects yet.</div>'}
+              </div>
+            </div>
 
-      <div class="grid-2">
-        <div class="card">
-          <div class="card-header">
-            <h2 class="card-title">🎯 Larger Goals &amp; Daily Habits <span class="badge badge-gym">${goalTasks.filter((x) => !x.done).length} active</span></h2>
-          </div>
-          <form id="form-daily-task" class="inline-form">
-            <input id="daily-title" class="input grow" type="text" placeholder="Goal or daily habit… e.g. LeetCode 1h daily for next 10 days" required />
-            <input id="daily-steps" class="input grow" type="text" placeholder="Steps (comma-separated, optional)" />
-            <input id="daily-timeline" class="input" type="text" placeholder="Timeline (e.g. Next 10 days)" style="width:155px" />
-            <input id="daily-frequency" class="input" type="text" placeholder="Daily target (e.g. 1 hour / day)" style="width:165px" />
-            <label class="check-row" style="font-size:12px;"><input id="daily-recurring-check" type="checkbox" class="checkbox" /> Daily habit</label>
-            <select id="daily-priority">
-              <option value="normal">Normal</option>
-              <option value="high">High</option>
-            </select>
-            <input id="daily-due" class="input" type="date" title="Due date" />
-            <button type="submit" class="btn btn-primary btn-sm">Add Goal</button>
-          </form>
-          <div class="item-list">
-            ${goalTasks.length ? goalTasks.map((t) => renderTaskRow(t, { isGoal: true })).join("") : '<div class="empty-state">No multi-day plans or daily habits yet.</div>'}
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-header">
-            <h2 class="card-title">🌟 Want to Do / Someday <span class="badge">${want.filter((x) => !x.done).length} open</span></h2>
-          </div>
-          <form id="form-want-task" class="inline-form">
-            <input id="want-title" class="input grow" type="text" placeholder="Thing you want to do…" required />
-            <input id="want-steps" class="input grow" type="text" placeholder="Checklist steps (optional)" />
-            <input id="want-cat" class="input" type="text" placeholder="Tag" style="width:100px" />
-            <button type="submit" class="btn btn-primary btn-sm">Add</button>
-          </form>
-          <div class="item-list">
-            ${want.length ? want.map((t) => renderTaskRow(t, { isWant: true })).join("") : '<div class="empty-state">No matching someday items.</div>'}
-          </div>
-        </div>
-      </div>
+            <details class="card someday-details">
+              <summary>🌟 Want to Do / Someday (${want.filter((x) => !x.done).length} open · ${want.length} total)</summary>
+              <div style="margin-top:10px;display:flex;flex-direction:column;gap:10px;">
+                <form id="form-want-task" class="inline-form">
+                  <input id="want-title" class="input grow" type="text" placeholder="Thing you want to do someday…" required />
+                  <input id="want-cat" class="input" type="text" placeholder="Tag" style="width:100px" />
+                  <button type="submit" class="btn btn-primary btn-sm">Add</button>
+                </form>
+                <div class="item-list">
+                  ${want.length ? want.map((t) => renderTaskRow(t, { isWant: true })).join("") : '<div class="empty-state">No someday items yet.</div>'}
+                </div>
+              </div>
+            </details>
+          `
+      }
     </div>
   `;
 
@@ -1065,12 +1175,19 @@ async function renderTasks() {
 
   el.querySelector("#tasks-study-card")?.addEventListener("click", () => switchView("timer"));
 
+  el.querySelectorAll("[data-task-tab]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      state.taskTab = btn.dataset.taskTab;
+      await renderTasks();
+    });
+  });
+
   el.querySelector("#tasks-auto-link-btn")?.addEventListener("click", async () => {
     const res = await api("/api/tasks/auto-link", { method: "POST" });
     if (res.count > 0) {
-      toast(`🔗 Linked ${res.count} Today task${res.count === 1 ? "" : "s"} to parent goals!`, "success");
+      toast(`🔗 Linked ${res.count} Today task${res.count === 1 ? "" : "s"} to general tasks!`, "success");
     } else if (res.ambiguous?.length) {
-      toast(`${res.ambiguous.length} task(s) had multiple or unsure matches — pick a parent in the dropdown or ask Voice Agent.`, "info");
+      toast(`${res.ambiguous.length} task(s) had unsure matches — link via dropdown or ask Voice Agent.`, "info");
     } else {
       toast("All Today tasks are already organized.", "info");
     }
@@ -1106,31 +1223,32 @@ async function renderTasks() {
     if (created?.parent_task_title) {
       toast(`Linked "${created.title}" under "${created.parent_task_title}"`, "success");
     } else if (created?.possible_parents?.length) {
-      toast(`Possible parent match: "${created.possible_parents[0].title}" — link via dropdown if related.`, "info");
+      toast(`Possible general task match: "${created.possible_parents[0].title}" — link via dropdown if related.`, "info");
     }
     await renderTasks();
   });
 
-  el.querySelector("#form-daily-task")?.addEventListener("submit", async (e) => {
+  el.querySelector("#form-general-task")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     const title = el.querySelector("#daily-title").value.trim();
     if (!title) return;
+    const pMode = el.querySelector("#gen-mode")?.value || "auto";
     const rawSteps = el.querySelector("#daily-steps").value;
     const checklistItems = rawSteps
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
-    const isRec = Boolean(el.querySelector("#daily-recurring-check")?.checked);
     await api("/api/tasks", {
       method: "POST",
       body: {
         title,
         list_type: "daily",
+        progress_mode: pMode,
+        is_recurring: pMode === "days" ? true : null,
         priority: el.querySelector("#daily-priority").value,
         due_date: el.querySelector("#daily-due").value || null,
         timeline: el.querySelector("#daily-timeline").value.trim(),
         frequency: el.querySelector("#daily-frequency").value.trim(),
-        is_recurring: isRec ? true : null,
         checklist_items: checklistItems,
         auto_link_parent: false,
       },
@@ -1142,31 +1260,108 @@ async function renderTasks() {
     e.preventDefault();
     const title = el.querySelector("#want-title").value.trim();
     if (!title) return;
-    const rawSteps = el.querySelector("#want-steps").value;
-    const checklistItems = rawSteps
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
     await api("/api/tasks", {
       method: "POST",
       body: {
         title,
         list_type: "want_to_do",
-        category: el.querySelector("#want-cat").value.trim(),
-        checklist_items: checklistItems,
+        category: el.querySelector("#want-cat")?.value.trim() || "",
       },
     });
     await renderTasks();
   });
 
-  el.querySelectorAll("[data-done-today]").forEach((btn) => {
+  el.querySelectorAll("[data-set-mode]").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      const res = await api(`/api/tasks/${btn.dataset.doneToday}/done-today`, { method: "POST", body: {} });
-      const it = res.item;
-      if (it?.done_today) {
-        const sfx = it.target_days ? ` (${it.days_completed}/${it.target_days} days)` : "";
-        toast(`✓ Marked "${it.title}" Done Today!${sfx}`, "success");
+      await api(`/api/tasks/${btn.dataset.setMode}`, {
+        method: "PATCH",
+        body: { progress_mode: btn.dataset.mode },
+      });
+      await renderTasks();
+    });
+  });
+
+  el.querySelectorAll("[data-day-slot-task]").forEach((cb) => {
+    cb.addEventListener("change", async () => {
+      await api(`/api/tasks/${cb.dataset.daySlotTask}/done-today`, {
+        method: "POST",
+        body: { date: cb.dataset.dayDate, done: cb.checked },
+      });
+      await renderTasks();
+    });
+  });
+
+  el.querySelectorAll("[data-prog-delta]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      await api(`/api/tasks/${btn.dataset.progDelta}/progress`, {
+        method: "POST",
+        body: { delta_percent: Number(btn.dataset.delta || 10), note: "" },
+      });
+      await renderTasks();
+    });
+  });
+
+  el.querySelectorAll("[data-prog-slider]").forEach((slider) => {
+    slider.addEventListener("change", async () => {
+      await api(`/api/tasks/${slider.dataset.progSlider}/progress`, {
+        method: "POST",
+        body: { progress_percent: Number(slider.value || 0), note: "" },
+      });
+      await renderTasks();
+    });
+  });
+
+  el.querySelectorAll("[data-prog-form]").forEach((form) => {
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const tid = form.dataset.progForm;
+      const note = form.querySelector("[name=prog_note]").value.trim();
+      const pctInput = form.querySelector("[name=prog_pct]").value;
+      const res = await api(`/api/tasks/${tid}/progress`, {
+        method: "POST",
+        body: {
+          progress_percent: pctInput !== "" ? Number(pctInput) : null,
+          note,
+        },
+      });
+      notifyParentRollup(res.item);
+      toast(`Logged ${res.item.progress_percent}% progress`, "success");
+      await renderTasks();
+    });
+  });
+
+  el.querySelectorAll("[data-toggle-task-note]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const tid = btn.dataset.toggleTaskNote;
+      state.expandedTaskNotes[tid] = !state.expandedTaskNotes[tid];
+      await renderTasks();
+    });
+  });
+
+  el.querySelectorAll("[data-open-task-note]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const res = await api(`/api/tasks/${btn.dataset.openTaskNote}/open-note`, { method: "POST" });
+      if (res?.note) {
+        state.notesFolder = "all";
+        state.notesTag = "";
+        state.notesQuery = "";
+        state.noteDraft = null;
+        state.activeNoteId = res.note.id;
+        state.noteEditorMode = res.created ? "edit" : "read";
+        await switchView("notes");
       }
+    });
+  });
+
+  el.querySelectorAll("[data-task-note-form]").forEach((form) => {
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const tid = form.dataset.taskNoteForm;
+      const inp = form.querySelector("[name=task_note_text]");
+      const text = inp.value.trim();
+      if (!text) return;
+      await api(`/api/tasks/${tid}/notes`, { method: "POST", body: { text } });
+      toast("Saved note connected to task!", "success");
       await renderTasks();
     });
   });
@@ -1207,7 +1402,8 @@ async function renderTasks() {
           parent_task_id: parentObj.id,
         },
       });
-      toast(`Added Today task under "${parentObj.title}"`, "success");
+      toast(`Added to Tasks for Today under "${parentObj.title}"`, "success");
+      state.taskTab = "today";
       await renderTasks();
     });
   });
@@ -1950,6 +2146,19 @@ async function renderNotes() {
 
           <!-- Summary Banner (Read) or Summary Field (Edit/Split) -->
           ${
+            active && active.linked_tasks && active.linked_tasks.length
+              ? `<div class="linked-task-bar">
+                  <span style="font-size:12px;color:var(--muted);">Connected tasks:</span>
+                  ${active.linked_tasks
+                    .map(
+                      (lt) =>
+                        `<button type="button" class="tag-chip" data-jump-linked-task-tab="${lt.is_today_task ? "today" : "general"}" title="Jump to Tasks">✅ ${esc(lt.title)}</button>`
+                    )
+                    .join("")}
+                </div>`
+              : ""
+          }
+          ${
             editorMode === "read"
               ? draft.summary
                 ? `<div class="note-summary-banner"><strong>✨ Summary:</strong> ${esc(draft.summary)}</div>`
@@ -2043,6 +2252,13 @@ async function renderNotes() {
       state.noteDraft = null;
       if (state.activeNoteId === -1) state.activeNoteId = null;
       await renderNotes();
+    });
+  });
+
+  el.querySelectorAll("[data-jump-linked-task-tab]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      state.taskTab = btn.dataset.jumpLinkedTaskTab === "today" ? "today" : "general";
+      await switchView("tasks");
     });
   });
 
