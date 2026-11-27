@@ -39,34 +39,39 @@
           <span>Focus Timer</span>
           <kbd>4</kbd>
         </button>
-        <button class="nav-item" data-view="gym" title="Alt+5">
-          <span class="nav-icon">🏋️</span>
-          <span>Gym</span>
+        <button class="nav-item" data-view="watchlist" title="Alt+5">
+          <span class="nav-icon">📺</span>
+          <span>Watchlist</span>
           <kbd>5</kbd>
         </button>
-        <button class="nav-item" data-view="art" title="Alt+6">
-          <span class="nav-icon">🎨</span>
-          <span>Art</span>
+        <button class="nav-item" data-view="gym" title="Alt+6">
+          <span class="nav-icon">🏋️</span>
+          <span>Gym</span>
           <kbd>6</kbd>
         </button>
-        <button class="nav-item" data-view="gaming" title="Alt+7">
-          <span class="nav-icon">🎮</span>
-          <span>Gaming</span>
+        <button class="nav-item" data-view="art" title="Alt+7">
+          <span class="nav-icon">🎨</span>
+          <span>Art</span>
           <kbd>7</kbd>
         </button>
-        <button class="nav-item" data-view="ask" title="Alt+8">
+        <button class="nav-item" data-view="gaming" title="Alt+8">
+          <span class="nav-icon">🎮</span>
+          <span>Gaming</span>
+          <kbd>8</kbd>
+        </button>
+        <button class="nav-item" data-view="ask" title="Alt+9">
           <span class="nav-icon">🎙️</span>
           <span>Voice Agent</span>
-          <kbd>8</kbd>
+          <kbd>9</kbd>
         </button>
       </nav>
 
       <div class="sidebar-footer">
         <div class="ai-pill" id="sidebar-ai-status">Groq: Checking…</div>
-        <button class="nav-item" data-view="settings" title="Alt+9">
+        <button class="nav-item" data-view="settings" title="Alt+0">
           <span class="nav-icon">⚙️</span>
           <span>Settings</span>
-          <kbd>9</kbd>
+          <kbd>0</kbd>
         </button>
       </div>
     </aside>
@@ -94,6 +99,7 @@
             <button class="mode-pill" data-mode="want_to_do">Want</button>
             <button class="mode-pill" data-mode="note">Note</button>
             <button class="mode-pill" data-mode="study">Study</button>
+            <button class="mode-pill" data-mode="watchlist">Watchlist</button>
             <button class="mode-pill" data-mode="gym">Gym</button>
             <button class="mode-pill" data-mode="art">Art</button>
             <button class="mode-pill" data-mode="game">Game</button>
@@ -134,7 +140,10 @@
         <!-- View 4: Focus Timer -->
         <section id="view-timer" class="view"></section>
 
-        <!-- View 5: Gym -->
+        <!-- View 5: Watchlist & Playlists -->
+        <section id="view-watchlist" class="view"></section>
+
+        <!-- View 6: Gym -->
         <section id="view-gym" class="view"></section>
 
         <!-- View 5: Art -->

@@ -64,6 +64,12 @@ const state = {
     notes: "",
   },
   studyData: null,
+  watchlist: [],
+  watchlistStatus: "all",
+  watchlistType: "all",
+  watchlistQuery: "",
+  lastGlobalVoiceSeq: 0,
+  globalVoicePollId: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -141,6 +147,7 @@ async function renderCurrentView() {
     else if (state.view === "tasks") await renderTasks();
     else if (state.view === "notes") await renderNotes();
     else if (state.view === "timer") await renderTimer();
+    else if (state.view === "watchlist") await renderWatchlist();
     else if (state.view === "gym") await renderGym();
     else if (state.view === "art") await renderArt();
     else if (state.view === "gaming") await renderGaming();
@@ -2705,6 +2712,345 @@ async function renderTimer() {
 }
 
 // ---------------------------------------------------------------------------
+// View 5: Watchlist & Playlists
+// ---------------------------------------------------------------------------
+
+const WATCHLIST_TYPE_ICONS = {
+  playlist: "📺 Playlist",
+  video: "🎬 Video",
+  course: "🎓 Course",
+  podcast: "🎧 Podcast",
+  article: "📄 Article",
+};
+
+function nextWatchStatus(status) {
+  if (status === "to_watch") return "watching";
+  if (status === "watching") return "watched";
+  return "to_watch";
+}
+
+function watchStatusBadge(status) {
+  if (status === "watching") return '<span class="badge badge-accent">👀 Watching</span>';
+  if (status === "watched") return '<span class="badge badge-gym">✓ Watched</span>';
+  return '<span class="badge">📌 To Watch</span>';
+}
+
+async function openExternalUrl(url) {
+  if (!url) return;
+  try {
+    await api("/api/system/open-url", { method: "POST", body: { url } });
+  } catch (err) {
+    toast(err.message || "Could not open URL", "error");
+  }
+}
+
+async function renderWatchlist() {
+  const prevSearchEl = document.getElementById("watchlist-search-input");
+  const restoreFocus = document.activeElement === prevSearchEl;
+  const selStart = restoreFocus ? prevSearchEl.selectionStart : null;
+  const selEnd = restoreFocus ? prevSearchEl.selectionEnd : null;
+
+  const params = new URLSearchParams();
+  if (state.watchlistStatus && state.watchlistStatus !== "all") {
+    params.set("status", state.watchlistStatus);
+  }
+  if (state.watchlistType && state.watchlistType !== "all") {
+    params.set("content_type", state.watchlistType);
+  }
+  if (state.watchlistQuery) {
+    params.set("q", state.watchlistQuery);
+  }
+
+  const { items } = await api(`/api/watchlist?${params.toString()}`);
+  state.watchlist = items || [];
+
+  const el = document.getElementById("view-watchlist");
+  el.innerHTML = `
+    <div class="view-header">
+      <div>
+        <h1 class="view-title">📺 Watchlist &amp; Playlists</h1>
+        <p class="view-sub">Save YouTube playlists, courses, talks, and articles — track episodes &amp; jump straight to Notes or Focus Timer</p>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px;">
+      <div class="card-header">
+        <h2 class="card-title">+ Save Playlist or Link</h2>
+        <span class="badge">Auto-fetches titles</span>
+      </div>
+      <form id="watchlist-add-form" style="display:flex;flex-direction:column;gap:8px;">
+        <div class="field-row" style="flex-wrap:wrap;">
+          <input id="wl-url-input" class="input" type="url" placeholder="Paste URL (e.g. https://www.youtube.com/playlist?list=...)" style="flex:2;min-width:240px;" />
+          <button id="wl-fetch-btn" type="button" class="btn btn-ghost btn-sm">✨ Auto-Fill</button>
+          <input id="wl-title-input" class="input" type="text" placeholder="Title (auto-filled from link if left blank)" style="flex:2;min-width:220px;" />
+        </div>
+        <div class="field-row" style="flex-wrap:wrap;">
+          <select id="wl-type-select" style="width:140px;">
+            <option value="playlist">📺 Playlist</option>
+            <option value="course">🎓 Course</option>
+            <option value="video">🎬 Video</option>
+            <option value="podcast">🎧 Podcast</option>
+            <option value="article">📄 Article</option>
+          </select>
+          <input id="wl-category-input" class="input" type="text" placeholder="Category (AI, Coding, Art…)" style="width:160px;" />
+          <input id="wl-total-input" class="input" type="number" min="0" placeholder="Episodes (opt)" style="width:130px;" />
+          <input id="wl-tags-input" class="input" type="text" placeholder="Tags (comma-separated)" style="flex:1;min-width:150px;" />
+          <button type="submit" class="btn btn-primary">+ Add to Watchlist</button>
+        </div>
+      </form>
+    </div>
+
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
+      <div class="tab-bar" style="margin-bottom:0;">
+        ${[
+          ["all", "All"],
+          ["watching", "👀 Watching"],
+          ["to_watch", "📌 To Watch"],
+          ["watched", "✓ Watched"],
+        ]
+          .map(
+            ([val, lbl]) =>
+              `<button type="button" class="tab-btn ${state.watchlistStatus === val ? "active" : ""}" data-wl-status="${val}">${lbl}</button>`
+          )
+          .join("")}
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <select id="wl-filter-type" style="padding:5px 9px;font-size:12.5px;">
+          <option value="all" ${state.watchlistType === "all" ? "selected" : ""}>All Types</option>
+          <option value="playlist" ${state.watchlistType === "playlist" ? "selected" : ""}>Playlists</option>
+          <option value="course" ${state.watchlistType === "course" ? "selected" : ""}>Courses</option>
+          <option value="video" ${state.watchlistType === "video" ? "selected" : ""}>Videos</option>
+          <option value="podcast" ${state.watchlistType === "podcast" ? "selected" : ""}>Podcasts</option>
+          <option value="article" ${state.watchlistType === "article" ? "selected" : ""}>Articles</option>
+        </select>
+        <input id="watchlist-search-input" class="input" type="search" placeholder="Search saved links…" value="${esc(state.watchlistQuery)}" style="width:210px;padding:6px 10px;font-size:12.5px;" />
+      </div>
+    </div>
+
+    <div class="watchlist-grid">
+      ${
+        items.length
+          ? items
+              .map((w) => {
+                const hasTotal = w.progress_total > 0;
+                const pct = hasTotal ? Math.min(100, Math.round((w.progress_current / w.progress_total) * 100)) : 0;
+                return `
+                  <div class="watch-card ${esc(w.status)}">
+                    <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap;">
+                      <div style="display:flex;gap:5px;flex-wrap:wrap;">
+                        <span class="badge">${WATCHLIST_TYPE_ICONS[w.content_type] || esc(w.content_type)}</span>
+                        ${w.source ? `<span class="badge badge-accent">${esc(w.source)}</span>` : ""}
+                        ${w.category ? `<span class="badge">${esc(w.category)}</span>` : ""}
+                      </div>
+                      ${watchStatusBadge(w.status)}
+                    </div>
+
+                    <div>
+                      ${
+                        w.url
+                          ? `<button type="button" class="watch-link-btn" data-open-url="${esc(w.url)}" title="Open in browser">${esc(w.title)}</button>
+                             <div class="watch-url-line" title="${esc(w.url)}">${esc(w.url)}</div>`
+                          : `<div style="font-size:15px;font-weight:700;">${esc(w.title)}</div>`
+                      }
+                    </div>
+
+                    ${
+                      hasTotal
+                        ? `
+                          <div>
+                            <div style="display:flex;align-items:center;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:4px;">
+                              <span>Progress: <strong>${w.progress_current} / ${w.progress_total}</strong> (${pct}%)</span>
+                              <span style="display:inline-flex;gap:4px;">
+                                <button type="button" class="btn btn-xs btn-ghost" data-wl-step="${w.id}" data-cur="${w.progress_current}" data-tot="${w.progress_total}" data-delta="-1">−1</button>
+                                <button type="button" class="btn btn-xs btn-ghost" data-wl-step="${w.id}" data-cur="${w.progress_current}" data-tot="${w.progress_total}" data-delta="1">+1</button>
+                              </span>
+                            </div>
+                            <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
+                          </div>`
+                        : ""
+                    }
+
+                    ${w.notes ? `<div style="font-size:12.5px;color:var(--muted)">${esc(w.notes)}</div>` : ""}
+                    ${
+                      w.tags && w.tags.length
+                        ? `<div class="row-meta">${w.tags.map((t) => `<span class="badge">#${esc(t)}</span>`).join("")}</div>`
+                        : ""
+                    }
+
+                    <div class="watch-actions">
+                      ${
+                        w.url
+                          ? `<button type="button" class="btn btn-xs btn-primary" data-open-url="${esc(w.url)}">↗ Open</button>`
+                          : ""
+                      }
+                      <button type="button" class="btn btn-xs btn-ghost" data-wl-timer="${w.id}" title="Start study timer for this">⏱️ Study</button>
+                      <button type="button" class="btn btn-xs btn-ghost" data-wl-note="${w.id}" title="Open or create structured lecture note">${w.note_id ? "📝 Open Note" : "📝 + Note"}</button>
+                      <button type="button" class="btn btn-xs btn-ghost" data-wl-cycle="${w.id}" data-cur-st="${esc(w.status)}">Status</button>
+                      <button type="button" class="btn btn-xs btn-danger" style="margin-left:auto;" data-wl-del="${w.id}">✕</button>
+                    </div>
+                  </div>`;
+              })
+              .join("")
+          : '<div class="card empty-state" style="grid-column:1 / -1;">No playlists or links saved yet. Paste any YouTube playlist, course, or article link above!</div>'
+      }
+    </div>
+  `;
+
+  const searchInput = el.querySelector("#watchlist-search-input");
+  if (restoreFocus && searchInput) {
+    searchInput.focus();
+    if (selStart !== null && selEnd !== null) {
+      searchInput.setSelectionRange(selStart, selEnd);
+    }
+  }
+
+  let wlSearchTimer = null;
+  searchInput.addEventListener("input", () => {
+    state.watchlistQuery = searchInput.value;
+    clearTimeout(wlSearchTimer);
+    wlSearchTimer = setTimeout(() => renderWatchlist(), 180);
+  });
+
+  const urlInput = el.querySelector("#wl-url-input");
+  const titleInput = el.querySelector("#wl-title-input");
+  const typeSelect = el.querySelector("#wl-type-select");
+
+  const autoFillFromUrl = async (forceToast = false) => {
+    const rawUrl = urlInput.value.trim();
+    if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) return;
+    const btn = el.querySelector("#wl-fetch-btn");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Fetching…";
+    }
+    try {
+      const meta = await api("/api/watchlist/fetch-meta", {
+        method: "POST",
+        body: { url: rawUrl },
+      });
+      if (meta.title && !titleInput.value.trim()) {
+        titleInput.value = meta.title;
+      }
+      if (meta.content_type) {
+        typeSelect.value = meta.content_type;
+      }
+      if (forceToast) {
+        toast(meta.fetched ? `Found: ${meta.title}` : "Detected link type & source", "info");
+      }
+    } catch (err) {
+      if (forceToast) toast(err.message, "error");
+    } finally {
+      if (btn && document.body.contains(btn)) {
+        btn.disabled = false;
+        btn.textContent = "✨ Auto-Fill";
+      }
+    }
+  };
+
+  el.querySelector("#wl-fetch-btn").addEventListener("click", () => autoFillFromUrl(true));
+  urlInput.addEventListener("paste", () => setTimeout(() => autoFillFromUrl(false), 60));
+
+  el.querySelector("#watchlist-add-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const url = urlInput.value.trim();
+    const title = titleInput.value.trim();
+    if (!url && !title) {
+      toast("Enter a link URL or title.", "info");
+      return;
+    }
+    await api("/api/watchlist", {
+      method: "POST",
+      body: {
+        url,
+        title,
+        content_type: typeSelect.value,
+        category: el.querySelector("#wl-category-input").value.trim(),
+        progress_total: Number(el.querySelector("#wl-total-input").value || 0),
+        tags: el.querySelector("#wl-tags-input").value.trim(),
+      },
+    });
+    toast("Added to Watchlist!", "success");
+    await renderWatchlist();
+  });
+
+  el.querySelectorAll("[data-wl-status]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.watchlistStatus = btn.dataset.wlStatus;
+      renderWatchlist();
+    });
+  });
+
+  el.querySelector("#wl-filter-type").addEventListener("change", (e) => {
+    state.watchlistType = e.target.value;
+    renderWatchlist();
+  });
+
+  el.querySelectorAll("[data-open-url]").forEach((btn) => {
+    btn.addEventListener("click", () => openExternalUrl(btn.dataset.openUrl));
+  });
+
+  el.querySelectorAll("[data-wl-step]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.wlStep;
+      const cur = Number(btn.dataset.cur || 0);
+      const tot = Number(btn.dataset.tot || 0);
+      const delta = Number(btn.dataset.delta || 0);
+      const next = Math.max(0, tot > 0 ? Math.min(tot, cur + delta) : cur + delta);
+      await api(`/api/watchlist/${id}`, {
+        method: "PATCH",
+        body: { progress_current: next },
+      });
+      await renderWatchlist();
+    });
+  });
+
+  el.querySelectorAll("[data-wl-cycle]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const next = nextWatchStatus(btn.dataset.curSt);
+      await api(`/api/watchlist/${btn.dataset.wlCycle}`, {
+        method: "PATCH",
+        body: { status: next },
+      });
+      await renderWatchlist();
+    });
+  });
+
+  el.querySelectorAll("[data-wl-note]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const res = await api(`/api/watchlist/${btn.dataset.wlNote}/open-note`, { method: "POST" });
+      state.notesFolder = "all";
+      state.notesTag = "";
+      state.notesQuery = "";
+      state.noteDraft = null;
+      state.activeNoteId = res.note.id;
+      state.noteEditorMode = res.created ? "split" : "read";
+      toast(res.created ? "Created linked study note" : "Opened linked note", "success");
+      await switchView("notes");
+    });
+  });
+
+  el.querySelectorAll("[data-wl-timer]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const w = state.watchlist.find((x) => x.id === Number(btn.dataset.wlTimer));
+      if (!w) return;
+      state.timerDraft.subject = w.category || (w.content_type === "course" || w.content_type === "playlist" ? "Lectures" : "Study");
+      state.timerDraft.topic = w.title;
+      state.timerDraft.noteId = w.note_id ? String(w.note_id) : "";
+      await switchView("timer");
+    });
+  });
+
+  el.querySelectorAll("[data-wl-del]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      await api(`/api/watchlist/${btn.dataset.wlDel}`, { method: "DELETE" });
+      toast("Removed from Watchlist", "info");
+      await renderWatchlist();
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Reusable Monthly Activity Calendar
 // ---------------------------------------------------------------------------
 
@@ -3619,6 +3965,7 @@ async function renderAsk() {
         switchView("notes");
       } else if (dom === "task" || dom === "want_to_do") switchView("tasks");
       else if (dom === "timer" || dom === "study" || dom === "study_session") switchView("timer");
+      else if (dom === "watchlist") switchView("watchlist");
       else if (dom === "gym") switchView("gym");
       else if (dom === "art") switchView("art");
       else if (dom === "game") switchView("gaming");
@@ -3631,19 +3978,23 @@ async function renderAsk() {
 // ---------------------------------------------------------------------------
 
 async function renderSettings() {
-  const [settings, devData] = await Promise.all([
+  const [settings, devData, cloudStatus, globalVoice] = await Promise.all([
     api("/api/settings"),
     api("/api/voice/devices"),
+    api("/api/cloud/status"),
+    api("/api/voice/global-state"),
   ]);
   state.settings = settings;
   const devices = devData.devices || [];
+  const gdrive = cloudStatus.gdrive || {};
+  const detectedClouds = cloudStatus.detected_folders || [];
 
   const el = document.getElementById("view-settings");
   el.innerHTML = `
     <div class="view-header">
       <div>
         <h1 class="view-title">⚙️ Settings</h1>
-        <p class="view-sub">Groq free API key, voice microphone, local notes folder sync, and private storage</p>
+        <p class="view-sub">Groq free API key, system-wide voice hotkey, Google Drive / Cloud sync, and private storage</p>
       </div>
     </div>
 
@@ -3675,6 +4026,51 @@ async function renderSettings() {
               )
               .join("")}
           </select>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h2 class="card-title">⌨️ Global Voice Hotkey &amp; Background Tray</h2>
+          <span class="badge ${globalVoice.hotkey_registered ? "badge-gym" : ""}">
+            ${
+              globalVoice.hotkey_registered
+                ? `Active: ${esc(globalVoice.hotkey)}`
+                : globalVoice.hotkey_error
+                ? esc(globalVoice.hotkey_error)
+                : "Runs in desktop app"
+            }
+          </span>
+        </div>
+
+        <div class="field-group">
+          <label class="field-label">Global Start / Stop Recording Shortcut (works from any app when running)</label>
+          <div class="field-row" style="margin-bottom:8px;">
+            <input id="set-global-hotkey" class="input" type="text" value="${esc(settings.global_hotkey)}" placeholder="e.g. ctrl+shift+space (leave empty to disable)" />
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;">
+            ${["ctrl+shift+space", "ctrl+alt+v", "alt+shift+space", "ctrl+shift+r"]
+              .map(
+                (hk) =>
+                  `<button type="button" class="mode-pill ${settings.global_hotkey === hk ? "active" : ""}" data-hk-preset="${hk}">${esc(hk)}</button>`
+              )
+              .join("")}
+          </div>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:8px;">
+          <label class="check-row">
+            <input id="set-minimize-tray" type="checkbox" ${settings.minimize_to_tray ? "checked" : ""} />
+            Hide to System Tray when closing window (keeps global hotkey alive; right-click tray icon → Exit to quit)
+          </label>
+          <label class="check-row">
+            <input id="set-floating-pill" type="checkbox" ${settings.floating_indicator ? "checked" : ""} />
+            Show tiny always-on-top floating recording indicator when speaking from another app
+          </label>
+          <label class="check-row">
+            <input id="set-sound-feedback" type="checkbox" ${settings.sound_feedback ? "checked" : ""} />
+            Play subtle start / stop / saved audio chimes
+          </label>
         </div>
       </div>
 
@@ -3770,6 +4166,86 @@ async function renderSettings() {
       </div>
 
       <div class="card">
+        <div class="card-header"><h2 class="card-title">☁️ Cloud &amp; Google Drive Sync</h2></div>
+
+        <div style="display:flex;flex-direction:column;gap:14px;">
+          <!-- Mode A: Instant Cloud Folder Auto-Sync -->
+          <div class="cloud-subpanel">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+              <strong>Option A — Instant Cloud Folder Sync (Google Drive Desktop / OneDrive / Dropbox)</strong>
+              ${cloudStatus.last_sync ? `<span class="badge">Last synced: ${esc(cloudStatus.last_sync)}</span>` : ""}
+            </div>
+            ${
+              detectedClouds.length
+                ? `<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+                    <span style="font-size:12px;color:var(--muted)">Detected:</span>
+                    ${detectedClouds
+                      .map(
+                        (c) =>
+                          `<button type="button" class="mode-pill" data-cloud-detect="${esc(c.suggested_target)}">${esc(c.provider)}: ${esc(c.suggested_target)}</button>`
+                      )
+                      .join("")}
+                  </div>`
+                : ""
+            }
+            <div class="field-row">
+              <input id="set-cloud-folder" class="input" type="text" value="${esc(settings.cloud_folder)}" placeholder="e.g. G:\\My Drive\\PersonalLifeHub or OneDrive\\PersonalLifeHub" />
+              <button id="set-pick-cloud-folder" type="button" class="btn btn-ghost">Browse…</button>
+              <button id="set-cloud-sync-btn" type="button" class="btn btn-primary btn-sm">☁️ Sync Now</button>
+            </div>
+            <div style="display:flex;gap:14px;flex-wrap:wrap;">
+              <label class="check-row"><input id="set-cloud-auto" type="checkbox" ${settings.cloud_auto_sync ? "checked" : ""} /> Auto-sync when Notes / Watchlist change</label>
+              <label class="check-row"><input id="set-cloud-notes" type="checkbox" ${settings.cloud_sync_notes ? "checked" : ""} /> Notes (.md)</label>
+              <label class="check-row"><input id="set-cloud-watch" type="checkbox" ${settings.cloud_sync_watchlist ? "checked" : ""} /> Watchlist &amp; Tasks</label>
+              <label class="check-row"><input id="set-cloud-backup" type="checkbox" ${settings.cloud_sync_backup ? "checked" : ""} /> JSON Backup</label>
+            </div>
+          </div>
+
+          <!-- Mode B: Direct Google Drive OAuth API -->
+          <div class="cloud-subpanel">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+              <strong>Option B — Direct Google Drive API (OAuth — No Desktop App Needed)</strong>
+              <span class="badge ${gdrive.connected ? "badge-gym" : ""}">
+                ${
+                  gdrive.connected
+                    ? `Connected${gdrive.account_email ? ` (${esc(gdrive.account_email)})` : ""}`
+                    : gdrive.has_credentials
+                    ? "Credentials loaded (Ready to Sign In)"
+                    : "Not configured"
+                }
+              </span>
+            </div>
+            <div class="field-row" style="flex-wrap:wrap;">
+              <input id="set-gdrive-folder" class="input" type="text" value="${esc(settings.gdrive_folder_name || "PersonalLifeHub")}" placeholder="Google Drive folder name" style="max-width:220px;" />
+              <button id="set-gdrive-pick-creds" type="button" class="btn btn-ghost btn-sm">📄 Load credentials.json</button>
+              <button id="set-gdrive-toggle-paste" type="button" class="btn btn-ghost btn-sm">Paste JSON</button>
+              ${
+                gdrive.connected
+                  ? `
+                    <button id="set-gdrive-sync-btn" type="button" class="btn btn-primary btn-sm">☁️ Sync to Google Drive</button>
+                    <button id="set-gdrive-disconnect-btn" type="button" class="btn btn-danger btn-sm">Disconnect</button>
+                  `
+                  : `<button id="set-gdrive-connect-btn" type="button" class="btn btn-primary btn-sm" ${gdrive.has_credentials ? "" : "disabled"}>🔗 Sign in with Google</button>`
+              }
+            </div>
+            <div id="set-gdrive-paste-wrap" class="hidden" style="display:flex;flex-direction:column;gap:6px;">
+              <textarea id="set-gdrive-paste-json" rows="4" placeholder='Paste Google Cloud Desktop OAuth credentials.json contents here…'></textarea>
+              <button id="set-gdrive-save-raw" type="button" class="btn btn-sm btn-ghost" style="align-self:flex-start;">Save Credentials JSON</button>
+            </div>
+            <details style="font-size:12px;color:var(--muted);">
+              <summary style="cursor:pointer;">How to get your own free Google Cloud OAuth credentials.json (1-time setup)</summary>
+              <ol style="margin:6px 0 0;padding-left:18px;line-height:1.5;">
+                <li>Open Google Cloud Console → Create/select a project → Enable <strong>Google Drive API</strong>.</li>
+                <li>Go to <strong>Credentials → Create Credentials → OAuth client ID</strong> → Application type: <strong>Desktop app</strong> (add your Gmail as a Test User if Testing mode).</li>
+                <li>Download JSON, click <strong>Load credentials.json</strong> above, then click <strong>Sign in with Google</strong>. Credentials stay strictly in <code>%LOCALAPPDATA%\\PersonalLifeHub</code>.</li>
+              </ol>
+            </details>
+            ${gdrive.last_sync ? `<div style="font-size:12px;color:var(--muted)">Last Drive API sync: ${esc(gdrive.last_sync)}</div>` : ""}
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
         <div class="card-header"><h2 class="card-title">📁 Local Notes Folder Sync (.md / .txt)</h2></div>
         <div class="field-group">
           <label class="field-label">Folder Path</label>
@@ -3784,7 +4260,7 @@ async function renderSettings() {
       <div class="card">
         <div class="card-header"><h2 class="card-title">🔒 Private Local Storage &amp; Backup</h2></div>
         <p class="view-sub" style="margin-bottom:12px;">
-          Your database, settings, API key, and reference images are stored locally outside Git at:<br/>
+          Your database, settings, API key, OAuth tokens, and reference images are stored locally outside Git at:<br/>
           <code>${esc(settings.data_dir)}</code>
         </p>
         <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:space-between;align-items:center;">
@@ -3797,6 +4273,29 @@ async function renderSettings() {
       </div>
     </div>
   `;
+
+  el.querySelectorAll("[data-hk-preset]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      el.querySelector("#set-global-hotkey").value = btn.dataset.hkPreset;
+      el.querySelectorAll("[data-hk-preset]").forEach((b) =>
+        b.classList.toggle("active", b.dataset.hkPreset === btn.dataset.hkPreset)
+      );
+    });
+  });
+
+  el.querySelectorAll("[data-cloud-detect]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      el.querySelector("#set-cloud-folder").value = btn.dataset.cloudDetect;
+      el.querySelector("#set-cloud-auto").checked = true;
+    });
+  });
+
+  el.querySelector("#set-pick-cloud-folder").addEventListener("click", async () => {
+    const res = await api("/api/system/pick-folder", { method: "POST" });
+    if (res.path) {
+      el.querySelector("#set-cloud-folder").value = res.path;
+    }
+  });
 
   el.querySelector("#set-test-groq").addEventListener("click", async () => {
     const entered = el.querySelector("#set-groq-key").value.trim();
@@ -3841,10 +4340,20 @@ async function renderSettings() {
       weight_unit: el.querySelector("#set-weight-unit").value,
       notes_folder: el.querySelector("#set-notes-folder").value.trim(),
       auto_silence: el.querySelector("#set-auto-silence").value === "true",
-      silence_seconds: Number(el.querySelector("#set-silence-seconds").value || 1.8),
+      silence_seconds: Number(el.querySelector("#set-silence-seconds").value || 3.5),
       tts_mode: el.querySelector("#set-tts-mode").value,
       tts_provider: el.querySelector("#set-tts-provider").value,
       tts_voice: el.querySelector("#set-tts-voice").value,
+      global_hotkey: el.querySelector("#set-global-hotkey").value.trim(),
+      minimize_to_tray: el.querySelector("#set-minimize-tray").checked,
+      floating_indicator: el.querySelector("#set-floating-pill").checked,
+      sound_feedback: el.querySelector("#set-sound-feedback").checked,
+      cloud_folder: el.querySelector("#set-cloud-folder").value.trim(),
+      cloud_auto_sync: el.querySelector("#set-cloud-auto").checked,
+      cloud_sync_notes: el.querySelector("#set-cloud-notes").checked,
+      cloud_sync_watchlist: el.querySelector("#set-cloud-watch").checked,
+      cloud_sync_backup: el.querySelector("#set-cloud-backup").checked,
+      gdrive_folder_name: el.querySelector("#set-gdrive-folder").value.trim() || "PersonalLifeHub",
       mic_device: (() => {
         const raw = el.querySelector("#set-mic-device").value;
         return raw === "" ? null : Number(raw);
@@ -3857,6 +4366,95 @@ async function renderSettings() {
     await api("/api/settings", { method: "PATCH", body: payload });
     await refreshSettingsBadge();
   };
+
+  el.querySelector("#set-cloud-sync-btn").addEventListener("click", async () => {
+    const btn = el.querySelector("#set-cloud-sync-btn");
+    btn.disabled = true;
+    btn.textContent = "Syncing…";
+    try {
+      await saveAllSettings();
+      const res = await api("/api/cloud/sync-folder", { method: "POST", body: {} });
+      toast(`Cloud folder synced: ${res.files_written} updated, ${res.files_unchanged} unchanged`, "success");
+      await renderSettings();
+    } catch (err) {
+      toast(err.message, "error");
+    } finally {
+      if (document.body.contains(btn)) {
+        btn.disabled = false;
+        btn.textContent = "☁️ Sync Now";
+      }
+    }
+  });
+
+  el.querySelector("#set-gdrive-pick-creds").addEventListener("click", async () => {
+    const res = await api("/api/system/pick-json", { method: "POST" });
+    if (!res.path) return;
+    try {
+      await api("/api/cloud/gdrive/credentials-file", {
+        method: "POST",
+        body: { path: res.path },
+      });
+      toast("Loaded credentials.json! Click 'Sign in with Google'.", "success");
+      await renderSettings();
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  });
+
+  el.querySelector("#set-gdrive-toggle-paste").addEventListener("click", () => {
+    el.querySelector("#set-gdrive-paste-wrap").classList.toggle("hidden");
+  });
+
+  el.querySelector("#set-gdrive-save-raw").addEventListener("click", async () => {
+    const raw = el.querySelector("#set-gdrive-paste-json").value.trim();
+    if (!raw) return;
+    try {
+      await api("/api/cloud/gdrive/credentials-raw", {
+        method: "POST",
+        body: { credentials_json: raw },
+      });
+      toast("Saved credentials.json!", "success");
+      await renderSettings();
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  });
+
+  el.querySelector("#set-gdrive-connect-btn")?.addEventListener("click", async () => {
+    toast("Opening browser for Google Drive sign-in…", "info");
+    try {
+      const res = await api("/api/cloud/gdrive/connect", { method: "POST" });
+      toast(`Connected Google Drive${res.account_email ? ` (${res.account_email})` : ""}!`, "success");
+      await renderSettings();
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  });
+
+  el.querySelector("#set-gdrive-disconnect-btn")?.addEventListener("click", async () => {
+    await api("/api/cloud/gdrive/disconnect", { method: "POST" });
+    toast("Disconnected Google Drive", "info");
+    await renderSettings();
+  });
+
+  el.querySelector("#set-gdrive-sync-btn")?.addEventListener("click", async () => {
+    const btn = el.querySelector("#set-gdrive-sync-btn");
+    btn.disabled = true;
+    btn.textContent = "Uploading…";
+    try {
+      await saveAllSettings();
+      const res = await api("/api/cloud/gdrive/sync", { method: "POST" });
+      toast(`Google Drive synced: ${res.created} new, ${res.updated} updated`, "success");
+      await renderSettings();
+    } catch (err) {
+      toast(err.message, "error");
+    } finally {
+      if (document.body.contains(btn)) {
+        btn.disabled = false;
+        btn.textContent = "☁️ Sync to Google Drive";
+      }
+    }
+  });
 
   el.querySelector("#set-test-tts").addEventListener("click", async () => {
     await saveAllSettings();
@@ -3875,9 +4473,13 @@ async function renderSettings() {
   });
 
   el.querySelector("#set-save-btn").addEventListener("click", async () => {
-    await saveAllSettings();
-    toast("Settings saved", "success");
-    await renderSettings();
+    try {
+      await saveAllSettings();
+      toast("Settings saved", "success");
+      await renderSettings();
+    } catch (err) {
+      toast(err.message, "error");
+    }
   });
 }
 
@@ -3963,14 +4565,45 @@ document.addEventListener("DOMContentLoaded", async () => {
       }
     }
     if (e.altKey && !e.ctrlKey && !e.shiftKey) {
-      const views = ["hub", "tasks", "notes", "timer", "gym", "art", "gaming", "ask", "settings"];
-      const idx = Number(e.key) - 1;
+      const views = ["hub", "tasks", "notes", "timer", "watchlist", "gym", "art", "gaming", "ask", "settings"];
+      const idx = e.key === "0" ? 9 : Number(e.key) - 1;
       if (idx >= 0 && idx < views.length) {
         e.preventDefault();
         switchView(views[idx]);
       }
     }
   });
+
+  const pollGlobalVoiceOnce = async () => {
+    try {
+      const gv = await api("/api/voice/global-state");
+      if (gv.event_seq > state.lastGlobalVoiceSeq) {
+        state.lastGlobalVoiceSeq = gv.event_seq;
+        if (gv.phase === "done" && gv.last_result) {
+          const r = gv.last_result;
+          toast(`🎙️ "${r.transcript}" → ${r.reply}`, "success");
+          await syncTimerState();
+          if (r.navigate_to && r.navigate_to !== state.view) {
+            await switchView(r.navigate_to);
+          } else {
+            await renderCurrentView();
+          }
+        } else if (gv.phase === "error" && gv.message) {
+          toast(`Global voice error: ${gv.message}`, "error");
+        }
+      }
+    } catch {
+      // ignore transient polls
+    }
+  };
+
+  try {
+    const initGv = await api("/api/voice/global-state");
+    state.lastGlobalVoiceSeq = Number(initGv.event_seq || 0);
+  } catch {
+    // ignore
+  }
+  state.globalVoicePollId = setInterval(pollGlobalVoiceOnce, 1500);
 
   await refreshSettingsBadge();
   await syncTimerState();
