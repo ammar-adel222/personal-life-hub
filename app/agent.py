@@ -89,7 +89,7 @@ async def _call_groq_agent_step(
 
 def _offline_agent_fallback(
     user_text: str, default_unit: str = "kg"
-) -> tuple[str, list[dict[str, Any]]]:
+) -> tuple[str, list[dict[str, Any]], str | None]:
     """Deterministic fallback when no Groq API key is configured or network is down."""
     text = user_text.strip()
     lower = text.lower()
@@ -121,6 +121,7 @@ def _offline_agent_fallback(
             return (
                 f"Created task '{prefix_title}' with {len(raw_steps)} checklist items (offline mode).",
                 actions_taken,
+                None,
             )
 
     # Only save as a lecture note if the user isn't explicitly asking for a task list / timeline
@@ -148,7 +149,64 @@ def _offline_agent_fallback(
         return (
             f"Saved note '{res['result']['note']['title']}' (offline mode).",
             actions_taken,
+            None,
         )
+
+    # Offline study timer controls & past-session logging
+    if re.search(r"\b(timer|pomodoro|stopwatch)\b", lower):
+        if re.search(r"\b(pause)\b", lower):
+            res = tools.execute_tool("control_study_timer", {"action": "pause"})
+            if res["action_badge"]:
+                actions_taken.append(res["action_badge"])
+            return ("Paused your focus timer (offline mode).", actions_taken, None)
+        if re.search(r"\b(resume|continue)\b", lower):
+            res = tools.execute_tool("control_study_timer", {"action": "resume"})
+            if res["action_badge"]:
+                actions_taken.append(res["action_badge"])
+            return ("Resumed your focus timer (offline mode).", actions_taken, None)
+        if re.search(r"\b(stop|finish|end)\b", lower):
+            res = tools.execute_tool("control_study_timer", {"action": "stop", "save_session": True})
+            if res["action_badge"]:
+                actions_taken.append(res["action_badge"])
+            return (f"{res['action_badge']['label']} (offline mode).", actions_taken, None)
+        dur_m = re.search(r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m)\b", lower)
+        mins = 25.0
+        if dur_m:
+            val = float(dur_m.group(1))
+            mins = val * 60.0 if dur_m.group(2).startswith("h") else val
+        mode = "stopwatch" if "stopwatch" in lower else "countdown"
+        res = tools.execute_tool(
+            "control_study_timer",
+            {
+                "action": "start",
+                "mode": mode,
+                "duration_minutes": mins,
+                "subject": "Study",
+                "topic": text[:80],
+                "open_timer_view": True,
+            },
+        )
+        if res["action_badge"]:
+            actions_taken.append(res["action_badge"])
+        return (
+            f"{res['action_badge']['label']} (offline mode).",
+            actions_taken,
+            res.get("navigate_to"),
+        )
+
+    studied_m = re.search(
+        r"\bstudied\b.*?(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m)\b", lower
+    )
+    if studied_m:
+        val = float(studied_m.group(1))
+        mins = val * 60.0 if studied_m.group(2).startswith("h") else val
+        res = tools.execute_tool(
+            "log_study_session",
+            {"subject": "Study", "topic": text[:80], "duration_minutes": mins},
+        )
+        if res["action_badge"]:
+            actions_taken.append(res["action_badge"])
+        return (f"Logged {mins:g} minutes of study (offline mode).", actions_taken, None)
 
     parsed = ai._fallback_parse(text, db.today_str(), default_unit)
     executed = ai.execute_actions(parsed.get("actions", []), default_unit=default_unit)
@@ -171,6 +229,7 @@ def _offline_agent_fallback(
     return (
         f"{reply} (offline mode — add your Groq API key in Settings for full agentic AI).",
         actions_taken,
+        None,
     )
 
 
@@ -238,10 +297,14 @@ async def run_agent_turn(
         "**bold** key terms, `> [!NOTE]` callout for key takeaways, and `- [ ]` research/action items), write a concise 1-2 sentence `summary`, "
         "pick an appropriate `folder` (`Lectures`, `Projects`, `Study`, `Personal`, `Ideas`), and include relevant `tags`. "
         "When the user asks to organize or clean up an existing note, fetch it with `get_note` or `search_notes` and update it via `update_note`.\n"
-        "5. **Update hobby trackers too**: If the user mentions games (e.g. Elden Ring) or art projects, ALSO call `upsert_game` / `upsert_art` alongside creating any sprint tasks.\n"
-        "6. **Check existing records first**: When updating/checking off an existing task or lecture note without its ID in recent history, call `list_tasks` or `search_notes` first.\n"
-        "7. **Delete safety**: Never delete without explicit confirmation (`confirmed=false` first).\n"
-        "8. **Concise replies**: Confirm clearly what was created/updated in 1-3 short, friendly sentences. Ask a brief clarifying question only if genuinely ambiguous."
+        "5. **Focus / Study Timer & Session Logging**: When the user asks to start, pause, resume, or stop/save a study timer or Pomodoro/stopwatch, "
+        "call `control_study_timer` (defaulting to 25m countdown / 5m break unless they specify duration or stopwatch; set `open_timer_view=true` when starting or when asked to open the timer). "
+        "When the user reports completed study time in the past (*'I studied Transformers for 90 minutes'*), call `log_study_session`. "
+        "When asked how much they studied, call `get_study_stats`. If they mention an existing task or lecture note, look up its ID first and link `task_id`/`note_id`.\n"
+        "6. **Update hobby trackers too**: If the user mentions games (e.g. Elden Ring) or art projects, ALSO call `upsert_game` / `upsert_art` alongside creating any sprint tasks.\n"
+        "7. **Check existing records first**: When updating/checking off an existing task or lecture note without its ID in recent history, call `list_tasks` or `search_notes` first.\n"
+        "8. **Delete safety**: Never delete without explicit confirmation (`confirmed=false` first).\n"
+        "9. **Concise replies**: Confirm clearly what was created/updated in 1-3 short, friendly sentences. Ask a brief clarifying question only if genuinely ambiguous."
     )
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
@@ -314,11 +377,11 @@ async def run_agent_turn(
                     assistant_reply = "Got it."
         except Exception as exc:
             warning = f"Groq agent unavailable ({exc}); used offline fallback."
-            assistant_reply, actions_taken = _offline_agent_fallback(clean, default_unit)
+            assistant_reply, actions_taken, navigate_target = _offline_agent_fallback(clean, default_unit)
             ai_used = False
             model_used = None
     else:
-        assistant_reply, actions_taken = _offline_agent_fallback(clean, default_unit)
+        assistant_reply, actions_taken, navigate_target = _offline_agent_fallback(clean, default_unit)
 
     db.add_agent_message(
         sid,

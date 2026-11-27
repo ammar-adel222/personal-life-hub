@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import date as dt_date, datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,10 @@ TASK_PRIORITIES = ("normal", "high")
 TASK_STATUSES = ("not_started", "partially_completed", "completed")
 DEFAULT_NOTE_FOLDERS = ("Lectures", "Projects", "Study", "Personal", "Ideas")
 NOTE_SORTS = ("updated", "created", "title")
+DEFAULT_STUDY_SUBJECTS = ("Study", "Lectures", "Coding", "Projects", "Art", "Reading", "Research")
+STUDY_MODES = ("countdown", "stopwatch", "manual")
+TIMER_MODES = ("countdown", "stopwatch")
+TIMER_PHASES = ("focus", "break")
 ACTIVITY_DOMAINS = ("gym", "art")
 ART_STATUSES = ("idea", "wip", "finished")
 GAME_STATUSES = ("playing", "want_to_play", "finished", "on_hold")
@@ -141,6 +146,40 @@ CREATE TABLE IF NOT EXISTS agent_messages (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS study_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject TEXT NOT NULL DEFAULT 'Study',
+    topic TEXT NOT NULL DEFAULT '',
+    mode TEXT NOT NULL DEFAULT 'countdown' CHECK(mode IN ('countdown', 'stopwatch', 'manual')),
+    duration_seconds INTEGER NOT NULL,
+    planned_seconds INTEGER,
+    date TEXT NOT NULL,
+    started_at TEXT,
+    ended_at TEXT NOT NULL,
+    task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+    note_id INTEGER REFERENCES notes(id) ON DELETE SET NULL,
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS active_timer (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    active INTEGER NOT NULL DEFAULT 0,
+    paused INTEGER NOT NULL DEFAULT 0,
+    mode TEXT NOT NULL DEFAULT 'countdown',
+    phase TEXT NOT NULL DEFAULT 'focus',
+    subject TEXT NOT NULL DEFAULT 'Study',
+    topic TEXT NOT NULL DEFAULT '',
+    task_id INTEGER,
+    note_id INTEGER,
+    target_seconds INTEGER NOT NULL DEFAULT 1500,
+    break_seconds INTEGER NOT NULL DEFAULT 300,
+    accumulated_seconds INTEGER NOT NULL DEFAULT 0,
+    started_at_epoch REAL,
+    started_at_iso TEXT,
+    notes TEXT NOT NULL DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_list_done ON tasks(list_type, done);
 CREATE INDEX IF NOT EXISTS idx_task_items_task ON task_items(task_id, position ASC, id ASC);
 CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(pinned DESC, updated_at DESC);
@@ -181,6 +220,8 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
     if "summary" not in note_cols:
         conn.execute("ALTER TABLE notes ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(folder COLLATE NOCASE);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_study_sessions_date ON study_sessions(date DESC, id DESC);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_study_sessions_subject ON study_sessions(subject COLLATE NOCASE);")
 
 
 @contextmanager
@@ -1638,6 +1679,7 @@ def search_everything(query: str, limit: int = 25) -> list[dict[str, Any]]:
         gym_rows = conn.execute("SELECT * FROM gym_logs ORDER BY date DESC, id DESC").fetchall()
         art_rows = conn.execute("SELECT * FROM art_items ORDER BY updated_at DESC").fetchall()
         game_rows = conn.execute("SELECT * FROM games ORDER BY updated_at DESC").fetchall()
+        study_rows = conn.execute("SELECT * FROM study_sessions ORDER BY date DESC, id DESC").fetchall()
 
     for r in note_rows:
         tags = _parse_json_list(r["tags"])
@@ -1735,6 +1777,23 @@ def search_everything(query: str, limit: int = 25) -> list[dict[str, Any]]:
                 }
             )
 
+    for r in study_rows:
+        mins = max(1, round(int(r["duration_seconds"]) / 60))
+        text = f"study focus timer {r['subject']} {r['topic']} {r['notes']} {r['date']}"
+        score = _score_match(q_lower, tokens, text, boost=0.2)
+        if score > 0:
+            title_lbl = f"{r['subject']}: {r['topic']}" if r["topic"] else f"{r['subject']} Study Session"
+            results.append(
+                {
+                    "type": "study",
+                    "id": r["id"],
+                    "title": f"{title_lbl} ({mins}m)",
+                    "snippet": r["notes"] or f"{r['mode'].title()} session on {r['date']}",
+                    "meta": r["date"],
+                    "score": score,
+                }
+            )
+
     results.sort(key=lambda item: item["score"], reverse=True)
     return results[: max(1, min(limit, 50))]
 
@@ -1755,6 +1814,8 @@ def get_dashboard() -> dict[str, Any]:
     playing_games = list_games(status="playing")[:5]
     recent_gym = list_gym_logs(limit=6)
     recent_captures = list_captures(limit=8)
+    study_stats = get_study_stats()
+    timer_state = get_timer_state()
 
     return {
         "today": today,
@@ -1768,6 +1829,8 @@ def get_dashboard() -> dict[str, Any]:
             "month_count": art_summary["month_count"],
             "streak": art_summary["streak"],
         },
+        "study": study_stats,
+        "timer": timer_state,
         "daily_tasks": open_daily[:12],
         "daily_done_today_count": len(done_today),
         "daily_open_count": len(open_daily),
@@ -1921,6 +1984,590 @@ def export_all_data() -> dict[str, Any]:
         "gym_logs": list_gym_logs(limit=500),
         "art_items": list_art_items(),
         "games": list_games(),
+        "study_sessions": list_study_sessions(limit=500),
+        "study_stats": get_study_stats(),
         "captures": list_captures(limit=100),
         "agent_sessions": list_agent_sessions(limit=50),
     }
+
+
+# ---------------------------------------------------------------------------
+# Study Sessions & Live Focus Timer State Machine
+# ---------------------------------------------------------------------------
+
+def _validate_fk_ids(
+    conn: sqlite3.Connection, task_id: Any, note_id: Any
+) -> tuple[int | None, int | None]:
+    valid_task: int | None = None
+    valid_note: int | None = None
+    if task_id is not None and str(task_id).strip() and str(task_id).lower() != "null":
+        try:
+            tid = int(task_id)
+            if conn.execute("SELECT id FROM tasks WHERE id = ?", (tid,)).fetchone():
+                valid_task = tid
+        except (TypeError, ValueError):
+            pass
+    if note_id is not None and str(note_id).strip() and str(note_id).lower() != "null":
+        try:
+            nid = int(note_id)
+            if conn.execute("SELECT id FROM notes WHERE id = ?", (nid,)).fetchone():
+                valid_note = nid
+        except (TypeError, ValueError):
+            pass
+    return valid_task, valid_note
+
+
+def _row_to_study_session(row: sqlite3.Row) -> dict[str, Any]:
+    row_keys = row.keys()
+    secs = int(row["duration_seconds"])
+    return {
+        "id": row["id"],
+        "subject": row["subject"],
+        "topic": row["topic"],
+        "mode": row["mode"],
+        "duration_seconds": secs,
+        "duration_minutes": round(secs / 60.0, 1),
+        "planned_seconds": row["planned_seconds"],
+        "date": row["date"],
+        "started_at": row["started_at"],
+        "ended_at": row["ended_at"],
+        "task_id": row["task_id"],
+        "task_title": (row["task_title"] if "task_title" in row_keys and row["task_title"] else ""),
+        "note_id": row["note_id"],
+        "note_title": (row["note_title"] if "note_title" in row_keys and row["note_title"] else ""),
+        "notes": row["notes"],
+        "created_at": row["created_at"],
+    }
+
+
+_STUDY_JOIN_SELECT = """
+    SELECT s.*, t.title AS task_title, n.title AS note_title
+    FROM study_sessions s
+    LEFT JOIN tasks t ON t.id = s.task_id
+    LEFT JOIN notes n ON n.id = s.note_id
+"""
+
+
+def _insert_study_session_conn(
+    conn: sqlite3.Connection,
+    *,
+    subject: str = "Study",
+    topic: str = "",
+    duration_seconds: int,
+    mode: str = "manual",
+    planned_seconds: int | None = None,
+    day_date: str | None = None,
+    started_at: str | None = None,
+    ended_at: str | None = None,
+    task_id: int | None = None,
+    note_id: int | None = None,
+    notes: str = "",
+) -> dict[str, Any]:
+    clean_secs = int(duration_seconds)
+    if clean_secs <= 0:
+        raise ValueError("Study session duration must be greater than zero.")
+    target_date = (day_date or today_str()).strip()
+    dt_date.fromisoformat(target_date)
+    clean_subject = (subject or "Study").strip()[:60] or "Study"
+    clean_mode = mode if mode in STUDY_MODES else "manual"
+    valid_task, valid_note = _validate_fk_ids(conn, task_id, note_id)
+    ts = now_iso()
+    end_iso = (ended_at or ts).strip()
+    cur = conn.execute(
+        """
+        INSERT INTO study_sessions (
+            subject, topic, mode, duration_seconds, planned_seconds,
+            date, started_at, ended_at, task_id, note_id, notes, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            clean_subject,
+            (topic or "").strip()[:160],
+            clean_mode,
+            clean_secs,
+            int(planned_seconds) if planned_seconds is not None else None,
+            target_date,
+            started_at,
+            end_iso,
+            valid_task,
+            valid_note,
+            (notes or "").strip(),
+            ts,
+        ),
+    )
+    row = conn.execute(
+        f"{_STUDY_JOIN_SELECT} WHERE s.id = ?", (cur.lastrowid,)
+    ).fetchone()
+    return _row_to_study_session(row)
+
+
+def create_study_session(
+    subject: str = "Study",
+    topic: str = "",
+    duration_seconds: int | None = None,
+    duration_minutes: float | None = None,
+    mode: str = "manual",
+    planned_seconds: int | None = None,
+    day_date: str | None = None,
+    started_at: str | None = None,
+    ended_at: str | None = None,
+    task_id: int | None = None,
+    note_id: int | None = None,
+    notes: str = "",
+) -> dict[str, Any]:
+    if duration_seconds is not None:
+        secs = int(duration_seconds)
+    elif duration_minutes is not None:
+        secs = int(round(float(duration_minutes) * 60))
+    else:
+        secs = 0
+    if secs <= 0:
+        raise ValueError("Study session duration must be greater than zero.")
+    with get_conn() as conn:
+        return _insert_study_session_conn(
+            conn,
+            subject=subject,
+            topic=topic,
+            duration_seconds=secs,
+            mode=mode,
+            planned_seconds=planned_seconds,
+            day_date=day_date,
+            started_at=started_at,
+            ended_at=ended_at,
+            task_id=task_id,
+            note_id=note_id,
+            notes=notes,
+        )
+
+
+def list_study_sessions(
+    subject: str | None = None,
+    day_date: str | None = None,
+    task_id: int | None = None,
+    note_id: int | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if subject and subject.strip():
+        clauses.append("LOWER(s.subject) = LOWER(?)")
+        params.append(subject.strip())
+    if day_date and day_date.strip():
+        clauses.append("s.date = ?")
+        params.append(day_date.strip())
+    if task_id is not None:
+        clauses.append("s.task_id = ?")
+        params.append(int(task_id))
+    if note_id is not None:
+        clauses.append("s.note_id = ?")
+        params.append(int(note_id))
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    sql = f"{_STUDY_JOIN_SELECT} {where_sql} ORDER BY s.date DESC, s.id DESC LIMIT ?"
+    params.append(max(1, min(limit, 500)))
+    with get_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+        return [_row_to_study_session(r) for r in rows]
+
+
+def update_study_session(session_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM study_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if not existing:
+            return None
+        subject = (str(patch.get("subject", existing["subject"])) or "Study").strip()[:60] or "Study"
+        topic = str(patch.get("topic", existing["topic"])).strip()[:160]
+        if "duration_seconds" in patch and patch["duration_seconds"] is not None:
+            secs = int(patch["duration_seconds"])
+        elif "duration_minutes" in patch and patch["duration_minutes"] is not None:
+            secs = int(round(float(patch["duration_minutes"]) * 60))
+        else:
+            secs = int(existing["duration_seconds"])
+        if secs <= 0:
+            raise ValueError("Study session duration must be greater than zero.")
+        day_date = str(patch.get("date", existing["date"])).strip()
+        dt_date.fromisoformat(day_date)
+
+        raw_task = patch["task_id"] if "task_id" in patch else existing["task_id"]
+        raw_note = patch["note_id"] if "note_id" in patch else existing["note_id"]
+        valid_task, valid_note = _validate_fk_ids(conn, raw_task, raw_note)
+        notes = str(patch.get("notes", existing["notes"])).strip()
+
+        conn.execute(
+            """
+            UPDATE study_sessions
+            SET subject = ?, topic = ?, duration_seconds = ?, date = ?,
+                task_id = ?, note_id = ?, notes = ?
+            WHERE id = ?
+            """,
+            (subject, topic, secs, day_date, valid_task, valid_note, notes, session_id),
+        )
+        row = conn.execute(
+            f"{_STUDY_JOIN_SELECT} WHERE s.id = ?", (session_id,)
+        ).fetchone()
+        return _row_to_study_session(row)
+
+
+def delete_study_session(session_id: int) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM study_sessions WHERE id = ?", (session_id,))
+        return cur.rowcount > 0
+
+
+def get_study_stats() -> dict[str, Any]:
+    today = today_str()
+    today_dt = dt_date.fromisoformat(today)
+    week_dates = [(today_dt - timedelta(days=offset)).isoformat() for offset in range(6, -1, -1)]
+    week_set = set(week_dates)
+    month_prefix = today[:7]
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT subject, duration_seconds, date FROM study_sessions ORDER BY date DESC, id DESC"
+        ).fetchall()
+
+    today_secs = 0
+    today_count = 0
+    week_secs = 0
+    month_secs = 0
+    total_secs = 0
+    distinct_dates: list[str] = []
+    seen_dates: set[str] = set()
+    day_totals: dict[str, int] = {d: 0 for d in week_dates}
+    subj_map: dict[str, dict[str, Any]] = {}
+
+    for r in rows:
+        secs = int(r["duration_seconds"])
+        d = r["date"]
+        subj = (r["subject"] or "Study").strip() or "Study"
+        total_secs += secs
+        if d == today:
+            today_secs += secs
+            today_count += 1
+        if d in week_set:
+            week_secs += secs
+            day_totals[d] = day_totals.get(d, 0) + secs
+        if d.startswith(month_prefix):
+            month_secs += secs
+        if d not in seen_dates:
+            seen_dates.add(d)
+            distinct_dates.append(d)
+
+        key = subj.lower()
+        if key not in subj_map:
+            subj_map[key] = {"subject": subj, "seconds": 0, "sessions": 0}
+        subj_map[key]["seconds"] += secs
+        subj_map[key]["sessions"] += 1
+
+    by_subject = []
+    for entry in sorted(subj_map.values(), key=lambda x: (-x["seconds"], x["subject"].lower())):
+        by_subject.append(
+            {
+                "subject": entry["subject"],
+                "seconds": entry["seconds"],
+                "minutes": round(entry["seconds"] / 60.0, 1),
+                "hours": round(entry["seconds"] / 3600.0, 2),
+                "sessions": entry["sessions"],
+            }
+        )
+
+    subjects_list: list[str] = list(DEFAULT_STUDY_SUBJECTS)
+    seen_subj_lows = {s.lower() for s in subjects_list}
+    for entry in by_subject:
+        if entry["subject"].lower() not in seen_subj_lows:
+            seen_subj_lows.add(entry["subject"].lower())
+            subjects_list.append(entry["subject"])
+
+    daily_breakdown = [
+        {"date": d, "seconds": day_totals[d], "minutes": round(day_totals[d] / 60.0, 1)}
+        for d in week_dates
+    ]
+
+    return {
+        "today_seconds": today_secs,
+        "today_minutes": round(today_secs / 60.0, 1),
+        "today_sessions_count": today_count,
+        "week_seconds": week_secs,
+        "week_minutes": round(week_secs / 60.0, 1),
+        "week_hours": round(week_secs / 3600.0, 2),
+        "month_seconds": month_secs,
+        "month_hours": round(month_secs / 3600.0, 2),
+        "total_seconds": total_secs,
+        "total_hours": round(total_secs / 3600.0, 2),
+        "total_sessions": len(rows),
+        "streak_days": _calculate_streak(distinct_dates, today),
+        "by_subject": by_subject,
+        "subjects": subjects_list,
+        "daily_breakdown": daily_breakdown,
+    }
+
+
+def _ensure_active_timer_row(conn: sqlite3.Connection) -> sqlite3.Row:
+    conn.execute("INSERT OR IGNORE INTO active_timer (id) VALUES (1)")
+    return conn.execute("SELECT * FROM active_timer WHERE id = 1").fetchone()
+
+
+def _format_timer_row(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    active = bool(row["active"])
+    paused = bool(row["paused"])
+    mode = row["mode"] if row["mode"] in TIMER_MODES else "countdown"
+    phase = row["phase"] if row["phase"] in TIMER_PHASES else "focus"
+    accumulated = int(row["accumulated_seconds"] or 0)
+    started_epoch = row["started_at_epoch"]
+    now_ep = time.time()
+
+    if active and not paused and started_epoch is not None:
+        elapsed = accumulated + max(0, int(now_ep - float(started_epoch)))
+    else:
+        elapsed = accumulated
+
+    target_secs = int(row["target_seconds"] or 0)
+    remaining: int | None = max(0, target_secs - elapsed) if mode == "countdown" else None
+
+    task_title = ""
+    if row["task_id"] is not None:
+        t_row = conn.execute("SELECT title FROM tasks WHERE id = ?", (row["task_id"],)).fetchone()
+        if t_row:
+            task_title = t_row["title"]
+
+    note_title = ""
+    if row["note_id"] is not None:
+        n_row = conn.execute("SELECT title FROM notes WHERE id = ?", (row["note_id"],)).fetchone()
+        if n_row:
+            note_title = n_row["title"]
+
+    return {
+        "active": active,
+        "paused": paused,
+        "mode": mode,
+        "phase": phase,
+        "subject": row["subject"] or "Study",
+        "topic": row["topic"] or "",
+        "task_id": row["task_id"],
+        "task_title": task_title,
+        "note_id": row["note_id"],
+        "note_title": note_title,
+        "target_seconds": target_secs,
+        "break_seconds": int(row["break_seconds"] or 0),
+        "accumulated_seconds": accumulated,
+        "started_at_epoch": started_epoch,
+        "started_at_iso": row["started_at_iso"],
+        "elapsed_seconds": elapsed,
+        "remaining_seconds": remaining,
+        "server_epoch": now_ep,
+        "notes": row["notes"] or "",
+    }
+
+
+def _reset_timer_conn(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        UPDATE active_timer
+        SET active = 0, paused = 0, phase = 'focus',
+            accumulated_seconds = 0, started_at_epoch = NULL, started_at_iso = NULL,
+            notes = ''
+        WHERE id = 1
+        """
+    )
+
+
+def get_timer_state() -> dict[str, Any]:
+    with get_conn() as conn:
+        row = _ensure_active_timer_row(conn)
+        return _format_timer_row(conn, row)
+
+
+def start_timer(
+    mode: str = "countdown",
+    duration_minutes: float = 25,
+    break_minutes: float = 5,
+    subject: str = "Study",
+    topic: str = "",
+    task_id: int | None = None,
+    note_id: int | None = None,
+    notes: str = "",
+) -> dict[str, Any]:
+    clean_mode = mode if mode in TIMER_MODES else "countdown"
+    target_secs = (
+        max(5, int(round(float(duration_minutes or 25) * 60)))
+        if clean_mode == "countdown"
+        else 0
+    )
+    break_secs = max(0, int(round(float(break_minutes if break_minutes is not None else 5) * 60)))
+    clean_subject = (subject or "Study").strip()[:60] or "Study"
+    now_ep = time.time()
+    started_iso = now_iso()
+
+    with get_conn() as conn:
+        _ensure_active_timer_row(conn)
+        valid_task, valid_note = _validate_fk_ids(conn, task_id, note_id)
+        conn.execute(
+            """
+            UPDATE active_timer
+            SET active = 1, paused = 0, mode = ?, phase = 'focus',
+                subject = ?, topic = ?, task_id = ?, note_id = ?,
+                target_seconds = ?, break_seconds = ?,
+                accumulated_seconds = 0, started_at_epoch = ?, started_at_iso = ?,
+                notes = ?
+            WHERE id = 1
+            """,
+            (
+                clean_mode,
+                clean_subject,
+                (topic or "").strip()[:160],
+                valid_task,
+                valid_note,
+                target_secs,
+                break_secs,
+                now_ep,
+                started_iso,
+                (notes or "").strip(),
+            ),
+        )
+        row = conn.execute("SELECT * FROM active_timer WHERE id = 1").fetchone()
+        return _format_timer_row(conn, row)
+
+
+def pause_timer() -> dict[str, Any]:
+    with get_conn() as conn:
+        row = _ensure_active_timer_row(conn)
+        state = _format_timer_row(conn, row)
+        if state["active"] and not state["paused"]:
+            conn.execute(
+                """
+                UPDATE active_timer
+                SET paused = 1, accumulated_seconds = ?, started_at_epoch = NULL
+                WHERE id = 1
+                """,
+                (state["elapsed_seconds"],),
+            )
+        row = conn.execute("SELECT * FROM active_timer WHERE id = 1").fetchone()
+        return _format_timer_row(conn, row)
+
+
+def resume_timer() -> dict[str, Any]:
+    now_ep = time.time()
+    with get_conn() as conn:
+        row = _ensure_active_timer_row(conn)
+        if row["active"] and row["paused"]:
+            conn.execute(
+                "UPDATE active_timer SET paused = 0, started_at_epoch = ? WHERE id = 1",
+                (now_ep,),
+            )
+        row = conn.execute("SELECT * FROM active_timer WHERE id = 1").fetchone()
+        return _format_timer_row(conn, row)
+
+
+def update_active_timer_meta(patch: dict[str, Any]) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = _ensure_active_timer_row(conn)
+        subject = (
+            (str(patch.get("subject", row["subject"])) or "Study").strip()[:60] or "Study"
+        )
+        topic = str(patch.get("topic", row["topic"])).strip()[:160]
+        raw_task = patch["task_id"] if "task_id" in patch else row["task_id"]
+        raw_note = patch["note_id"] if "note_id" in patch else row["note_id"]
+        valid_task, valid_note = _validate_fk_ids(conn, raw_task, raw_note)
+        notes = str(patch.get("notes", row["notes"])).strip()
+        conn.execute(
+            """
+            UPDATE active_timer
+            SET subject = ?, topic = ?, task_id = ?, note_id = ?, notes = ?
+            WHERE id = 1
+            """,
+            (subject, topic, valid_task, valid_note, notes),
+        )
+        updated = conn.execute("SELECT * FROM active_timer WHERE id = 1").fetchone()
+        return _format_timer_row(conn, updated)
+
+
+def stop_timer(save_session: bool = True, notes: str | None = None) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = _ensure_active_timer_row(conn)
+        state = _format_timer_row(conn, row)
+        logged_session: dict[str, Any] | None = None
+        if (
+            state["active"]
+            and save_session
+            and state["phase"] == "focus"
+            and state["elapsed_seconds"] >= 1
+        ):
+            session_notes = (
+                notes.strip() if isinstance(notes, str) else state["notes"]
+            )
+            planned = state["target_seconds"] if state["mode"] == "countdown" and state["target_seconds"] > 0 else None
+            logged_session = _insert_study_session_conn(
+                conn,
+                subject=state["subject"],
+                topic=state["topic"],
+                duration_seconds=state["elapsed_seconds"],
+                mode=state["mode"],
+                planned_seconds=planned,
+                day_date=today_str(),
+                started_at=state["started_at_iso"],
+                ended_at=now_iso(),
+                task_id=state["task_id"],
+                note_id=state["note_id"],
+                notes=session_notes,
+            )
+        _reset_timer_conn(conn)
+        updated_row = conn.execute("SELECT * FROM active_timer WHERE id = 1").fetchone()
+        return {
+            "state": _format_timer_row(conn, updated_row),
+            "logged_session": logged_session,
+        }
+
+
+def complete_countdown_phase(start_break: bool = True) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = _ensure_active_timer_row(conn)
+        state = _format_timer_row(conn, row)
+        logged_session: dict[str, Any] | None = None
+        if not state["active"]:
+            return {"state": state, "logged_session": None}
+
+        if state["phase"] == "focus":
+            dur_secs = (
+                state["target_seconds"]
+                if state["target_seconds"] > 0
+                else max(1, state["elapsed_seconds"])
+            )
+            logged_session = _insert_study_session_conn(
+                conn,
+                subject=state["subject"],
+                topic=state["topic"],
+                duration_seconds=dur_secs,
+                mode=state["mode"],
+                planned_seconds=state["target_seconds"] or None,
+                day_date=today_str(),
+                started_at=state["started_at_iso"],
+                ended_at=now_iso(),
+                task_id=state["task_id"],
+                note_id=state["note_id"],
+                notes=state["notes"],
+            )
+            if start_break and state["break_seconds"] > 0:
+                now_ep = time.time()
+                conn.execute(
+                    """
+                    UPDATE active_timer
+                    SET active = 1, paused = 0, mode = 'countdown', phase = 'break',
+                        target_seconds = ?, accumulated_seconds = 0,
+                        started_at_epoch = ?, started_at_iso = ?
+                    WHERE id = 1
+                    """,
+                    (state["break_seconds"], now_ep, now_iso()),
+                )
+            else:
+                _reset_timer_conn(conn)
+        else:
+            # Break phase finished — return cleanly to idle without inflating focus hours
+            _reset_timer_conn(conn)
+
+        updated_row = conn.execute("SELECT * FROM active_timer WHERE id = 1").fetchone()
+        return {
+            "state": _format_timer_row(conn, updated_row),
+            "logged_session": logged_session,
+        }

@@ -457,6 +457,26 @@ def _explicit_mode_actions(raw_text: str, mode: str, today: str, unit: str) -> d
         return {"summary": "Saved art idea", "actions": [{"type": "art_item", "title": text, "status": "idea"}]}
     if mode == "game":
         return {"summary": "Saved game", "actions": [{"type": "game", "title": text, "status": "want_to_play"}]}
+    if mode == "study":
+        dur_match = re.search(r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m)\b", text, flags=re.IGNORECASE)
+        mins = 30.0
+        topic_text = text
+        if dur_match:
+            val = float(dur_match.group(1))
+            mins = val * 60.0 if dur_match.group(2).lower().startswith("h") else val
+            topic_text = (text[: dur_match.start()] + text[dur_match.end() :]).strip(" -—:,") or text
+        return {
+            "summary": f"Logged {mins:g}m study session",
+            "actions": [
+                {
+                    "type": "study_session",
+                    "subject": "Study",
+                    "topic": topic_text[:120],
+                    "duration_minutes": mins,
+                    "date": today,
+                }
+            ],
+        }
     return _fallback_parse(text, today, unit)
 
 
@@ -604,6 +624,35 @@ def execute_actions(actions: list[dict[str, Any]], default_unit: str = "kg") -> 
                     )
                     executed.append({"type": "game", "label": f"Game ({item['status']}): {item['title']}", "item": item})
 
+        elif atype == "study_session":
+            dur_mins = act.get("duration_minutes")
+            dur_secs = act.get("duration_seconds")
+            try:
+                mins_val = float(dur_mins) if dur_mins is not None and str(dur_mins) != "" else None
+            except (TypeError, ValueError):
+                mins_val = None
+            try:
+                secs_val = int(dur_secs) if dur_secs is not None and str(dur_secs) != "" else None
+            except (TypeError, ValueError):
+                secs_val = None
+            if (secs_val and secs_val > 0) or (mins_val and mins_val > 0):
+                item = db.create_study_session(
+                    subject=str(act.get("subject") or "Study"),
+                    topic=str(act.get("topic") or ""),
+                    duration_seconds=secs_val,
+                    duration_minutes=mins_val,
+                    mode="manual",
+                    day_date=str(act.get("date") or today).strip(),
+                    notes=str(act.get("notes") or ""),
+                )
+                executed.append(
+                    {
+                        "type": "study_session",
+                        "label": f"Study {item['duration_minutes']:g}m: {item['subject']}",
+                        "item": item,
+                    }
+                )
+
     return executed
 
 
@@ -661,6 +710,7 @@ async def smart_capture(
             "6. {\"type\": \"art_day\", \"date\": \"YYYY-MM-DD\", \"note\": \"\"} (when user says they drew/painted/did art)\n"
             "7. {\"type\": \"art_item\", \"title\": \"...\", \"status\": \"idea|wip|finished\", \"notes\": \"\"}\n"
             "8. {\"type\": \"game\", \"title\": \"...\", \"status\": \"playing|want_to_play|finished|on_hold\", \"platform\": \"\", \"rating\": null, \"notes\": \"\"}\n"
+            "9. {\"type\": \"study_session\", \"subject\": \"Study|Lectures|Coding|Reading|Research|Art\", \"topic\": \"...\", \"duration_minutes\": 45, \"date\": \"YYYY-MM-DD\", \"notes\": \"\"}\n"
             f"Default weight unit if unspecified: {default_unit}. "
             "If the user mentions multiple things in one sentence, output multiple actions."
         )
@@ -759,6 +809,19 @@ def _build_life_context(question: str) -> tuple[str, list[dict[str, Any]]]:
         for g in games:
             r = f" ({g['rating']}/10)" if g["rating"] else ""
             lines.append(f"- [{g['status']}] {g['title']}{r}: {g['notes'][:140]}")
+
+    study_stats = db.get_study_stats()
+    recent_study = db.list_study_sessions(limit=8)
+    if study_stats["total_sessions"] or recent_study:
+        lines.append(
+            f"\n[Study & Focus Stats]\n"
+            f"- Today: {study_stats['today_minutes']}m ({study_stats['today_sessions_count']} sessions), "
+            f"7-day total: {study_stats['week_hours']}h, Streak: {study_stats['streak_days']}d"
+        )
+        for rs in recent_study:
+            lines.append(
+                f"- {rs['date']}: {rs['subject']} ({rs['duration_minutes']}m) {rs['topic']} {rs['notes']}"
+            )
 
     return "\n".join(lines), hits
 

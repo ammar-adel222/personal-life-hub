@@ -8,7 +8,7 @@ from typing import Any
 from app import db, notes_sync
 from app.config import load_settings
 
-ALLOWED_VIEWS = ("hub", "tasks", "notes", "gym", "art", "gaming", "ask", "agent", "settings")
+ALLOWED_VIEWS = ("hub", "tasks", "notes", "timer", "gym", "art", "gaming", "ask", "agent", "settings")
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -373,6 +373,87 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "control_study_timer",
+            "description": (
+                "Control the live Focus/Study Timer (start countdown/Pomodoro or stopwatch, pause, resume, "
+                "stop & save session, or reset). Can link an Active Task ID or Note ID."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "pause", "resume", "stop", "reset"],
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["countdown", "stopwatch"],
+                        "description": "'countdown' (Pomodoro/timed block) or 'stopwatch' (count up).",
+                    },
+                    "duration_minutes": {
+                        "type": "number",
+                        "description": "Focus duration in minutes for countdown mode (default 25).",
+                    },
+                    "break_minutes": {
+                        "type": "number",
+                        "description": "Break duration in minutes after countdown completes (default 5).",
+                    },
+                    "subject": {"type": "string", "description": "Subject tag e.g. Study, Lectures, Coding, Art."},
+                    "topic": {"type": "string", "description": "Optional specific topic being studied."},
+                    "task_id": {"type": "integer", "description": "Optional Active Task ID to link."},
+                    "note_id": {"type": "integer", "description": "Optional Note ID to link."},
+                    "notes": {"type": "string", "description": "Optional session reflection/notes when starting or stopping."},
+                    "save_session": {
+                        "type": "boolean",
+                        "description": "For action='stop': whether to save elapsed time as a logged study session (default true).",
+                    },
+                    "open_timer_view": {
+                        "type": "boolean",
+                        "description": "Set true to also switch the UI to the Focus Timer screen.",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "log_study_session",
+            "description": "Log a completed past study/focus session (e.g. 'studied ML for 90 minutes'), optionally linked to a task or note.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string", "description": "e.g. Study, Lectures, Coding, Reading, Research, Art."},
+                    "topic": {"type": "string"},
+                    "duration_minutes": {"type": "number", "description": "Session length in minutes (> 0)."},
+                    "date": {"type": "string", "description": "YYYY-MM-DD or null for today."},
+                    "task_id": {"type": "integer"},
+                    "note_id": {"type": "integer"},
+                    "notes": {"type": "string"},
+                },
+                "required": ["duration_minutes"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_study_stats",
+            "description": "Fetch live timer status, today/week/total focus hours, study streak, breakdown by subject, and recent sessions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "navigate_ui",
             "description": "Switch the desktop app screen to a specific view when the user asks to open or show a section.",
             "parameters": {
@@ -380,7 +461,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "view": {
                         "type": "string",
-                        "enum": ["hub", "tasks", "notes", "gym", "art", "gaming", "agent", "settings"],
+                        "enum": ["hub", "tasks", "notes", "timer", "gym", "art", "gaming", "agent", "settings"],
                     }
                 },
                 "required": ["view"],
@@ -391,11 +472,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "delete_item",
-            "description": "Delete a task, note, gym log, art item, or game. Only set confirmed=true after the user has explicitly confirmed deletion.",
+            "description": "Delete a task, note, gym log, art item, game, or study_session. Only set confirmed=true after the user has explicitly confirmed deletion.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "domain": {"type": "string", "enum": ["task", "note", "gym_log", "art", "game"]},
+                    "domain": {
+                        "type": "string",
+                        "enum": ["task", "note", "gym_log", "art", "game", "study_session"],
+                    },
                     "item_id": {"type": "integer"},
                     "confirmed": {"type": "boolean"},
                 },
@@ -930,6 +1014,122 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
                 "navigate_to": None,
             }
 
+        if name == "control_study_timer":
+            action = str(args.get("action") or "").strip().lower()
+            open_view = _coerce_bool(args.get("open_timer_view"), False)
+            nav = "timer" if open_view else None
+            logged_session = None
+
+            if action == "start":
+                mode = str(args.get("mode") or "countdown").strip().lower()
+                dur_mins = _coerce_float(args.get("duration_minutes"), 25.0) or 25.0
+                brk_mins = _coerce_float(args.get("break_minutes"), 5.0)
+                if brk_mins is None:
+                    brk_mins = 5.0
+                subject = str(args.get("subject") or "Study").strip() or "Study"
+                topic = str(args.get("topic") or "").strip()
+                timer_state = db.start_timer(
+                    mode=mode,
+                    duration_minutes=dur_mins,
+                    break_minutes=brk_mins,
+                    subject=subject,
+                    topic=topic,
+                    task_id=_coerce_int(args.get("task_id")),
+                    note_id=_coerce_int(args.get("note_id")),
+                    notes=str(args.get("notes") or ""),
+                )
+                if timer_state["mode"] == "stopwatch":
+                    lbl = f"Started Stopwatch: {timer_state['subject']}"
+                else:
+                    mins_lbl = round(timer_state["target_seconds"] / 60, 1)
+                    lbl = f"Started {mins_lbl:g}m Timer: {timer_state['subject']}"
+                badge = {"tool": name, "domain": "timer", "item_id": None, "label": lbl}
+            elif action == "pause":
+                timer_state = db.pause_timer()
+                badge = {
+                    "tool": name,
+                    "domain": "timer",
+                    "item_id": None,
+                    "label": f"Paused Timer ({timer_state['subject']})",
+                }
+            elif action == "resume":
+                timer_state = db.resume_timer()
+                badge = {
+                    "tool": name,
+                    "domain": "timer",
+                    "item_id": None,
+                    "label": f"Resumed Timer ({timer_state['subject']})",
+                }
+            elif action in ("stop", "reset"):
+                save_sess = _coerce_bool(args.get("save_session"), action == "stop")
+                res = db.stop_timer(
+                    save_session=save_sess,
+                    notes=str(args["notes"]) if args.get("notes") is not None else None,
+                )
+                timer_state = res["state"]
+                logged_session = res["logged_session"]
+                if logged_session:
+                    lbl = f"Logged {logged_session['duration_minutes']:g}m Study: {logged_session['subject']}"
+                    item_id = logged_session["id"]
+                else:
+                    lbl = "Reset Timer" if action == "reset" else "Stopped Timer"
+                    item_id = None
+                badge = {"tool": name, "domain": "timer", "item_id": item_id, "label": lbl}
+            else:
+                return {"result": {"error": f"Unsupported timer action: {action}"}, "action_badge": None, "navigate_to": None}
+
+            return {
+                "result": {
+                    "timer": timer_state,
+                    "logged_session": logged_session,
+                    "stats": db.get_study_stats(),
+                },
+                "action_badge": badge,
+                "navigate_to": nav,
+            }
+
+        if name == "log_study_session":
+            dur_mins = _coerce_float(args.get("duration_minutes"))
+            if dur_mins is None or dur_mins <= 0:
+                return {"result": {"error": "duration_minutes > 0 is required."}, "action_badge": None, "navigate_to": None}
+            day_date = args.get("date")
+            if isinstance(day_date, str) and day_date.strip().lower() == "null":
+                day_date = None
+            item = db.create_study_session(
+                subject=str(args.get("subject") or "Study"),
+                topic=str(args.get("topic") or ""),
+                duration_minutes=dur_mins,
+                mode="manual",
+                day_date=day_date,
+                task_id=_coerce_int(args.get("task_id")),
+                note_id=_coerce_int(args.get("note_id")),
+                notes=str(args.get("notes") or ""),
+            )
+            topic_sfx = f" — {item['topic']}" if item["topic"] else ""
+            return {
+                "result": {"session": item, "stats": db.get_study_stats()},
+                "action_badge": {
+                    "tool": name,
+                    "domain": "timer",
+                    "item_id": item["id"],
+                    "label": f"Study {item['duration_minutes']:g}m: {item['subject']}{topic_sfx}",
+                },
+                "navigate_to": None,
+            }
+
+        if name == "get_study_stats":
+            subj = str(args.get("subject") or "").strip() or None
+            limit = _coerce_int(args.get("limit"), 15) or 15
+            return {
+                "result": {
+                    "timer": db.get_timer_state(),
+                    "stats": db.get_study_stats(),
+                    "recent_sessions": db.list_study_sessions(subject=subj, limit=limit),
+                },
+                "action_badge": None,
+                "navigate_to": None,
+            }
+
         if name == "navigate_ui":
             view = str(args.get("view") or "hub").strip().lower()
             if view == "agent":
@@ -975,6 +1175,8 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
                 deleted = db.delete_art_item(item_id)
             elif domain == "game":
                 deleted = db.delete_game(item_id)
+            elif domain == "study_session":
+                deleted = db.delete_study_session(item_id)
             else:
                 return {"result": {"error": f"Unknown domain: {domain}"}, "action_badge": None, "navigate_to": None}
             if not deleted:

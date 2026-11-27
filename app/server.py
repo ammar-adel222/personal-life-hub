@@ -194,6 +194,43 @@ class GameUpdate(BaseModel):
     notes: str | None = None
 
 
+class TimerControlPayload(BaseModel):
+    action: str
+    mode: str = "countdown"
+    duration_minutes: float = 25
+    break_minutes: float = 5
+    subject: str = "Study"
+    topic: str = ""
+    task_id: int | None = None
+    note_id: int | None = None
+    notes: str | None = None
+    save_session: bool = True
+    start_break: bool = True
+
+
+class StudySessionCreate(BaseModel):
+    subject: str = "Study"
+    topic: str = ""
+    duration_minutes: float | None = None
+    duration_seconds: int | None = None
+    mode: str = "manual"
+    date: str | None = None
+    task_id: int | None = None
+    note_id: int | None = None
+    notes: str = ""
+
+
+class StudySessionUpdate(BaseModel):
+    subject: str | None = None
+    topic: str | None = None
+    duration_minutes: float | None = None
+    duration_seconds: int | None = None
+    date: str | None = None
+    task_id: int | None = None
+    note_id: int | None = None
+    notes: str | None = None
+
+
 class SettingsUpdate(BaseModel):
     groq_api_key: str | None = None
     groq_model: str | None = None
@@ -795,6 +832,128 @@ def remove_game(game_id: int) -> dict[str, Any]:
     if not db.delete_game(game_id):
         raise HTTPException(status_code=404, detail="Game not found.")
     return {"deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Focus / Study Timer & Session History
+# ---------------------------------------------------------------------------
+
+@app.get("/api/timer")
+def get_timer_overview() -> dict[str, Any]:
+    return {
+        "state": db.get_timer_state(),
+        "stats": db.get_study_stats(),
+        "sessions": db.list_study_sessions(limit=50),
+    }
+
+
+@app.get("/api/timer/state")
+def get_live_timer_state() -> dict[str, Any]:
+    return {"state": db.get_timer_state()}
+
+
+@app.post("/api/timer/control")
+def post_timer_control(payload: TimerControlPayload) -> dict[str, Any]:
+    action = (payload.action or "").strip().lower()
+    logged_session: dict[str, Any] | None = None
+    try:
+        if action == "start":
+            state = db.start_timer(
+                mode=payload.mode,
+                duration_minutes=payload.duration_minutes,
+                break_minutes=payload.break_minutes,
+                subject=payload.subject,
+                topic=payload.topic,
+                task_id=payload.task_id,
+                note_id=payload.note_id,
+                notes=payload.notes or "",
+            )
+        elif action == "pause":
+            state = db.pause_timer()
+        elif action == "resume":
+            state = db.resume_timer()
+        elif action == "stop":
+            res = db.stop_timer(save_session=payload.save_session, notes=payload.notes)
+            state = res["state"]
+            logged_session = res["logged_session"]
+        elif action in ("reset", "skip_break"):
+            res = db.stop_timer(save_session=False)
+            state = res["state"]
+        elif action == "complete":
+            res = db.complete_countdown_phase(start_break=payload.start_break)
+            state = res["state"]
+            logged_session = res["logged_session"]
+        elif action == "update_meta":
+            meta_patch = payload.model_dump(exclude_unset=True)
+            state = db.update_active_timer_meta(meta_patch)
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported timer action: {payload.action}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "state": state,
+        "logged_session": logged_session,
+        "stats": db.get_study_stats(),
+    }
+
+
+@app.get("/api/study/sessions")
+def get_study_sessions(
+    subject: str | None = None,
+    date: str | None = None,
+    task_id: int | None = None,
+    note_id: int | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    return {
+        "items": db.list_study_sessions(
+            subject=subject,
+            day_date=date,
+            task_id=task_id,
+            note_id=note_id,
+            limit=limit,
+        ),
+        "stats": db.get_study_stats(),
+    }
+
+
+@app.post("/api/study/sessions", status_code=201)
+def post_study_session(payload: StudySessionCreate) -> dict[str, Any]:
+    try:
+        item = db.create_study_session(
+            subject=payload.subject,
+            topic=payload.topic,
+            duration_seconds=payload.duration_seconds,
+            duration_minutes=payload.duration_minutes,
+            mode=payload.mode,
+            day_date=payload.date,
+            task_id=payload.task_id,
+            note_id=payload.note_id,
+            notes=payload.notes,
+        )
+        return {"item": item, "stats": db.get_study_stats()}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/study/sessions/{session_id}")
+def patch_study_session(session_id: int, payload: StudySessionUpdate) -> dict[str, Any]:
+    patch = payload.model_dump(exclude_unset=True)
+    try:
+        item = db.update_study_session(session_id, patch)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not item:
+        raise HTTPException(status_code=404, detail="Study session not found.")
+    return {"item": item, "stats": db.get_study_stats()}
+
+
+@app.delete("/api/study/sessions/{session_id}")
+def remove_study_session(session_id: int) -> dict[str, Any]:
+    if not db.delete_study_session(session_id):
+        raise HTTPException(status_code=404, detail="Study session not found.")
+    return {"deleted": True, "stats": db.get_study_stats()}
 
 
 # ---------------------------------------------------------------------------
