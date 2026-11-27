@@ -35,18 +35,19 @@ flowchart LR
   - **Capture From Anywhere**: Press the customizable global hotkey (`Ctrl+Shift+Space` by default) while in another app or minimized to the system tray — no need to focus or open the window first.
   - **Background System Tray & Audio Chimes**: Closing the window hides cleanly to the Windows notification tray with right-click controls (**Open**, **Toggle Voice Recording**, **Exit**) and gentle start/stop/done/error `winsound` chimes.
   - **Non-Focus-Stealing Floating Pill**: A compact always-on-top Win32 indicator shows live recording duration and AI status without interrupting your active window.
-- **✅ 3-State Tasks & Auto-Rollup Checklists**:
-  - Every task supports **`not_started` (`○`)**, **`partially_completed` (`◐`)**, and **`completed` (`✓`)** states plus optional progress notes.
-  - Tasks can contain nested checklist steps — checking `1..N-1` steps automatically sets the parent task to **`partially_completed`** with a progress bar; checking all steps completes it.
-  - **Active Tasks** and **Want to Do / Someday** lists with timelines (`start_date` / `due_date` / `timeline`), target frequencies (`frequency`), and 1-click promotion.
+- **✅ 3-State Tasks, Daily Habits & Automatic Parent Linking**:
+  - **Today's To-Do vs. Larger Goals & Daily Habits**: Organize Today's items separately from multi-day plans and daily recurring habits (e.g., *"LeetCode 1 hour a day for the next 10 days"*).
+  - **Automatic Sub-Task Detection & Rollup**: Adding or completing a Today task automatically detects and links to its larger parent goal (checking off matching checklist steps and marking daily habits **Done Today · X/10 days**); if a parent match is ambiguous, the Voice Agent asks whether to group it under the bigger task.
+  - **3-State Checklists**: Every task supports **`not_started` (`○`)**, **`partially_completed` (`◐`)**, and **`completed` (`✓`)** with automatic checklist rollup, timelines (`start_date` / `due_date` / `timeline`), and target frequencies.
 - **📝 Structured Markdown Notes, Notebooks & ✨ AI Organizer**:
   - **Read / Split / Edit Modes + Formatting Toolbar**: Render headings, callouts (`> [!NOTE]`, `> [!IMPORTANT]`), fenced code blocks, tables, highlighted text, links, and clickable `- [ ]` / `- [x]` checkboxes directly in preview.
   - **Notebooks & Filtering**: Organize notes into folders (`Lectures`, `Projects`, `Study`, `Personal`, `Ideas`, or custom notebooks), filter by pinned or `#tag`, search across summaries/titles/bodies, and sort by Updated, Created, or Title.
   - **✨ Organize with AI & Auto-Structured Voice Notes**: 1-click button (`Structured`, `Lecture Note`, `Concise TL;DR`) turns messy voice transcripts into crisp Markdown headings, bullets, summaries, tags, and follow-up checklists; Voice Agent also auto-structures dictated notes.
   - **Subfolder Sync**: Bidirectional synchronization with a local `.md`/`.txt` folder (mapping subfolders to note notebooks).
-- **⏱️ Focus / Study Timer & Session History (`Alt+4`)**:
-  - **Countdown / Pomodoro (`25/5`, `50/10`, `90/15`, or custom) & Open Stopwatch** with live top-bar timer pill visible across every view and gentle WebAudio completion chime.
-  - **Tagging, Linking & Stats**: Categorize by subject (`Study`, `Lectures`, `Coding`, `Projects`, `Art`, `Reading`, `Research`, or custom), link sessions to any **Active Task** or **Note**, log past sessions manually, track streaks & 7-day charts, and control everything by voice (*"Start a 25 minute coding timer"*, *"I studied neural nets for 90 minutes"*).
+- **⏱️ Focus / Study Timer & Live Daily Study Totals (`Alt+4`)**:
+  - **Live Counting Toward Today**: Every running focus timer (countdown or stopwatch) immediately counts toward **Study Today** totals across Timer, Hub, and Tasks views; starting a new timer automatically saves any prior active focus session, and hitting a daily habit's target minutes marks it **Done Today** automatically.
+  - **Countdown / Pomodoro (`25/5`, `50/10`, `90/15`, or custom) & Open Stopwatch** with live top-bar timer pill, gentle WebAudio chime, and wall-clock/server sync that survives minimizing to tray.
+  - **Tagging, Linking & Stats**: Categorize by subject, link sessions to any **Active Task** (or auto-match from topic) or **Note**, log past sessions manually, track streaks & 7-day charts, and control everything by voice.
 - **📺 Watchlist & Playlists (`Alt+5`)**:
   - Save **playlists, videos, courses, podcasts, and articles** (`YouTube` oEmbed + safe HTML title auto-fill, SSRF-protected).
   - Track episode/lecture progress (`3/12` with automatic `to_watch` → `watching` → `watched` status rollup), open structured lecture notes in 1 click (`📝 Note`), and launch a linked **Focus Timer** (`⏱️ Study`) directly from any item.
@@ -72,6 +73,7 @@ All personal data stays outside this repository in:
 ├── google_credentials.json   # Optional Google Drive OAuth client config
 ├── google_token.json         # Optional Google Drive OAuth token
 ├── tray.ico                  # Generated Windows system tray icon
+├── runtime.json              # Active desktop PID/port for single-instance focus
 ├── app.log                   # Windowless startup diagnostics
 └── media\                    # Art reference images
 ```

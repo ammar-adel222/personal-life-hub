@@ -50,11 +50,13 @@ Instead of pulling in LangChain/LangGraph abstractions, `app/agent.py` + `app/to
 
 ## 3. SQLite Schema & Legacy Migration (`app/db.py`)
 
-Databases use `PRAGMA journal_mode=WAL` and `PRAGMA foreign_keys=ON`. `_migrate_db()` inspects existing tables on startup so older databases automatically receive new columns (`status`, `progress_note`, `start_date`, `timeline`, `frequency`, `folder`, `summary`) and new tables (`study_sessions`, `active_timer`, `watchlist_items`) without data loss.
+Databases use `PRAGMA journal_mode=WAL` and `PRAGMA foreign_keys=ON`. `_migrate_db()` inspects existing tables on startup so older databases automatically receive new columns (`status`, `progress_note`, `start_date`, `timeline`, `frequency`, `parent_task_id`, `parent_item_id`, `is_recurring`, `target_days`, `daily_target_minutes`, `folder`, `summary`) and new tables (`task_daily_logs`, `study_sessions`, `active_timer`, `watchlist_items`) without data loss.
 
 ```mermaid
 erDiagram
     tasks ||--o{ task_items : "has checklist steps"
+    tasks ||--o{ tasks : "optional parent goal"
+    tasks ||--o{ task_daily_logs : "logs Done Today dates"
     tasks ||--o{ study_sessions : "optional task link"
     notes ||--o{ study_sessions : "optional note link"
     notes ||--o{ watchlist_items : "optional linked note"
@@ -64,6 +66,11 @@ erDiagram
         int id PK
         text title
         text list_type "daily | want_to_do"
+        int parent_task_id FK "ON DELETE SET NULL"
+        int parent_item_id
+        int is_recurring
+        int target_days
+        int daily_target_minutes
         text start_date
         text due_date
         text timeline
@@ -71,6 +78,13 @@ erDiagram
         text status "not_started | partially_completed | completed"
         text progress_note
         int done
+    }
+    task_daily_logs {
+        int id PK
+        int task_id FK "ON DELETE CASCADE"
+        text date
+        text note
+        text completed_at
     }
     task_items {
         int id PK
@@ -135,10 +149,11 @@ erDiagram
     }
 ```
 
-### 3-State Task Auto-Rollup
+### 3-State Task Auto-Rollup & Parent-Goal / Study Linking
 - `0` sub-items checked → `not_started`
 - `1 .. N-1` sub-items checked → `partially_completed`
-- `N / N` sub-items checked → `completed`
+- `N / N` sub-items checked → `completed` (for recurring daily habits, logs today into `task_daily_logs` and checks `days_completed / target_days` instead of closing future days prematurely)
+- **3-Tier Parent Detection (`_analyze_parent_candidates_conn`)**: High-confidence matches auto-link Today's child task to its larger/recurring goal (and completing the child propagates to the parent); medium/tied matches populate `possible_parents` so the Voice Agent can ask the user to confirm; live focus timers count immediately in `get_study_stats()` and roll study seconds up into linked goals.
 
 ---
 
