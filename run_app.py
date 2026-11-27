@@ -81,6 +81,8 @@ def main() -> int:
     log_handle, orig_out, orig_err = _ensure_std_streams()
     try:
         from app import desktop_host, dialogs
+        if not smoke_mode and desktop_host.focus_existing_instance():
+            return 0
         from app.config import load_settings
         from app.server import app
 

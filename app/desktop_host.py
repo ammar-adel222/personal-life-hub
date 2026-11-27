@@ -33,6 +33,8 @@ WM_TRAYICON = WM_USER + 1
 WM_RELOAD_HOTKEY = WM_USER + 2
 WM_UPDATE_PILL = WM_USER + 3
 WM_STOP_HOST = WM_USER + 4
+WM_SHOW_MAIN = WM_USER + 5
+HOST_WINDOW_TITLE = "PersonalLifeHubHost"
 
 WM_LBUTTONUP = 0x0202
 WM_LBUTTONDBLCLK = 0x0203
@@ -216,6 +218,25 @@ def _set_global_state(**kwargs: Any) -> None:
 
 def _rgb(r: int, g: int, b: int) -> int:
     return r | (g << 8) | (b << 16)
+
+
+def focus_existing_instance() -> bool:
+    """If another Personal Life Hub host window is already running, bring it to front."""
+    if sys.platform != "win32":
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        user32.FindWindowW.argtypes = [wt.LPCWSTR, wt.LPCWSTR]
+        user32.FindWindowW.restype = wt.HWND
+        user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+        user32.PostMessageW.restype = wt.BOOL
+        hwnd = user32.FindWindowW(None, HOST_WINDOW_TITLE)
+        if hwnd:
+            user32.PostMessageW(hwnd, WM_SHOW_MAIN, 0, 0)
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _ensure_tray_ico_file() -> str | None:
@@ -740,6 +761,9 @@ class DesktopHost:
                 elif event == WM_RBUTTONUP:
                     _show_tray_menu(hwnd)
                 return 0
+            if msg == WM_SHOW_MAIN:
+                host_ref._trigger_window_show()
+                return 0
             if msg == WM_STOP_HOST:
                 user32.UnregisterHotKey(hwnd, HOTKEY_ID)
                 if host_ref._tray_added:
@@ -779,7 +803,7 @@ class DesktopHost:
         user32.RegisterClassW(ctypes.byref(wc_pill))
 
         self._hwnd = user32.CreateWindowExW(
-            0, host_cls, "PersonalLifeHubHost", 0, 0, 0, 0, 0, None, None, hinst, None
+            0, host_cls, HOST_WINDOW_TITLE, 0, 0, 0, 0, 0, None, None, hinst, None
         )
         self._pill_hwnd = user32.CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,

@@ -265,3 +265,53 @@ def test_agent_study_tools_offline_fallback_and_smart_capture(monkeypatch, tmp_p
         )
         assert ch2.status_code == 200
         assert client.get("/api/timer").json()["stats"]["total_sessions"] == 2
+
+
+def test_running_timer_elapsed_survives_resync_and_client_formula(monkeypatch, tmp_path):
+    monkeypatch.setenv("LIFEHUB_DATA_DIR", str(tmp_path))
+    db._initialized_db_paths.clear()
+
+    with TestClient(app) as client:
+        r_start = client.post(
+            "/api/timer/control",
+            json={
+                "action": "start",
+                "mode": "countdown",
+                "duration_minutes": 30,
+                "subject": "Study",
+            },
+        )
+        assert r_start.status_code == 200
+
+        # Simulate 10 minutes elapsing while window is minimized (no pause events yet, so accumulated_seconds=0)
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE active_timer SET started_at_epoch = ? WHERE id = 1",
+                (time.time() - 600.0,),
+            )
+
+        resynced = client.get("/api/timer/state").json()["state"]
+        assert resynced["accumulated_seconds"] == 0
+        assert resynced["elapsed_seconds"] >= 600
+        assert resynced["remaining_seconds"] <= 1200
+
+        meta_upd = client.post(
+            "/api/timer/control",
+            json={"action": "update_meta", "subject": "Study", "topic": "Minimized session"},
+        ).json()["state"]
+        assert meta_upd["elapsed_seconds"] >= 600
+        assert meta_upd["remaining_seconds"] <= 1200
+
+    # Verify client JS computes elapsed time from server timestamps/Date.now() and re-syncs on restore
+    from pathlib import Path
+
+    app_js = (Path(__file__).resolve().parent.parent / "app" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    assert "server_epoch" in app_js
+    assert "elapsed_seconds" in app_js
+    assert "Date.now()" in app_js
+    assert "visibilitychange" in app_js
+    assert "Date.now() - state.timerClientSyncedAt" in app_js
+    assert "let elapsed = Number(t.accumulated_seconds || 0);" not in app_js
+    assert "timerClientSyncedAt = performance.now()" not in app_js

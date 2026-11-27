@@ -2071,6 +2071,11 @@ function playTimerChime() {
   }
 }
 
+function setTimerState(nextState) {
+  state.timerState = nextState;
+  state.timerClientSyncedAt = Date.now();
+}
+
 function computeLiveTimerValues() {
   const t = state.timerState;
   if (!t || !t.active) {
@@ -2089,10 +2094,15 @@ function computeLiveTimerValues() {
     };
   }
 
-  let elapsed = Number(t.accumulated_seconds || 0);
+  let baseElapsed = Number(t.elapsed_seconds ?? t.accumulated_seconds ?? 0);
+  if (!t.paused && t.started_at_epoch != null && t.server_epoch != null) {
+    const runningSecs = Math.max(0, Number(t.server_epoch) - Number(t.started_at_epoch));
+    baseElapsed = Number(t.accumulated_seconds || 0) + runningSecs;
+  }
+  let elapsed = Math.floor(Math.max(0, baseElapsed));
   if (!t.paused) {
-    const delta = Math.max(0, Math.floor((performance.now() - state.timerClientSyncedAt) / 1000));
-    elapsed += delta;
+    const deltaSec = Math.max(0, (Date.now() - state.timerClientSyncedAt) / 1000);
+    elapsed = Math.floor(Math.max(0, baseElapsed + deltaSec));
   }
 
   if (t.mode === "countdown") {
@@ -2176,8 +2186,7 @@ function updateTimerDomInPlace() {
       body: { action: "complete", start_break: true },
     })
       .then(async (res) => {
-        state.timerState = res.state;
-        state.timerClientSyncedAt = performance.now();
+        setTimerState(res.state);
         updateTimerDomInPlace();
         if (res.logged_session) {
           const msg = res.state.active
@@ -2206,8 +2215,7 @@ function ensureTimerTicker() {
 async function syncTimerState() {
   try {
     const data = await api("/api/timer/state");
-    state.timerState = data.state;
-    state.timerClientSyncedAt = performance.now();
+    setTimerState(data.state);
     ensureTimerTicker();
     updateTimerDomInPlace();
   } catch {
@@ -2221,8 +2229,7 @@ async function renderTimer() {
     api("/api/tasks?list_type=daily&include_done=false"),
     api("/api/notes"),
   ]);
-  state.timerState = timerData.state;
-  state.timerClientSyncedAt = performance.now();
+  setTimerState(timerData.state);
   state.studyData = timerData;
   ensureTimerTicker();
 
@@ -2533,8 +2540,7 @@ async function renderTimer() {
           notes: state.timerDraft.notes,
         },
       });
-      state.timerState = res.state;
-      state.timerClientSyncedAt = performance.now();
+      setTimerState(res.state);
       updateTimerDomInPlace();
     } catch {
       // ignore
@@ -2608,23 +2614,20 @@ async function renderTimer() {
         notes: state.timerDraft.notes || "",
       },
     });
-    state.timerState = res.state;
-    state.timerClientSyncedAt = performance.now();
+    setTimerState(res.state);
     toast("Focus timer started!", "success");
     await renderTimer();
   });
 
   el.querySelector("#timer-pause-btn")?.addEventListener("click", async () => {
     const res = await api("/api/timer/control", { method: "POST", body: { action: "pause" } });
-    state.timerState = res.state;
-    state.timerClientSyncedAt = performance.now();
+    setTimerState(res.state);
     await renderTimer();
   });
 
   el.querySelector("#timer-resume-btn")?.addEventListener("click", async () => {
     const res = await api("/api/timer/control", { method: "POST", body: { action: "resume" } });
-    state.timerState = res.state;
-    state.timerClientSyncedAt = performance.now();
+    setTimerState(res.state);
     await renderTimer();
   });
 
@@ -2637,8 +2640,7 @@ async function renderTimer() {
         notes: state.timerDraft.notes || "",
       },
     });
-    state.timerState = res.state;
-    state.timerClientSyncedAt = performance.now();
+    setTimerState(res.state);
     state.timerDraft.notes = "";
     if (res.logged_session) {
       toast(`Saved ${formatDurationHuman(res.logged_session.duration_seconds)} of ${res.logged_session.subject}!`, "success");
@@ -2650,16 +2652,14 @@ async function renderTimer() {
 
   el.querySelector("#timer-skip-break-btn")?.addEventListener("click", async () => {
     const res = await api("/api/timer/control", { method: "POST", body: { action: "skip_break" } });
-    state.timerState = res.state;
-    state.timerClientSyncedAt = performance.now();
+    setTimerState(res.state);
     toast("Break skipped", "info");
     await renderTimer();
   });
 
   el.querySelector("#timer-reset-btn")?.addEventListener("click", async () => {
     const res = await api("/api/timer/control", { method: "POST", body: { action: "reset" } });
-    state.timerState = res.state;
-    state.timerClientSyncedAt = performance.now();
+    setTimerState(res.state);
     toast("Timer cancelled", "info");
     await renderTimer();
   });
@@ -4604,6 +4604,15 @@ document.addEventListener("DOMContentLoaded", async () => {
     // ignore
   }
   state.globalVoicePollId = setInterval(pollGlobalVoiceOnce, 1500);
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      syncTimerState();
+    }
+  });
+  window.addEventListener("focus", () => {
+    syncTimerState();
+  });
 
   await refreshSettingsBadge();
   await syncTimerState();
