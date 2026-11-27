@@ -86,6 +86,8 @@ class TaskItemUpdate(BaseModel):
 
 class NoteAppendPayload(BaseModel):
     text: str = ""
+    heading: str = ""
+    folder: str | None = None
     checklist_items: list[str] = Field(default_factory=list)
     add_tags: list[str] | str = Field(default_factory=list)
 
@@ -99,16 +101,38 @@ class NoteChecklistTogglePayload(BaseModel):
 class NoteCreate(BaseModel):
     title: str = ""
     content: str = ""
+    folder: str = ""
+    summary: str = ""
     tags: list[str] | str = Field(default_factory=list)
     pinned: bool = False
     save_to_folder: bool = False
+    auto_organize: bool = False
 
 
 class NoteUpdate(BaseModel):
     title: str | None = None
     content: str | None = None
+    folder: str | None = None
+    summary: str | None = None
     tags: list[str] | str | None = None
     pinned: bool | None = None
+
+
+class NoteOrganizePayload(BaseModel):
+    style: str = "structured"
+    apply: bool = True
+    draft_content: str | None = None
+    draft_title: str | None = None
+    draft_folder: str | None = None
+    draft_tags: list[str] | str | None = None
+
+
+class NoteOrganizePreviewPayload(BaseModel):
+    content: str = ""
+    title: str = ""
+    folder: str = ""
+    tags: list[str] | str = Field(default_factory=list)
+    style: str = "structured"
 
 
 class ActivityDayPayload(BaseModel):
@@ -339,27 +363,88 @@ def remove_task_item(task_id: int, item_id: int) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 @app.get("/api/notes")
-def get_notes(q: str = "", tag: str = "") -> dict[str, Any]:
-    return {"items": db.list_notes(query=q, tag=tag)}
+def get_notes(
+    q: str = "",
+    tag: str = "",
+    folder: str = "",
+    pinned_only: bool = False,
+    sort: str = "updated",
+) -> dict[str, Any]:
+    return {
+        "items": db.list_notes(
+            query=q,
+            tag=tag,
+            folder=folder,
+            pinned_only=pinned_only,
+            sort=sort,
+        ),
+        "folders": db.list_note_folders(),
+        "tags": db.list_note_tags(),
+    }
 
 
 @app.post("/api/notes", status_code=201)
-def post_note(payload: NoteCreate) -> dict[str, Any]:
+async def post_note(payload: NoteCreate) -> dict[str, Any]:
     try:
+        title = payload.title
+        content = payload.content
+        folder = payload.folder
+        summary = payload.summary
+        tags = payload.tags
+        if payload.auto_organize:
+            organized = await ai.organize_note_text(
+                raw_content=content,
+                current_title=title,
+                current_folder=folder,
+                current_tags=tags,
+                style="structured",
+            )
+            title = organized["title"]
+            content = organized["content"]
+            folder = organized["folder"]
+            summary = organized["summary"]
+            tags = organized["tags"]
         item = db.create_note(
-            title=payload.title,
-            content=payload.content,
-            tags=payload.tags,
+            title=title,
+            content=content,
+            tags=tags,
             pinned=payload.pinned,
+            folder=folder,
+            summary=summary,
         )
         if payload.save_to_folder:
-            folder = load_settings().get("notes_folder", "").strip()
-            if not folder:
+            notes_dir = load_settings().get("notes_folder", "").strip()
+            if not notes_dir:
                 raise ValueError("Configure a local notes folder in Settings first.")
-            item = notes_sync.save_new_note_to_folder(item, folder)
+            item = notes_sync.save_new_note_to_folder(item, notes_dir)
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"item": item}
+
+
+@app.post("/api/notes/organize-preview")
+async def post_note_organize_preview(payload: NoteOrganizePreviewPayload) -> dict[str, Any]:
+    try:
+        return await ai.organize_note_text(
+            raw_content=payload.content,
+            current_title=payload.title,
+            current_folder=payload.folder,
+            current_tags=payload.tags,
+            style=payload.style,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/notes/sync")
+def sync_notes(payload: NotesSyncPayload | None = None) -> dict[str, Any]:
+    folder = (payload.folder if payload and payload.folder else "") or load_settings().get("notes_folder", "")
+    try:
+        return notes_sync.sync_notes_folder(folder)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.patch("/api/notes/{note_id}")
@@ -379,6 +464,54 @@ def patch_note(note_id: int, payload: NoteUpdate) -> dict[str, Any]:
     return {"item": item}
 
 
+@app.post("/api/notes/{note_id}/organize")
+async def post_note_organize(note_id: int, payload: NoteOrganizePayload) -> dict[str, Any]:
+    existing = db.get_note(note_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Note not found.")
+    raw_content = payload.draft_content if payload.draft_content is not None else existing["content"]
+    raw_title = payload.draft_title if payload.draft_title is not None else existing["title"]
+    raw_folder = payload.draft_folder if payload.draft_folder is not None else existing["folder"]
+    raw_tags = payload.draft_tags if payload.draft_tags is not None else existing["tags"]
+    try:
+        org = await ai.organize_note_text(
+            raw_content=raw_content,
+            current_title=raw_title,
+            current_folder=raw_folder,
+            current_tags=raw_tags,
+            style=payload.style,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    item = existing
+    if payload.apply:
+        updated = db.update_note(
+            note_id,
+            {
+                "title": org["title"],
+                "folder": org["folder"],
+                "summary": org["summary"],
+                "tags": org["tags"],
+                "content": org["content"],
+            },
+        )
+        if updated:
+            item = updated
+            if item.get("source_path"):
+                try:
+                    item = notes_sync.write_note_to_source(item)
+                except OSError:
+                    pass
+    return {
+        "item": item,
+        "organized": org,
+        "ai_used": org["ai_used"],
+        "model": org["model"],
+        "warning": org["warning"],
+    }
+
+
 @app.delete("/api/notes/{note_id}")
 def remove_note(note_id: int) -> dict[str, Any]:
     if not db.delete_note(note_id):
@@ -393,6 +526,8 @@ def post_note_append(note_id: int, payload: NoteAppendPayload) -> dict[str, Any]
         text=payload.text,
         checklist_items=payload.checklist_items,
         add_tags=payload.add_tags,
+        heading=payload.heading,
+        folder=payload.folder,
     )
     if not item:
         raise HTTPException(status_code=404, detail="Note not found.")
@@ -422,17 +557,6 @@ def post_note_checklist_toggle(
         except OSError:
             pass
     return {"item": item}
-
-
-@app.post("/api/notes/sync")
-def sync_notes(payload: NotesSyncPayload | None = None) -> dict[str, Any]:
-    folder = (payload.folder if payload and payload.folder else "") or load_settings().get("notes_folder", "")
-    try:
-        return notes_sync.sync_notes_folder(folder)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

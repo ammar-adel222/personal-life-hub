@@ -30,6 +30,14 @@ const state = {
   tasks: [],
   taskFilter: "all",
   notes: [],
+  noteFolders: null,
+  noteTags: [],
+  notesFolder: "all",
+  notesTag: "",
+  notesSort: "updated",
+  noteEditorMode: "read",
+  noteOrganizeStyle: "structured",
+  noteDraft: null,
   activeNoteId: null,
   notesQuery: "",
   gymMonth: localTodayStr().slice(0, 7),
@@ -538,7 +546,10 @@ async function renderHub() {
           (n) => `
       <div class="note-list-item" data-jump-note="${n.id}">
         <div class="row-title">${n.pinned ? "📌 " : ""}${esc(n.title)}</div>
-        <div class="row-meta">${esc((n.content || "").slice(0, 95))}</div>
+        <div class="row-meta">
+          ${n.folder ? `<span class="badge badge-accent">📁 ${esc(n.folder)}</span>` : ""}
+          <span>${esc(n.summary || stripMarkdownPreview(n.content, 90))}</span>
+        </div>
       </div>`
         )
         .join("")
@@ -669,7 +680,12 @@ async function renderHub() {
   });
   el.querySelectorAll("[data-jump-note]").forEach((card) => {
     card.addEventListener("click", () => {
+      state.notesFolder = "all";
+      state.notesTag = "";
+      state.notesQuery = "";
+      state.noteDraft = null;
       state.activeNoteId = Number(card.dataset.jumpNote);
+      state.noteEditorMode = "read";
       switchView("notes");
     });
   });
@@ -920,17 +936,511 @@ async function renderTasks() {
 }
 
 // ---------------------------------------------------------------------------
-// View 3: Notes + Local Folder Sync
+// View 3: Structured Markdown Notes, Folders & AI Note Organizer
 // ---------------------------------------------------------------------------
 
-async function renderNotes() {
-  const { items } = await api(`/api/notes?q=${encodeURIComponent(state.notesQuery)}`);
-  state.notes = items;
-  if (!state.activeNoteId || !items.some((n) => n.id === state.activeNoteId)) {
-    state.activeNoteId = items.length ? items[0].id : null;
+const FOLDER_ICONS = {
+  Lectures: "🎓",
+  Projects: "🚀",
+  Study: "📖",
+  Personal: "🏠",
+  Ideas: "💡",
+};
+
+const NOTE_TEMPLATES = {
+  lecture: {
+    folder: "Lectures",
+    tags: "lecture, study",
+    content: [
+      "## Overview",
+      "Topic, instructor, or main theme of the session.",
+      "",
+      "## Core Concepts",
+      "- Key idea or definition",
+      "- Important mechanism or formula",
+      "",
+      "> [!IMPORTANT]",
+      "> Core takeaway to remember from this lecture.",
+      "",
+      "## To Research / Review",
+      "- [ ] Concept or paper to look into later",
+      "- [ ] Practice exercise or follow-up question",
+    ].join("\n"),
+  },
+  project: {
+    folder: "Projects",
+    tags: "project, planning",
+    content: [
+      "## Goal & Scope",
+      "What this milestone aims to ship.",
+      "",
+      "## Architecture / Notes",
+      "- Component or design decision",
+      "- Constraints and trade-offs",
+      "",
+      "> [!NOTE]",
+      "> Open risk, dependency, or blocker to watch.",
+      "",
+      "## Next Action Items",
+      "- [ ] First deliverable",
+      "- [ ] Second deliverable",
+    ].join("\n"),
+  },
+  study: {
+    folder: "Study",
+    tags: "study, research",
+    content: [
+      "## Question / Hypothesis",
+      "What I am trying to understand or solve.",
+      "",
+      "## Findings",
+      "- Observation 1",
+      "- Observation 2",
+      "",
+      "```python",
+      "# Example or formula snippet",
+      "```",
+      "",
+      "## Review Checklist",
+      "- [ ] Summarize in own words",
+    ].join("\n"),
+  },
+};
+
+function stripMarkdownPreview(rawMd, maxLen = 110) {
+  let s = String(rawMd || "");
+  s = s.replace(/```[\s\S]*?```/g, " [code] ");
+  s = s.replace(/`([^`]*)`/g, "$1");
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1");
+  s = s.replace(/^\s*>\s*\[!(?:NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*/gim, "");
+  s = s.replace(/^\s{0,3}(?:#{1,6}|>|[-*]|\d+\.)\s+/gm, "");
+  s = s.replace(/\[([ xX])\]\s+/g, "");
+  s = s.replace(/[*_~=]+/g, "");
+  s = s.replace(/\s+/g, " ").trim();
+  if (s.length > maxLen) {
+    return `${s.slice(0, maxLen - 1).trimEnd()}…`;
   }
-  const active = items.find((n) => n.id === state.activeNoteId) || null;
-  const hasFolder = Boolean(state.settings?.notes_folder);
+  return s;
+}
+
+function formatInlineMd(rawText) {
+  const inlineCodes = [];
+  let text = String(rawText || "").replace(/`([^`\n]+)`/g, (_m, code) => {
+    const idx = inlineCodes.length;
+    inlineCodes.push(`<code class="md-inline-code">${esc(code)}</code>`);
+    return `\u0000IC${idx}\u0000`;
+  });
+
+  text = esc(text);
+
+  const links = [];
+  text = text.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (full, label, hrefRaw) => {
+    const decodedHref = hrefRaw.replaceAll("&amp;", "&").trim();
+    if (!/^(https?:\/\/|mailto:|#)/i.test(decodedHref)) {
+      return label;
+    }
+    const idx = links.length;
+    links.push(
+      `<a class="md-link" href="${esc(decodedHref)}" target="_blank" rel="noopener noreferrer">${label}</a>`
+    );
+    return `\u0000LN${idx}\u0000`;
+  });
+
+  text = text.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+  text = text.replace(/==([^=\n]+)==/g, "<mark>$1</mark>");
+  text = text.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  text = text.replace(/(^|[^\w*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+
+  text = text.replace(/\u0000LN(\d+)\u0000/g, (_m, i) => links[Number(i)] || "");
+  text = text.replace(/\u0000IC(\d+)\u0000/g, (_m, i) => inlineCodes[Number(i)] || "");
+  return text;
+}
+
+function isTableDelimiterLine(line) {
+  return /^\s*\|?(?:\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$/.test(line || "") && line.includes("-");
+}
+
+function splitTableCells(line) {
+  let trimmed = String(line || "").trim();
+  if (trimmed.startsWith("|")) trimmed = trimmed.slice(1);
+  if (trimmed.endsWith("|")) trimmed = trimmed.slice(0, -1);
+  return trimmed.split("|").map((c) => c.trim());
+}
+
+function renderMarkdown(rawMd) {
+  const normalized = String(rawMd || "").replace(/\r\n/g, "\n");
+  if (!normalized.trim()) {
+    return '<div class="empty-state" style="padding:24px 8px;">Nothing in this note yet. Switch to <strong>Split</strong> or <strong>Edit</strong> to write, or pick a template.</div>';
+  }
+
+  const codeBlocks = [];
+  const withSentinels = normalized.replace(
+    /```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```/g,
+    (_m, lang, body) => {
+      const idx = codeBlocks.length;
+      const safeLang = esc((lang || "code").trim() || "code");
+      const safeCode = esc(body.replace(/\n$/, ""));
+      codeBlocks.push(
+        `<pre class="md-code"><div class="md-code-header"><span>${safeLang}</span></div><code>${safeCode}</code></pre>`
+      );
+      return `\n@@LIFEHUB_CB_${idx}@@\n`;
+    }
+  );
+
+  const lines = withSentinels.split("\n");
+  const out = [];
+  let i = 0;
+  let chkCounter = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      i += 1;
+      continue;
+    }
+
+    const cbMatch = /^@@LIFEHUB_CB_(\d+)@@$/.exec(trimmed);
+    if (cbMatch) {
+      out.push(codeBlocks[Number(cbMatch[1])] || "");
+      i += 1;
+      continue;
+    }
+
+    if (/^(?:---+|___+|\*\*\*+)$/.test(trimmed)) {
+      out.push('<hr class="md-hr" />');
+      i += 1;
+      continue;
+    }
+
+    const hMatch = /^(#{1,4})\s+(.*)$/.exec(trimmed);
+    if (hMatch) {
+      const level = hMatch[1].length;
+      out.push(`<h${level}>${formatInlineMd(hMatch[2])}</h${level}>`);
+      i += 1;
+      continue;
+    }
+
+    // GFM table
+    if (line.includes("|") && i + 1 < lines.length && isTableDelimiterLine(lines[i + 1])) {
+      const headers = splitTableCells(line);
+      i += 2;
+      const bodyRows = [];
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim() !== "") {
+        bodyRows.push(splitTableCells(lines[i]));
+        i += 1;
+      }
+      const thead = `<thead><tr>${headers.map((h) => `<th>${formatInlineMd(h)}</th>`).join("")}</tr></thead>`;
+      const tbody = bodyRows.length
+        ? `<tbody>${bodyRows
+            .map(
+              (cells) =>
+                `<tr>${headers.map((_h, ci) => `<td>${formatInlineMd(cells[ci] || "")}</td>`).join("")}</tr>`
+            )
+            .join("")}</tbody>`
+        : "";
+      out.push(`<div class="md-table-wrap"><table class="md-table">${thead}${tbody}</table></div>`);
+      continue;
+    }
+
+    // GitHub-style Callout or Blockquote
+    if (/^\s*>\s?/.test(line)) {
+      const quoteLines = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+        quoteLines.push(lines[i].replace(/^\s*>\s?/, ""));
+        i += 1;
+      }
+      const calloutMatch = /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*(.*)$/i.exec(
+        (quoteLines[0] || "").trim()
+      );
+      if (calloutMatch) {
+        const kind = calloutMatch[1].toLowerCase();
+        const icons = {
+          note: "📝 Note",
+          tip: "💡 Tip",
+          important: "⭐ Key Takeaway",
+          warning: "⚠️ Warning",
+          caution: "🛑 Caution",
+        };
+        const rest = [];
+        if (calloutMatch[2]) rest.push(calloutMatch[2]);
+        for (let q = 1; q < quoteLines.length; q += 1) {
+          rest.push(quoteLines[q]);
+        }
+        const bodyHtml = rest.length
+          ? `<div class="md-callout-body">${rest.map((r) => formatInlineMd(r)).join("<br />")}</div>`
+          : "";
+        out.push(
+          `<div class="md-callout callout-${kind}"><div class="md-callout-title">${icons[kind] || kind.toUpperCase()}</div>${bodyHtml}</div>`
+        );
+      } else {
+        out.push(`<blockquote class="md-quote">${quoteLines.map((q) => formatInlineMd(q)).join("<br />")}</blockquote>`);
+      }
+      continue;
+    }
+
+    // Checklist lines `- [ ]` or `- [x]`
+    if (/^\s*[-*]\s*\[([ xX])\]\s+(.*)$/.test(line)) {
+      const taskItems = [];
+      while (i < lines.length) {
+        const m = /^\s*[-*]\s*\[([ xX])\]\s+(.*)$/.exec(lines[i]);
+        if (!m) break;
+        const done = m[1].toLowerCase() === "x";
+        const idx = chkCounter;
+        chkCounter += 1;
+        taskItems.push(
+          `<label class="md-task-item ${done ? "done" : ""}">` +
+            `<input type="checkbox" class="checkbox" data-md-chk-idx="${idx}" ${done ? "checked" : ""} />` +
+            `<span>${formatInlineMd(m[2].trim())}</span>` +
+          `</label>`
+        );
+        i += 1;
+      }
+      out.push(`<div class="md-task-list">${taskItems.join("")}</div>`);
+      continue;
+    }
+
+    // Unordered list `- ` / `* ` (excluding checklist lines)
+    if (/^\s*[-*]\s+(.*)$/.test(line)) {
+      const ulItems = [];
+      while (i < lines.length) {
+        if (/^\s*[-*]\s*\[([ xX])\]\s+/.test(lines[i])) break;
+        const m = /^\s*[-*]\s+(.*)$/.exec(lines[i]);
+        if (!m) break;
+        ulItems.push(`<li>${formatInlineMd(m[1])}</li>`);
+        i += 1;
+      }
+      out.push(`<ul>${ulItems.join("")}</ul>`);
+      continue;
+    }
+
+    // Ordered list `1. `
+    if (/^\s*\d+\.\s+(.*)$/.test(line)) {
+      const olItems = [];
+      while (i < lines.length) {
+        const m = /^\s*\d+\.\s+(.*)$/.exec(lines[i]);
+        if (!m) break;
+        olItems.push(`<li>${formatInlineMd(m[1])}</li>`);
+        i += 1;
+      }
+      out.push(`<ol>${olItems.join("")}</ol>`);
+      continue;
+    }
+
+    // Plain paragraph until blank line or block boundary
+    const paraLines = [];
+    while (i < lines.length) {
+      const cur = lines[i];
+      const curT = cur.trim();
+      if (
+        !curT ||
+        /^@@LIFEHUB_CB_\d+@@$/.test(curT) ||
+        /^(?:---+|___+|\*\*\*+)$/.test(curT) ||
+        /^#{1,4}\s+/.test(curT) ||
+        /^\s*>\s?/.test(cur) ||
+        /^\s*[-*]\s+/.test(cur) ||
+        /^\s*\d+\.\s+/.test(cur) ||
+        (cur.includes("|") && i + 1 < lines.length && isTableDelimiterLine(lines[i + 1]))
+      ) {
+        break;
+      }
+      paraLines.push(formatInlineMd(cur));
+      i += 1;
+    }
+    if (paraLines.length) {
+      out.push(`<p>${paraLines.join("<br />")}</p>`);
+    }
+  }
+
+  return out.join("\n");
+}
+
+function toggleChecklistLineInText(rawMd, targetIndex, done) {
+  const lines = String(rawMd || "").replace(/\r\n/g, "\n").split("\n");
+  let counter = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    const m = /^(\s*[-*]\s*)\[([ xX])\](\s+)(.*)$/.exec(lines[i]);
+    if (!m) continue;
+    if (counter === targetIndex) {
+      lines[i] = `${m[1]}[${done ? "x" : " "}]${m[3]}${m[4]}`;
+      break;
+    }
+    counter += 1;
+  }
+  return lines.join("\n");
+}
+
+function applyMdToolbarAction(textarea, action) {
+  if (!textarea) return;
+  const start = textarea.selectionStart ?? 0;
+  const end = textarea.selectionEnd ?? 0;
+  const val = textarea.value;
+  const selected = val.slice(start, end);
+
+  const replaceSelection = (replacement, selStartOffset = 0, selEndOffset = replacement.length) => {
+    textarea.value = val.slice(0, start) + replacement + val.slice(end);
+    textarea.focus();
+    textarea.setSelectionRange(start + selStartOffset, start + selEndOffset);
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+
+  if (action === "bold") {
+    const inner = selected || "bold text";
+    replaceSelection(`**${inner}**`, 2, 2 + inner.length);
+  } else if (action === "italic") {
+    const inner = selected || "italic text";
+    replaceSelection(`*${inner}*`, 1, 1 + inner.length);
+  } else if (action === "highlight") {
+    const inner = selected || "key highlight";
+    replaceSelection(`==${inner}==`, 2, 2 + inner.length);
+  } else if (action === "inline_code") {
+    const inner = selected || "code";
+    replaceSelection(`\`${inner}\``, 1, 1 + inner.length);
+  } else if (action === "h1" || action === "h2" || action === "h3") {
+    const prefix = action === "h1" ? "# " : action === "h2" ? "## " : "### ";
+    const lineStart = val.lastIndexOf("\n", Math.max(0, start - 1)) + 1;
+    const before = val.slice(0, lineStart);
+    const chunk = val.slice(lineStart, end || lineStart);
+    const lineText = chunk || (val.slice(lineStart).split("\n")[0] || "");
+    const cleanLine = lineText.replace(/^#{1,4}\s+/, "");
+    const endPos = chunk ? end : lineStart + lineText.length;
+    const inserted = `${prefix}${cleanLine || "Section Heading"}`;
+    textarea.value = before + inserted + val.slice(endPos);
+    textarea.focus();
+    textarea.setSelectionRange(before.length + prefix.length, before.length + inserted.length);
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  } else if (action === "ul" || action === "ol" || action === "chk") {
+    const block = selected || (action === "chk" ? "Research item" : "List item");
+    const lines = block.split("\n").map((ln, idx) => {
+      if (action === "chk") return `- [ ] ${ln.replace(/^[-*]\s*(\[[ xX]\]\s*)?/, "")}`;
+      if (action === "ol") return `${idx + 1}. ${ln.replace(/^\d+\.\s*/, "")}`;
+      return `- ${ln.replace(/^[-*]\s*/, "")}`;
+    });
+    const outText = (start > 0 && val[start - 1] !== "\n" ? "\n" : "") + lines.join("\n");
+    replaceSelection(outText, outText.length, outText.length);
+  } else if (action === "callout") {
+    const body = selected ? selected.split("\n").map((l) => `> ${l}`).join("\n") : "> Key takeaway or reminder";
+    const outText = `${start > 0 && val[start - 1] !== "\n" ? "\n\n" : ""}> [!NOTE]\n${body}\n`;
+    replaceSelection(outText, outText.length, outText.length);
+  } else if (action === "code_block") {
+    const inner = selected || "# code or snippet";
+    const outText = `${start > 0 && val[start - 1] !== "\n" ? "\n\n" : ""}\`\`\`python\n${inner}\n\`\`\`\n`;
+    replaceSelection(outText, outText.length, outText.length);
+  } else if (action === "table") {
+    const outText =
+      `${start > 0 && val[start - 1] !== "\n" ? "\n\n" : ""}` +
+      "| Topic | Key Detail |\n| --- | --- |\n| Item 1 | Notes |\n| Item 2 | Notes |\n";
+    replaceSelection(outText, outText.length, outText.length);
+  } else if (action === "hr") {
+    const outText = `${start > 0 && val[start - 1] !== "\n" ? "\n\n" : ""}---\n\n`;
+    replaceSelection(outText, outText.length, outText.length);
+  }
+}
+
+function buildMdToolbarHtml(isNew = false) {
+  return `
+    <div class="md-toolbar">
+      <div class="md-toolbar-group">
+        <button type="button" class="md-tool-btn" data-md-tool="h1" title="Heading 1">H1</button>
+        <button type="button" class="md-tool-btn" data-md-tool="h2" title="Heading 2">H2</button>
+        <button type="button" class="md-tool-btn" data-md-tool="h3" title="Heading 3">H3</button>
+      </div>
+      <div class="md-toolbar-group">
+        <button type="button" class="md-tool-btn" data-md-tool="bold" title="Bold"><strong>B</strong></button>
+        <button type="button" class="md-tool-btn" data-md-tool="italic" title="Italic"><em>I</em></button>
+        <button type="button" class="md-tool-btn" data-md-tool="highlight" title="Highlight ==text==">🖍️</button>
+        <button type="button" class="md-tool-btn" data-md-tool="inline_code" title="Inline Code">&lt;/&gt;</button>
+      </div>
+      <div class="md-toolbar-group">
+        <button type="button" class="md-tool-btn" data-md-tool="ul" title="Bullet List">• List</button>
+        <button type="button" class="md-tool-btn" data-md-tool="ol" title="Numbered List">1. List</button>
+        <button type="button" class="md-tool-btn" data-md-tool="chk" title="Checklist Item">☑ Task</button>
+      </div>
+      <div class="md-toolbar-group">
+        <button type="button" class="md-tool-btn" data-md-tool="callout" title="Insert Note Callout">💡 Callout</button>
+        <button type="button" class="md-tool-btn" data-md-tool="code_block" title="Code Block">{ } Block</button>
+        <button type="button" class="md-tool-btn" data-md-tool="table" title="Insert Table">⊞ Table</button>
+        <button type="button" class="md-tool-btn" data-md-tool="hr" title="Section Divider">—</button>
+      </div>
+      <div class="md-toolbar-group" style="margin-left:auto;">
+        <span style="font-size:11px;color:var(--muted);align-self:center;padding:0 4px;">Templates:</span>
+        <button type="button" class="md-tool-btn" data-note-tpl="lecture" title="Lecture Note Template">${isNew ? "🎓 Lecture" : "+ Lecture"}</button>
+        <button type="button" class="md-tool-btn" data-note-tpl="project" title="Project Note Template">${isNew ? "🚀 Project" : "+ Project"}</button>
+        <button type="button" class="md-tool-btn" data-note-tpl="study" title="Study Note Template">${isNew ? "📖 Study" : "+ Study"}</button>
+      </div>
+    </div>
+  `;
+}
+
+async function renderNotes() {
+  const prevSearchEl = document.getElementById("notes-search-input");
+  const restoreSearchFocus = document.activeElement === prevSearchEl;
+  const searchSelStart = restoreSearchFocus ? prevSearchEl.selectionStart : null;
+  const searchSelEnd = restoreSearchFocus ? prevSearchEl.selectionEnd : null;
+
+  const params = new URLSearchParams();
+  if (state.notesQuery) params.set("q", state.notesQuery);
+  if (state.notesTag) params.set("tag", state.notesTag);
+  if (state.notesFolder === "__pinned__") {
+    params.set("pinned_only", "true");
+  } else if (state.notesFolder && state.notesFolder !== "all") {
+    params.set("folder", state.notesFolder);
+  }
+  params.set("sort", state.notesSort || "updated");
+
+  const data = await api(`/api/notes?${params.toString()}`);
+  const items = data.items || [];
+  state.notes = items;
+  state.noteFolders = data.folders || { total: items.length, pinned: 0, unfiled: 0, folders: [] };
+  state.noteTags = data.tags || [];
+
+  if (state.activeNoteId !== -1) {
+    if (!state.activeNoteId || !items.some((n) => n.id === state.activeNoteId)) {
+      state.activeNoteId = items.length ? items[0].id : -1;
+      state.noteDraft = null;
+    }
+  }
+  const active = state.activeNoteId === -1 ? null : (items.find((n) => n.id === state.activeNoteId) || null);
+
+  if (active) {
+    if (!state.noteDraft || state.noteDraft.id !== active.id) {
+      state.noteDraft = {
+        id: active.id,
+        title: active.title || "",
+        folder: active.folder || "",
+        summary: active.summary || "",
+        tags: (active.tags || []).join(", "),
+        content: active.content || "",
+        dirty: false,
+      };
+    }
+  } else {
+    if (!state.noteDraft || state.noteDraft.id !== -1) {
+      const defaultFolder =
+        state.notesFolder && !["all", "__pinned__", "__unfiled__"].includes(state.notesFolder)
+          ? state.notesFolder
+          : "";
+      state.noteDraft = {
+        id: -1,
+        title: "",
+        folder: defaultFolder,
+        summary: "",
+        tags: state.notesTag || "",
+        content: "",
+        dirty: false,
+      };
+    }
+    if (state.noteEditorMode === "read") {
+      state.noteEditorMode = "split";
+    }
+  }
+
+  const draft = state.noteDraft;
+  const isNew = !active;
+  const hasSyncFolder = Boolean(state.settings?.notes_folder);
+  const foldersInfo = state.noteFolders;
+  const folderOptions = (foldersInfo.folders || []).map((f) => f.name);
 
   const noteChkBadge = (n) => {
     const c = n.checklist;
@@ -940,15 +1450,25 @@ async function renderNotes() {
     return `<span class="badge">☐ ${c.done}/${c.total}</span>`;
   };
 
+  const folderPillHtml = (key, label, count) => `
+    <button type="button" class="folder-pill ${state.notesFolder === key ? "active" : ""}" data-folder-filter="${esc(key)}">
+      <span>${label}</span>
+      <span class="folder-count">${count}</span>
+    </button>
+  `;
+
+  const editorMode = isNew && state.noteEditorMode === "read" ? "split" : state.noteEditorMode;
+  const wordCount = (draft.content || "").trim() ? (draft.content || "").trim().split(/\s+/).length : 0;
+
   const el = document.getElementById("view-notes");
   el.innerHTML = `
     <div class="view-header">
       <div>
-        <h1 class="view-title">📝 Notes</h1>
-        <p class="view-sub">Fast notes &amp; lecture logs with tags, interactive checklists, and local .md/.txt folder sync</p>
+        <h1 class="view-title">📝 Structured Notes</h1>
+        <p class="view-sub">Notebooks, rich Markdown (Read / Split / Edit), interactive checklists &amp; ✨ AI note organizer</p>
       </div>
       <div style="display:flex; gap:8px; flex-wrap:wrap;">
-        <button id="notes-sync-btn" class="btn btn-ghost btn-sm" ${hasFolder ? "" : "title='Configure a folder in Settings first'"}>
+        <button id="notes-sync-btn" class="btn btn-ghost btn-sm" ${hasSyncFolder ? "" : "title='Configure a folder in Settings first'"}>
           🔄 Sync Folder
         </button>
         <button id="notes-new-btn" class="btn btn-primary btn-sm">+ New Note</button>
@@ -956,9 +1476,47 @@ async function renderNotes() {
     </div>
 
     <div class="notes-layout">
-      <div class="card" style="display:flex;flex-direction:column;gap:10px;">
-        <input id="notes-search-input" class="input" type="search" placeholder="Search notes or #tags…" value="${esc(state.notesQuery)}" />
-        <div class="item-list" style="overflow-y:auto;max-height:460px;">
+      <!-- Left Sidebar: Notebooks, Search/Sort, Tag Filters & Note Cards -->
+      <div class="card notes-sidebar-card">
+        <div class="folder-pills">
+          ${folderPillHtml("all", "🗂️ All", foldersInfo.total || 0)}
+          ${folderPillHtml("__pinned__", "📌 Pinned", foldersInfo.pinned || 0)}
+          ${(foldersInfo.folders || [])
+            .map((f) =>
+              folderPillHtml(
+                f.name,
+                `${FOLDER_ICONS[f.name] || "📁"} ${esc(f.name)}`,
+                f.count
+              )
+            )
+            .join("")}
+          ${foldersInfo.unfiled > 0 ? folderPillHtml("__unfiled__", "📥 Unfiled", foldersInfo.unfiled) : ""}
+        </div>
+
+        <div class="field-row" style="gap:6px;">
+          <input id="notes-search-input" class="input" type="search" placeholder="Search title, body, #tags…" value="${esc(state.notesQuery)}" />
+          <select id="notes-sort-select" style="flex:0 0 auto;padding:7px 8px;font-size:12px;" title="Sort notes">
+            <option value="updated" ${state.notesSort === "updated" ? "selected" : ""}>Updated</option>
+            <option value="created" ${state.notesSort === "created" ? "selected" : ""}>Created</option>
+            <option value="title" ${state.notesSort === "title" ? "selected" : ""}>Title A–Z</option>
+          </select>
+        </div>
+
+        ${
+          state.noteTags.length
+            ? `<div class="tag-filter-row">
+                ${state.noteTags
+                  .slice(0, 14)
+                  .map(
+                    (t) =>
+                      `<button type="button" class="tag-chip ${state.notesTag.toLowerCase() === t.name.toLowerCase() ? "active" : ""}" data-tag-filter="${esc(t.name)}">#${esc(t.name)} <span>(${t.count})</span></button>`
+                  )
+                  .join("")}
+              </div>`
+            : ""
+        }
+
+        <div class="item-list" style="overflow-y:auto;max-height:460px;padding-right:2px;">
           ${
             items.length
               ? items
@@ -966,87 +1524,188 @@ async function renderNotes() {
                     (n) => `
               <div class="note-list-item ${n.id === state.activeNoteId ? "active" : ""}" data-select-note="${n.id}">
                 <div class="row-title">${n.pinned ? "📌 " : ""}${esc(n.title)}</div>
+                <div class="note-card-preview">${esc(n.summary || stripMarkdownPreview(n.content, 85))}</div>
                 <div class="row-meta">
+                  ${n.folder ? `<span class="badge badge-accent">${FOLDER_ICONS[n.folder] || "📁"} ${esc(n.folder)}</span>` : ""}
                   <span>${esc(n.updated_at.slice(0, 10))}</span>
                   ${noteChkBadge(n)}
-                  ${n.source_path ? '<span class="badge badge-accent">Synced</span>' : ""}
-                  ${n.tags.map((t) => `<span class="badge">#${esc(t)}</span>`).join("")}
+                  ${n.source_path ? '<span class="badge">Synced</span>' : ""}
+                  ${n.tags.slice(0, 3).map((t) => `<span class="badge">#${esc(t)}</span>`).join("")}
                 </div>
               </div>`
                   )
                   .join("")
-              : '<div class="empty-state">No notes match. Click "+ New Note" to start!</div>'
+              : '<div class="empty-state">No notes match this filter. Click "+ New Note" to start!</div>'
           }
         </div>
       </div>
 
-      <div class="card">
-        ${
-          active
-            ? `
-          <div class="note-editor">
-            <div class="field-row">
-              <input id="note-edit-title" class="input" type="text" value="${esc(active.title)}" placeholder="Note title" style="font-weight:700;font-size:15px;" />
-              <button id="note-pin-btn" class="btn btn-sm ${active.pinned ? "btn-primary" : "btn-ghost"}" title="Pin note">📌</button>
-              <button id="note-save-btn" class="btn btn-sm btn-primary">Save</button>
-              <button id="note-del-btn" class="btn btn-sm btn-danger">Delete</button>
-            </div>
-            <input id="note-edit-tags" class="input" type="text" value="${esc(active.tags.join(", "))}" placeholder="Comma-separated tags (e.g. lecture, AI, research)" />
-            <div class="note-checklist-panel">
-              <div style="display:flex;align-items:center;justify-content:space-between;">
-                <span class="field-label">Checklist / Research Later</span>
-                ${noteChkBadge(active)}
-              </div>
+      <!-- Right Main Note Workspace -->
+      <div class="card note-workspace-card">
+        <datalist id="note-folders-datalist">
+          ${folderOptions.map((fn) => `<option value="${esc(fn)}"></option>`).join("")}
+        </datalist>
+
+        <div class="note-editor">
+          <!-- Title + Primary Actions Bar -->
+          <div class="note-top-bar">
+            <input
+              id="note-edit-title"
+              class="input"
+              type="text"
+              value="${esc(draft.title)}"
+              placeholder="${isNew ? "New note title (or leave blank & click Organize with AI)…" : "Note title"}"
+              style="flex:1;min-width:190px;font-weight:700;font-size:15.5px;"
+            />
+            <div class="editor-mode-tabs">
               ${
-                active.checklist && active.checklist.total
-                  ? active.checklist.items
-                      .map(
-                        (ci) => `
-                      <div class="sub-item-row ${ci.done ? "done" : ""}">
-                        <input type="checkbox" class="checkbox" data-note-chk-idx="${ci.index}" ${ci.done ? "checked" : ""} />
-                        <span>${esc(ci.text)}</span>
-                      </div>`
-                      )
-                      .join("")
-                  : '<div style="font-size:12px;color:var(--muted)">Add `- [ ]` items below or ask the Voice Agent mid-lecture.</div>'
+                !isNew
+                  ? `<button type="button" class="mode-tab ${editorMode === "read" ? "active" : ""}" data-editor-mode="read">📖 Read</button>`
+                  : ""
               }
-              <form id="note-add-chk-form" class="sub-add-form">
-                <input id="note-add-chk-input" class="input" type="text" placeholder="+ Add checklist / research-later item…" />
-                <button type="submit" class="btn btn-xs btn-ghost">Add</button>
-              </form>
+              <button type="button" class="mode-tab ${editorMode === "split" ? "active" : ""}" data-editor-mode="split">◫ Split</button>
+              <button type="button" class="mode-tab ${editorMode === "edit" ? "active" : ""}" data-editor-mode="edit">✏️ Edit</button>
             </div>
-            <textarea id="note-edit-content" placeholder="Write your note here… (use '- [ ] item' for checkboxes)">${esc(active.content)}</textarea>
-            <div class="row-meta">
-              <span>Updated ${esc(active.updated_at)}</span>
-              ${active.source_path ? `<span>File: ${esc(active.source_path)}</span>` : ""}
+          </div>
+
+          <!-- Folder + Tags + AI Organize + Save Bar -->
+          <div class="note-meta-bar">
+            <input
+              id="note-edit-folder"
+              class="input"
+              type="text"
+              list="note-folders-datalist"
+              value="${esc(draft.folder)}"
+              placeholder="📁 Folder (e.g. Lectures)"
+              style="width:165px;font-size:12.5px;"
+            />
+            <input
+              id="note-edit-tags"
+              class="input"
+              type="text"
+              value="${esc(draft.tags)}"
+              placeholder="Tags (comma-separated, e.g. ai, lecture)"
+              style="flex:1;min-width:160px;font-size:12.5px;"
+            />
+            <div class="note-ai-group">
+              <select id="note-organize-style" title="Organization style" style="padding:5px 8px;font-size:12px;">
+                <option value="structured" ${state.noteOrganizeStyle === "structured" ? "selected" : ""}>Structured</option>
+                <option value="lecture" ${state.noteOrganizeStyle === "lecture" ? "selected" : ""}>Lecture Note</option>
+                <option value="concise" ${state.noteOrganizeStyle === "concise" ? "selected" : ""}>Concise TL;DR</option>
+              </select>
+              <button id="note-organize-btn" type="button" class="btn btn-sm btn-art" title="Clean up messy text into structured headings, bullets, summary & takeaways">
+                ✨ Organize with AI
+              </button>
             </div>
-          </div>`
-            : `
-          <div class="note-editor">
-            <div class="card-header"><h2 class="card-title">Create a New Note</h2></div>
-            <input id="note-new-title" class="input" type="text" placeholder="Title (optional)" />
-            <input id="note-new-tags" class="input" type="text" placeholder="Tags (comma-separated)" />
-            <textarea id="note-new-content" placeholder="Jot down anything…"></textarea>
-            <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
-              ${
-                hasFolder
-                  ? '<label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted)"><input id="note-save-folder" type="checkbox" checked /> Also save .md file to sync folder</label>'
-                  : "<span></span>"
-              }
-              <button id="note-create-btn" class="btn btn-primary">Save Note</button>
-            </div>
-          </div>`
-        }
+            ${
+              !isNew
+                ? `
+                  <button id="note-pin-btn" type="button" class="btn btn-sm ${active.pinned ? "btn-primary" : "btn-ghost"}" title="Pin / Unpin note">📌</button>
+                  <button id="note-save-btn" type="button" class="btn btn-sm btn-primary" title="Save (Ctrl+S)">
+                    ${draft.dirty ? "● Save" : "Save"}
+                  </button>
+                  <button id="note-del-btn" type="button" class="btn btn-sm btn-danger">Delete</button>
+                `
+                : `<button id="note-create-btn" type="button" class="btn btn-sm btn-primary" title="Create Note (Ctrl+S)">Save Note</button>`
+            }
+          </div>
+
+          <!-- Summary Banner (Read) or Summary Field (Edit/Split) -->
+          ${
+            editorMode === "read"
+              ? draft.summary
+                ? `<div class="note-summary-banner"><strong>✨ Summary:</strong> ${esc(draft.summary)}</div>`
+                : ""
+              : `<input id="note-edit-summary" class="input" type="text" value="${esc(draft.summary)}" placeholder="TL;DR summary (optional — auto-filled by ✨ Organize with AI)" style="font-size:12.5px;color:var(--muted);" />`
+          }
+
+          <!-- Formatting Toolbar (Edit & Split) -->
+          ${editorMode !== "read" ? buildMdToolbarHtml(isNew) : ""}
+
+          <!-- Body Workspace -->
+          ${
+            editorMode === "read"
+              ? `
+                <div id="note-md-preview" class="markdown-body">${renderMarkdown(draft.content)}</div>
+                <form id="note-add-chk-form" class="sub-add-form" style="margin-top:4px;">
+                  <input id="note-add-chk-input" class="input" type="text" placeholder="+ Add checklist / research-later item directly to this note…" />
+                  <button type="submit" class="btn btn-sm btn-ghost">Add Item</button>
+                </form>
+              `
+              : editorMode === "split"
+              ? `
+                <div class="note-split-pane">
+                  <textarea id="note-edit-content" placeholder="Write Markdown here… Use headings (##), bullets (- ), checklists (- [ ]), callouts (> [!NOTE]), or click a template above.">${esc(draft.content)}</textarea>
+                  <div id="note-md-preview" class="markdown-body note-split-preview">${renderMarkdown(draft.content)}</div>
+                </div>
+              `
+              : `
+                <textarea id="note-edit-content" style="min-height:390px;" placeholder="Write Markdown here…">${esc(draft.content)}</textarea>
+              `
+          }
+
+          ${
+            isNew && hasSyncFolder
+              ? `<label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted)">
+                  <input id="note-save-folder" type="checkbox" checked /> Also save .md file inside sync folder
+                </label>`
+              : ""
+          }
+
+          <div class="row-meta" style="justify-content:space-between;">
+            <span>
+              ${wordCount} words
+              ${active && active.checklist && active.checklist.total ? ` · Checklist ${active.checklist.done}/${active.checklist.total}` : ""}
+              ${editorMode !== "read" ? " · Ctrl+S to save" : ""}
+            </span>
+            <span>
+              ${active ? `Updated ${esc(active.updated_at)}` : "New Note Draft"}
+              ${active && active.source_path ? ` · File: ${esc(active.source_path)}` : ""}
+            </span>
+          </div>
+        </div>
       </div>
     </div>
   `;
 
+  // Restore search cursor focus if user was actively typing in search bar
   const searchInput = el.querySelector("#notes-search-input");
+  if (restoreSearchFocus && searchInput) {
+    searchInput.focus();
+    if (searchSelStart !== null && searchSelEnd !== null) {
+      searchInput.setSelectionRange(searchSelStart, searchSelEnd);
+    }
+  }
+
   let searchTimer = null;
   searchInput.addEventListener("input", () => {
     state.notesQuery = searchInput.value;
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => renderNotes(), 180);
+  });
+
+  el.querySelector("#notes-sort-select").addEventListener("change", async (e) => {
+    state.notesSort = e.target.value;
+    await renderNotes();
+  });
+
+  el.querySelectorAll("[data-folder-filter]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      state.notesFolder = btn.dataset.folderFilter;
+      state.noteDraft = null;
+      if (state.activeNoteId === -1) state.activeNoteId = null;
+      await renderNotes();
+    });
+  });
+
+  el.querySelectorAll("[data-tag-filter]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const clicked = btn.dataset.tagFilter;
+      state.notesTag = state.notesTag.toLowerCase() === clicked.toLowerCase() ? "" : clicked;
+      state.noteDraft = null;
+      if (state.activeNoteId === -1) state.activeNoteId = null;
+      await renderNotes();
+    });
   });
 
   el.querySelector("#notes-sync-btn").addEventListener("click", async () => {
@@ -1062,39 +1721,208 @@ async function renderNotes() {
 
   el.querySelector("#notes-new-btn").addEventListener("click", () => {
     state.activeNoteId = -1;
-    el.querySelector(".note-editor").innerHTML = `
-      <div class="card-header"><h2 class="card-title">Create a New Note</h2></div>
-      <input id="note-new-title" class="input" type="text" placeholder="Title (optional)" />
-      <input id="note-new-tags" class="input" type="text" placeholder="Tags (comma-separated)" />
-      <textarea id="note-new-content" placeholder="Jot down anything…"></textarea>
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
-        ${
-          hasFolder
-            ? '<label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted)"><input id="note-save-folder" type="checkbox" checked /> Also save .md file to sync folder</label>'
-            : "<span></span>"
-        }
-        <button id="note-create-btn" class="btn btn-primary">Save Note</button>
-      </div>`;
-    bindNewNoteCreate(el);
+    state.noteDraft = null;
+    state.noteEditorMode = "split";
+    renderNotes();
   });
 
   el.querySelectorAll("[data-select-note]").forEach((item) => {
     item.addEventListener("click", () => {
       state.activeNoteId = Number(item.dataset.selectNote);
+      state.noteDraft = null;
       renderNotes();
     });
   });
 
-  if (active) {
-    el.querySelectorAll("[data-note-chk-idx]").forEach((cb) => {
+  const titleEl = el.querySelector("#note-edit-title");
+  const folderEl = el.querySelector("#note-edit-folder");
+  const tagsEl = el.querySelector("#note-edit-tags");
+  const summaryEl = el.querySelector("#note-edit-summary");
+  const contentEl = el.querySelector("#note-edit-content");
+  const previewEl = el.querySelector("#note-md-preview");
+  const saveBtnEl = el.querySelector("#note-save-btn");
+
+  const markDirty = () => {
+    draft.dirty = true;
+    if (saveBtnEl) saveBtnEl.textContent = "● Save";
+  };
+
+  if (titleEl) {
+    titleEl.addEventListener("input", () => {
+      draft.title = titleEl.value;
+      markDirty();
+    });
+  }
+  if (folderEl) {
+    folderEl.addEventListener("input", () => {
+      draft.folder = folderEl.value;
+      markDirty();
+    });
+  }
+  if (tagsEl) {
+    tagsEl.addEventListener("input", () => {
+      draft.tags = tagsEl.value;
+      markDirty();
+    });
+  }
+  if (summaryEl) {
+    summaryEl.addEventListener("input", () => {
+      draft.summary = summaryEl.value;
+      markDirty();
+    });
+  }
+
+  const bindPreviewCheckboxes = () => {
+    if (!previewEl) return;
+    previewEl.querySelectorAll("[data-md-chk-idx]").forEach((cb) => {
       cb.addEventListener("change", async () => {
-        await api(`/api/notes/${active.id}/checklist-toggle`, {
-          method: "POST",
-          body: { item_index: Number(cb.dataset.noteChkIdx), done: cb.checked },
-        });
-        await renderNotes();
+        const idx = Number(cb.dataset.mdChkIdx);
+        if (!isNew && !draft.dirty) {
+          const res = await api(`/api/notes/${active.id}/checklist-toggle`, {
+            method: "POST",
+            body: { item_index: idx, done: cb.checked },
+          });
+          state.noteDraft = null;
+          state.activeNoteId = res.item.id;
+          await renderNotes();
+        } else {
+          draft.content = toggleChecklistLineInText(draft.content, idx, cb.checked);
+          draft.dirty = true;
+          if (contentEl) contentEl.value = draft.content;
+          if (saveBtnEl) saveBtnEl.textContent = "● Save";
+          previewEl.innerHTML = renderMarkdown(draft.content);
+          bindPreviewCheckboxes();
+        }
       });
     });
+  };
+  bindPreviewCheckboxes();
+
+  if (contentEl) {
+    contentEl.addEventListener("input", () => {
+      draft.content = contentEl.value;
+      markDirty();
+      if (previewEl) {
+        previewEl.innerHTML = renderMarkdown(draft.content);
+        bindPreviewCheckboxes();
+      }
+    });
+  }
+
+  // Formatting toolbar buttons
+  el.querySelectorAll("[data-md-tool]").forEach((btn) => {
+    btn.addEventListener("click", () => applyMdToolbarAction(contentEl, btn.dataset.mdTool));
+  });
+
+  // Template insertion buttons
+  el.querySelectorAll("[data-note-tpl]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const tpl = NOTE_TEMPLATES[btn.dataset.noteTpl];
+      if (!tpl || !contentEl) return;
+      if (!draft.folder.trim() && folderEl) {
+        draft.folder = tpl.folder;
+        folderEl.value = tpl.folder;
+      }
+      if (!draft.tags.trim() && tagsEl) {
+        draft.tags = tpl.tags;
+        tagsEl.value = tpl.tags;
+      }
+      if (!contentEl.value.trim()) {
+        contentEl.value = tpl.content;
+      } else {
+        contentEl.value = `${contentEl.value.trimEnd()}\n\n${tpl.content}`;
+      }
+      contentEl.dispatchEvent(new Event("input", { bubbles: true }));
+      toast(`Applied ${tpl.folder} template`, "info");
+    });
+  });
+
+  // Read / Split / Edit switcher (preserves unsaved draft)
+  el.querySelectorAll("[data-editor-mode]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.noteEditorMode = btn.dataset.editorMode;
+      renderNotes();
+    });
+  });
+
+  const styleSelect = el.querySelector("#note-organize-style");
+  if (styleSelect) {
+    styleSelect.addEventListener("change", () => {
+      state.noteOrganizeStyle = styleSelect.value;
+    });
+  }
+
+  // AI Organize button (both existing notes & new note drafts)
+  const orgBtn = el.querySelector("#note-organize-btn");
+  if (orgBtn) {
+    orgBtn.addEventListener("click", async () => {
+      const rawBody = (draft.content || "").trim();
+      const rawTitle = (draft.title || "").trim();
+      if (!rawBody && !rawTitle) {
+        toast("Write or dictate some note content first.", "info");
+        return;
+      }
+      orgBtn.disabled = true;
+      orgBtn.textContent = "✨ Organizing…";
+      try {
+        if (!isNew) {
+          const res = await api(`/api/notes/${active.id}/organize`, {
+            method: "POST",
+            body: {
+              style: state.noteOrganizeStyle,
+              apply: true,
+              draft_content: draft.content,
+              draft_title: draft.title,
+              draft_folder: draft.folder,
+              draft_tags: draft.tags,
+            },
+          });
+          state.noteDraft = null;
+          state.noteEditorMode = "read";
+          toast(
+            res.ai_used
+              ? `✨ Organized note in ${res.item.folder || "Notes"}`
+              : "Structured locally (add Groq key for AI rewriting)",
+            res.ai_used ? "success" : "info"
+          );
+          await renderNotes();
+        } else {
+          const org = await api("/api/notes/organize-preview", {
+            method: "POST",
+            body: {
+              content: draft.content,
+              title: draft.title,
+              folder: draft.folder,
+              tags: draft.tags,
+              style: state.noteOrganizeStyle,
+            },
+          });
+          draft.title = org.title || draft.title;
+          draft.folder = org.folder || draft.folder;
+          draft.summary = org.summary || "";
+          draft.tags = (org.tags || []).join(", ");
+          draft.content = org.content || draft.content;
+          draft.dirty = true;
+          toast(
+            org.ai_used
+              ? "✨ Draft organized! Review and click Save Note."
+              : "Structured locally! Review and click Save Note.",
+            org.ai_used ? "success" : "info"
+          );
+          await renderNotes();
+        }
+      } catch (err) {
+        toast(err.message || "Could not organize note", "error");
+      } finally {
+        if (document.body.contains(orgBtn)) {
+          orgBtn.disabled = false;
+          orgBtn.textContent = "✨ Organize with AI";
+        }
+      }
+    });
+  }
+
+  if (!isNew) {
     const chkForm = el.querySelector("#note-add-chk-form");
     if (chkForm) {
       chkForm.addEventListener("submit", async (e) => {
@@ -1105,52 +1933,61 @@ async function renderNotes() {
           method: "POST",
           body: { checklist_items: [text] },
         });
+        state.noteDraft = null;
         await renderNotes();
       });
     }
+
     el.querySelector("#note-save-btn").addEventListener("click", async () => {
       await api(`/api/notes/${active.id}`, {
         method: "PATCH",
         body: {
-          title: el.querySelector("#note-edit-title").value,
-          tags: el.querySelector("#note-edit-tags").value,
-          content: el.querySelector("#note-edit-content").value,
+          title: draft.title,
+          folder: draft.folder,
+          summary: draft.summary,
+          tags: draft.tags,
+          content: draft.content,
         },
       });
+      state.noteDraft = null;
       toast("Note saved", "success");
       await renderNotes();
     });
+
     el.querySelector("#note-pin-btn").addEventListener("click", async () => {
       await api(`/api/notes/${active.id}`, { method: "PATCH", body: { pinned: !active.pinned } });
+      state.noteDraft = null;
       await renderNotes();
     });
+
     el.querySelector("#note-del-btn").addEventListener("click", async () => {
       await api(`/api/notes/${active.id}`, { method: "DELETE" });
       state.activeNoteId = null;
+      state.noteDraft = null;
       toast("Note deleted", "info");
       await renderNotes();
     });
   } else {
-    bindNewNoteCreate(el);
-  }
-}
-
-function bindNewNoteCreate(el) {
-  const btn = el.querySelector("#note-create-btn");
-  if (!btn) return;
-  btn.addEventListener("click", async () => {
-    const title = el.querySelector("#note-new-title").value.trim();
-    const tags = el.querySelector("#note-new-tags").value.trim();
-    const content = el.querySelector("#note-new-content").value;
-    const saveToFolder = Boolean(el.querySelector("#note-save-folder")?.checked);
-    const res = await api("/api/notes", {
-      method: "POST",
-      body: { title, tags, content, save_to_folder: saveToFolder },
+    el.querySelector("#note-create-btn").addEventListener("click", async () => {
+      const saveToFolder = Boolean(el.querySelector("#note-save-folder")?.checked);
+      const res = await api("/api/notes", {
+        method: "POST",
+        body: {
+          title: draft.title.trim(),
+          folder: draft.folder.trim(),
+          summary: draft.summary.trim(),
+          tags: draft.tags.trim(),
+          content: draft.content,
+          save_to_folder: saveToFolder,
+        },
+      });
+      state.noteDraft = null;
+      state.activeNoteId = res.item.id;
+      state.noteEditorMode = "read";
+      toast("Note created", "success");
+      await renderNotes();
     });
-    state.activeNoteId = res.item.id;
-    toast("Note created", "success");
-    await renderNotes();
-  });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2059,7 +2896,12 @@ async function renderAsk() {
       const dom = chip.dataset.chipDomain;
       const id = chip.dataset.chipId ? Number(chip.dataset.chipId) : null;
       if (dom === "note") {
+        state.notesFolder = "all";
+        state.notesTag = "";
+        state.notesQuery = "";
+        state.noteDraft = null;
         if (id) state.activeNoteId = id;
+        state.noteEditorMode = "read";
         switchView("notes");
       } else if (dom === "task" || dom === "want_to_do") switchView("tasks");
       else if (dom === "gym") switchView("gym");
@@ -2369,6 +3211,14 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   document.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s" && state.view === "notes") {
+      e.preventDefault();
+      const saveBtn = document.getElementById("note-save-btn") || document.getElementById("note-create-btn");
+      if (saveBtn && !saveBtn.disabled) {
+        saveBtn.click();
+      }
+      return;
+    }
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
       e.preventDefault();
       const input = document.getElementById("capture-input");

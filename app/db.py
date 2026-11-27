@@ -15,6 +15,8 @@ from app.config import get_db_path, get_media_dir
 TASK_LIST_TYPES = ("daily", "want_to_do")
 TASK_PRIORITIES = ("normal", "high")
 TASK_STATUSES = ("not_started", "partially_completed", "completed")
+DEFAULT_NOTE_FOLDERS = ("Lectures", "Projects", "Study", "Personal", "Ideas")
+NOTE_SORTS = ("updated", "created", "title")
 ACTIVITY_DOMAINS = ("gym", "art")
 ART_STATUSES = ("idea", "wip", "finished")
 GAME_STATUSES = ("playing", "want_to_play", "finished", "on_hold")
@@ -61,6 +63,8 @@ CREATE TABLE IF NOT EXISTS notes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL DEFAULT '',
     content TEXT NOT NULL DEFAULT '',
+    folder TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
     tags TEXT NOT NULL DEFAULT '[]',
     pinned INTEGER NOT NULL DEFAULT 0,
     source_path TEXT UNIQUE,
@@ -170,6 +174,13 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
     if "frequency" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN frequency TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);")
+
+    note_cols = {r["name"] for r in conn.execute("PRAGMA table_info(notes)").fetchall()}
+    if "folder" not in note_cols:
+        conn.execute("ALTER TABLE notes ADD COLUMN folder TEXT NOT NULL DEFAULT ''")
+    if "summary" not in note_cols:
+        conn.execute("ALTER TABLE notes ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(folder COLLATE NOCASE);")
 
 
 @contextmanager
@@ -317,10 +328,16 @@ def _row_to_task(
 
 def _row_to_note(row: sqlite3.Row) -> dict[str, Any]:
     content = row["content"]
+    row_keys = row.keys()
+    folder = row["folder"] if "folder" in row_keys else ""
+    summary = row["summary"] if "summary" in row_keys else ""
     return {
         "id": row["id"],
         "title": row["title"],
         "content": content,
+        "folder": folder or "",
+        "summary": summary or "",
+        "word_count": len((content or "").split()),
         "tags": _parse_json_list(row["tags"]),
         "pinned": bool(row["pinned"]),
         "checklist": _compute_note_checklist_stats(content),
@@ -732,12 +749,40 @@ def delete_task(task_id: int) -> bool:
 # Notes
 # ---------------------------------------------------------------------------
 
-def list_notes(query: str = "", tag: str = "") -> list[dict[str, Any]]:
+def _clean_folder(folder: str | None) -> str:
+    return (folder or "").strip()[:60]
+
+
+def list_notes(
+    query: str = "",
+    tag: str = "",
+    folder: str = "",
+    pinned_only: bool = False,
+    sort: str = "updated",
+) -> list[dict[str, Any]]:
+    order_key = sort if sort in NOTE_SORTS else "updated"
+    if order_key == "created":
+        order_sql = "ORDER BY pinned DESC, created_at DESC, id DESC"
+    elif order_key == "title":
+        order_sql = "ORDER BY pinned DESC, LOWER(title) ASC, id DESC"
+    else:
+        order_sql = "ORDER BY pinned DESC, updated_at DESC, id DESC"
+
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM notes ORDER BY pinned DESC, updated_at DESC, id DESC"
-        ).fetchall()
+        rows = conn.execute(f"SELECT * FROM notes {order_sql}").fetchall()
     notes = [_row_to_note(r) for r in rows]
+
+    if pinned_only:
+        notes = [n for n in notes if n["pinned"]]
+
+    f_raw = (folder or "").strip()
+    if f_raw and f_raw.lower() != "all":
+        if f_raw == "__unfiled__":
+            notes = [n for n in notes if not n["folder"].strip()]
+        else:
+            f_low = f_raw.lower()
+            notes = [n for n in notes if n["folder"].strip().lower() == f_low]
+
     q = query.strip().lower()
     t = tag.strip().lstrip("#").lower()
     if t:
@@ -746,11 +791,76 @@ def list_notes(query: str = "", tag: str = "") -> list[dict[str, Any]]:
         tokens = [tok for tok in re.split(r"\s+", q) if tok]
         filtered = []
         for n in notes:
-            hay = f"{n['title']} {n['content']} {' '.join(n['tags'])}".lower()
+            hay = (
+                f"{n['title']} {n['summary']} {n['content']} "
+                f"{n['folder']} {' '.join(n['tags'])}"
+            ).lower()
             if all(tok in hay for tok in tokens):
                 filtered.append(n)
         notes = filtered
     return notes
+
+
+def list_note_folders() -> dict[str, Any]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT folder, pinned FROM notes").fetchall()
+
+    counts: dict[str, int] = {}
+    display_names: dict[str, str] = {}
+    for preset in DEFAULT_NOTE_FOLDERS:
+        counts[preset.lower()] = 0
+        display_names[preset.lower()] = preset
+
+    pinned_count = 0
+    unfiled_count = 0
+    for r in rows:
+        if r["pinned"]:
+            pinned_count += 1
+        raw_folder = (r["folder"] or "").strip()
+        if not raw_folder:
+            unfiled_count += 1
+            continue
+        low = raw_folder.lower()
+        if low not in display_names:
+            display_names[low] = raw_folder
+        counts[low] = counts.get(low, 0) + 1
+
+    preset_lows = [p.lower() for p in DEFAULT_NOTE_FOLDERS]
+    folders: list[dict[str, Any]] = [
+        {"name": display_names[low], "count": counts[low]} for low in preset_lows
+    ]
+    custom_lows = sorted(k for k in counts if k not in preset_lows)
+    for low in custom_lows:
+        folders.append({"name": display_names[low], "count": counts[low]})
+
+    return {
+        "total": len(rows),
+        "pinned": pinned_count,
+        "unfiled": unfiled_count,
+        "folders": folders,
+    }
+
+
+def list_note_tags() -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT tags FROM notes").fetchall()
+
+    counts: dict[str, int] = {}
+    display: dict[str, str] = {}
+    for r in rows:
+        for tag in _parse_json_list(r["tags"]):
+            clean = str(tag).strip()
+            if not clean:
+                continue
+            low = clean.lower()
+            if low not in display:
+                display[low] = clean
+            counts[low] = counts.get(low, 0) + 1
+
+    return [
+        {"name": display[low], "count": cnt}
+        for low, cnt in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
 
 
 def get_note(note_id: int) -> dict[str, Any] | None:
@@ -774,6 +884,8 @@ def create_note(
     pinned: bool = False,
     source_path: str | None = None,
     file_mtime: float | None = None,
+    folder: str = "",
+    summary: str = "",
 ) -> dict[str, Any]:
     clean_title = title.strip()
     clean_content = content.strip("\r\n")
@@ -783,16 +895,20 @@ def create_note(
         first_line = clean_content.splitlines()[0].lstrip("#").strip()
         clean_title = first_line[:80] or "Untitled Note"
     cleaned_tags = _clean_tags(tags)
+    clean_folder = _clean_folder(folder)
+    clean_summary = (summary or "").strip()
     ts = now_iso()
     with get_conn() as conn:
         cur = conn.execute(
             """
-            INSERT INTO notes (title, content, tags, pinned, source_path, file_mtime, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO notes (title, content, folder, summary, tags, pinned, source_path, file_mtime, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 clean_title,
                 clean_content,
+                clean_folder,
+                clean_summary,
                 json.dumps(cleaned_tags),
                 int(bool(pinned)),
                 source_path,
@@ -814,6 +930,16 @@ def update_note(note_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
         content = str(patch.get("content", existing["content"])).strip("\r\n")
         if not title and content:
             title = content.splitlines()[0].lstrip("#").strip()[:80] or "Untitled Note"
+        folder = (
+            _clean_folder(str(patch["folder"]))
+            if "folder" in patch and patch["folder"] is not None
+            else (existing["folder"] or "")
+        )
+        summary = (
+            str(patch["summary"]).strip()
+            if "summary" in patch and patch["summary"] is not None
+            else (existing["summary"] or "")
+        )
         tags = (
             _clean_tags(patch["tags"])
             if "tags" in patch
@@ -826,12 +952,15 @@ def update_note(note_id: int, patch: dict[str, Any]) -> dict[str, Any] | None:
         conn.execute(
             """
             UPDATE notes
-            SET title = ?, content = ?, tags = ?, pinned = ?, source_path = ?, file_mtime = ?, updated_at = ?
+            SET title = ?, content = ?, folder = ?, summary = ?, tags = ?, pinned = ?,
+                source_path = ?, file_mtime = ?, updated_at = ?
             WHERE id = ?
             """,
             (
                 title,
                 content,
+                folder,
+                summary,
                 json.dumps(tags),
                 int(pinned),
                 source_path,
@@ -849,17 +978,27 @@ def append_to_note(
     text: str = "",
     checklist_items: list[str] | None = None,
     add_tags: list[str] | str | None = None,
+    heading: str = "",
+    folder: str | None = None,
 ) -> dict[str, Any] | None:
-    """Append text, Markdown checklist lines, and/or tags to an existing note."""
+    """Append text, optional Markdown heading, checklist lines, folder, and/or tags to a note."""
     existing = get_note(note_id)
     if not existing:
         return None
     parts: list[str] = []
     if existing["content"].strip():
         parts.append(existing["content"].rstrip())
+
+    new_block_parts: list[str] = []
+    clean_heading = (heading or "").strip()
+    if clean_heading:
+        if not clean_heading.startswith("#"):
+            clean_heading = f"## {clean_heading}"
+        new_block_parts.append(clean_heading)
+
     clean_text = (text or "").strip("\r\n")
     if clean_text:
-        parts.append(clean_text)
+        new_block_parts.append(clean_text)
     if checklist_items:
         checklist_lines = [
             f"- [ ] {str(item).strip()}"
@@ -867,13 +1006,20 @@ def append_to_note(
             if str(item).strip()
         ]
         if checklist_lines:
-            parts.append("\n".join(checklist_lines))
+            new_block_parts.append("\n".join(checklist_lines))
+
+    if new_block_parts:
+        parts.append("\n\n".join(new_block_parts))
+
     merged_content = "\n\n".join(parts) if parts else existing["content"]
     merged_tags = list(existing["tags"])
     for tag in _clean_tags(add_tags):
         if tag.lower() not in {t.lower() for t in merged_tags}:
             merged_tags.append(tag)
-    return update_note(note_id, {"content": merged_content, "tags": merged_tags})
+    patch: dict[str, Any] = {"content": merged_content, "tags": merged_tags}
+    if folder is not None and folder.strip():
+        patch["folder"] = _clean_folder(folder)
+    return update_note(note_id, patch)
 
 
 def toggle_note_checklist_line(
@@ -1495,16 +1641,24 @@ def search_everything(query: str, limit: int = 25) -> list[dict[str, Any]]:
 
     for r in note_rows:
         tags = _parse_json_list(r["tags"])
-        text = f"{r['title']} {r['content']} {' '.join(tags)}"
+        r_keys = r.keys()
+        folder = r["folder"] if "folder" in r_keys else ""
+        summary = r["summary"] if "summary" in r_keys else ""
+        text = f"{r['title']} {folder} {summary} {r['content']} {' '.join(tags)}"
         score = _score_match(q_lower, tokens, text, boost=1.0 if r["pinned"] else 0.3)
         if score > 0:
+            meta_parts = []
+            if folder:
+                meta_parts.append(f"📁 {folder}")
+            if tags:
+                meta_parts.append(", ".join(f"#{t}" for t in tags))
             results.append(
                 {
                     "type": "note",
                     "id": r["id"],
                     "title": r["title"] or "Untitled Note",
-                    "snippet": (r["content"] or "")[:240],
-                    "meta": ", ".join(f"#{t}" for t in tags) if tags else r["updated_at"][:10],
+                    "snippet": (summary or r["content"] or "")[:240],
+                    "meta": " · ".join(meta_parts) if meta_parts else r["updated_at"][:10],
                     "score": score,
                 }
             )

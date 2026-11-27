@@ -72,12 +72,15 @@ def sync_notes_folder(folder_path: str) -> dict[str, Any]:
                 title = _extract_title_from_file(fpath, text)
                 existing = db.get_note_by_source_path(resolved)
                 if existing is None:
+                    rel_parts = fpath.relative_to(root).parts
+                    inferred_folder = rel_parts[0] if len(rel_parts) > 1 else ""
                     db.create_note(
                         title=title,
                         content=text,
                         tags=["synced"],
                         source_path=resolved,
                         file_mtime=mtime,
+                        folder=inferred_folder,
                     )
                     imported += 1
                 else:
@@ -130,15 +133,21 @@ def write_note_to_source(note: dict[str, Any]) -> dict[str, Any]:
 
 
 def save_new_note_to_folder(note: dict[str, Any], folder_path: str) -> dict[str, Any]:
-    """Create a .md file inside folder_path for a newly created app note."""
+    """Create a .md file inside folder_path (preserving subfolder if note has a folder)."""
     root = Path(folder_path).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         raise FileNotFoundError(f"Notes folder does not exist: {root}")
+    note_folder = str(note.get("folder") or "").strip()
+    if note_folder:
+        target_dir = root / _slugify_filename(note_folder)
+        target_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        target_dir = root
     slug = _slugify_filename(note.get("title") or "note")
-    candidate = root / f"{slug}.md"
+    candidate = target_dir / f"{slug}.md"
     counter = 2
     while candidate.exists():
-        candidate = root / f"{slug}-{counter}.md"
+        candidate = target_dir / f"{slug}-{counter}.md"
         counter += 1
     title = (note.get("title") or "").strip()
     content = note.get("content", "")

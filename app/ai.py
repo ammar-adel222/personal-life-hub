@@ -217,6 +217,228 @@ def _fallback_parse(raw_text: str, today: str, default_unit: str = "kg") -> dict
     }
 
 
+def _infer_note_folder(text: str) -> str:
+    low = (text or "").lower()
+    if any(k in low for k in ("lecture", "course", "professor", "class ", "semester", "stanford", "MIT")):
+        return "Lectures"
+    if any(k in low for k in ("project", "repo", "deploy", "backend", "frontend", "api", "roadmap", "milestone")):
+        return "Projects"
+    if any(k in low for k in ("study", "research", "paper", "chapter", "book", "exam", "concept", "algorithm")):
+        return "Study"
+    if any(k in low for k in ("idea", "brainstorm", "Concept", "sketch")):
+        return "Ideas"
+    return "Personal"
+
+
+def _offline_organize_note(
+    raw_content: str,
+    current_title: str = "",
+    current_folder: str = "",
+    current_tags: list[str] | None = None,
+    style: str = "structured",
+) -> dict[str, Any]:
+    """Deterministic local fallback that cleans prose into Markdown sections and checklists."""
+    text = (raw_content or "").strip()
+    title = (current_title or "").strip()
+    if not text and not title:
+        raise ValueError("Note content cannot be empty.")
+
+    lines = text.splitlines() if text else [title]
+    has_headings = any(ln.lstrip().startswith("#") for ln in lines)
+    checklist_lines: list[str] = []
+    body_blocks: list[str] = []
+    in_code = False
+
+    if not has_headings:
+        for ln in lines:
+            stripped = ln.strip()
+            if stripped.startswith("```"):
+                in_code = not in_code
+                body_blocks.append(ln)
+                continue
+            if in_code:
+                body_blocks.append(ln)
+                continue
+            if re.match(r"^[-*]\s*\[[ xX]\]\s+", stripped):
+                checklist_lines.append(stripped)
+            elif stripped:
+                body_blocks.append(stripped)
+
+        formatted_points: list[str] = []
+        in_code = False
+        for blk in body_blocks:
+            if blk.strip().startswith("```"):
+                in_code = not in_code
+                formatted_points.append(blk)
+                continue
+            if in_code:
+                formatted_points.append(blk)
+                continue
+            if re.match(r"^([-*]|\d+\.|>|\|)\s", blk):
+                formatted_points.append(blk)
+            elif len(blk) > 140 and ". " in blk:
+                for sent in re.split(r"(?<=[.!?])\s+", blk):
+                    s = sent.strip()
+                    if s:
+                        formatted_points.append(f"- {s}")
+            else:
+                formatted_points.append(f"- {blk}")
+
+        heading_label = {
+            "lecture": "## Key Concepts",
+            "concise": "## Key Takeaways",
+        }.get(style, "## Key Notes")
+        parts: list[str] = []
+        if formatted_points:
+            parts.append(heading_label + "\n\n" + "\n".join(formatted_points))
+        if checklist_lines:
+            parts.append("## Action & Research Items\n\n" + "\n".join(checklist_lines))
+        organized_content = "\n\n".join(parts).strip() or text
+    else:
+        organized_content = text
+
+    plain_preview = re.sub(r"[#>*`\[\]_~]+", " ", text or title)
+    plain_preview = re.sub(r"\s+", " ", plain_preview).strip()
+    first_sent = re.split(r"(?<=[.!?])\s+", plain_preview)[0] if plain_preview else ""
+    summary = first_sent[:160].strip()
+
+    if not title or title.lower().startswith("untitled"):
+        words = [w for w in re.split(r"\s+", first_sent) if w]
+        title = " ".join(words[:7]).rstrip(".,;:")[:75] or "Structured Note"
+
+    folder = (current_folder or "").strip() or _infer_note_folder(f"{title} {text}")
+    tags = db._clean_tags(current_tags)
+    if not tags and folder:
+        tags = [folder.lower()]
+
+    return {
+        "title": title,
+        "folder": folder,
+        "summary": summary,
+        "tags": tags,
+        "content": organized_content,
+    }
+
+
+async def organize_note_text(
+    raw_content: str,
+    current_title: str = "",
+    current_folder: str = "",
+    current_tags: list[str] | str | None = None,
+    style: str = "structured",
+) -> dict[str, Any]:
+    """Turn messy notes or voice transcripts into clean structured Markdown with summary & tags."""
+    clean_content = (raw_content or "").strip()
+    clean_title = (current_title or "").strip()
+    if not clean_content and not clean_title:
+        raise ValueError("Note content cannot be empty.")
+
+    norm_style = style if style in ("structured", "lecture", "concise") else "structured"
+    base_tags = db._clean_tags(current_tags)
+    settings = load_settings()
+    api_key = settings.get("groq_api_key", "").strip()
+    model = settings.get("groq_model", "openai/gpt-oss-120b")
+
+    if not api_key:
+        organized = _offline_organize_note(
+            clean_content,
+            current_title=clean_title,
+            current_folder=current_folder,
+            current_tags=base_tags,
+            style=norm_style,
+        )
+        return {**organized, "ai_used": False, "model": None, "warning": None}
+
+    style_guidance = {
+        "structured": (
+            "Format with clear `##` topical headings, clean bullet points, **bold** key terms, "
+            "a `> [!NOTE]` or `> [!IMPORTANT]` callout for the main takeaway if helpful, "
+            "Markdown tables for comparisons/numbers if applicable, and `- [ ]` items under "
+            "`## Action & Research Items` for follow-ups."
+        ),
+        "lecture": (
+            "Structure as a clean study/lecture note using sections like `## Overview`, "
+            "`## Core Concepts`, `> [!IMPORTANT]` Key Takeaways callout, and "
+            "`## To Research / Review` (`- [ ]` checkboxes) for open questions."
+        ),
+        "concise": (
+            "Distill into a tight executive summary: one `> [!NOTE]` TL;DR callout, compact `##` "
+            "bullet lists, and `- [ ]` action items if any exist."
+        ),
+    }[norm_style]
+
+    system_prompt = (
+        "You are an expert personal knowledge editor inside Personal Life Hub.\n"
+        "Transform the user's raw note or spoken transcript into a crisp, well-organized Markdown note.\n"
+        "Return ONLY valid JSON: "
+        '{"title": "...", "folder": "...", "summary": "1-2 sentence TL;DR", "tags": ["..."], "content": "..."}.\n'
+        "Rules:\n"
+        "1. Fix obvious speech-to-text / Whisper phonetic typos (e.g. 'to the DEM' -> 'to the gym' if workout context) "
+        "WITHOUT inventing facts. Preserve all specific numbers, weights, sets/reps, dates, links, and code blocks.\n"
+        "2. Preserve existing Markdown checkboxes `- [x]` and `- [ ]` accurately (do not uncheck done items).\n"
+        f"3. {style_guidance}\n"
+        "4. Do NOT start `content` with `# {title}` since `title` is stored separately.\n"
+        f"5. Choose an appropriate `folder` from {list(db.DEFAULT_NOTE_FOLDERS)} (or keep the existing folder if clearly right).\n"
+        "6. Provide 2-5 concise lowercase `tags` without `#`."
+    )
+    user_payload = (
+        f"Current title: {clean_title or '(auto-generate a clean title)'}\n"
+        f"Current folder: {(current_folder or '').strip() or '(auto-pick)'}\n"
+        f"Current tags: {', '.join(base_tags) if base_tags else '(none)'}\n\n"
+        f"Note text:\n{clean_content or clean_title}"
+    )
+
+    try:
+        raw_reply, model_used = await _call_groq_chat(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_payload},
+            ],
+            api_key=api_key,
+            model=model,
+            json_mode=True,
+            temperature=0.15,
+        )
+        parsed = _extract_json_object(raw_reply)
+        out_content = str(parsed.get("content") or "").strip()
+        if not out_content:
+            raise ValueError("AI returned empty note content")
+        out_title = str(parsed.get("title") or clean_title).strip() or "Structured Note"
+        # Strip duplicate leading H1 if model repeated the title
+        first_line = out_content.splitlines()[0].strip() if out_content.splitlines() else ""
+        if first_line.startswith("# ") and first_line[2:].strip().lower() == out_title.lower():
+            out_content = "\n".join(out_content.splitlines()[1:]).lstrip("\r\n")
+        out_folder = str(parsed.get("folder") or current_folder).strip() or _infer_note_folder(
+            f"{out_title} {out_content}"
+        )
+        out_summary = str(parsed.get("summary") or "").strip()
+        out_tags = db._clean_tags(parsed.get("tags") or base_tags)
+        return {
+            "title": out_title[:120],
+            "folder": out_folder[:60],
+            "summary": out_summary[:320],
+            "tags": out_tags,
+            "content": out_content,
+            "ai_used": True,
+            "model": model_used,
+            "warning": None,
+        }
+    except Exception as exc:
+        organized = _offline_organize_note(
+            clean_content,
+            current_title=clean_title,
+            current_folder=current_folder,
+            current_tags=base_tags,
+            style=norm_style,
+        )
+        return {
+            **organized,
+            "ai_used": False,
+            "model": None,
+            "warning": f"Groq unavailable ({exc}); used local organizer.",
+        }
+
+
 def _explicit_mode_actions(raw_text: str, mode: str, today: str, unit: str) -> dict[str, Any]:
     text = raw_text.strip()
     if mode == "task":
@@ -279,6 +501,8 @@ def execute_actions(actions: list[dict[str, Any]], default_unit: str = "kg") -> 
                     title=title,
                     content=content,
                     tags=act.get("tags") or [],
+                    folder=str(act.get("folder") or ""),
+                    summary=str(act.get("summary") or ""),
                 )
                 executed.append({"type": "note", "label": f"Note: {item['title']}", "item": item})
 
@@ -403,7 +627,25 @@ async def smart_capture(
     model_used: str | None = None
     warning: str | None = None
 
-    if mode != "auto":
+    if mode == "note" and api_key and len(clean) > 40:
+        org = await organize_note_text(clean, style="structured")
+        parsed = {
+            "summary": f"Saved organized note: {org['title']}",
+            "actions": [
+                {
+                    "type": "note",
+                    "title": org["title"],
+                    "folder": org["folder"],
+                    "summary": org["summary"],
+                    "tags": org["tags"],
+                    "content": org["content"],
+                }
+            ],
+        }
+        ai_used = bool(org["ai_used"])
+        model_used = org["model"]
+        warning = org["warning"]
+    elif mode != "auto":
         parsed = _explicit_mode_actions(clean, mode, today, default_unit)
     elif api_key:
         system_prompt = (
@@ -413,7 +655,7 @@ async def smart_capture(
             "Allowed action schemas:\n"
             "1. {\"type\": \"task\", \"title\": \"...\", \"priority\": \"normal|high\", \"due_date\": \"YYYY-MM-DD or null\", \"category\": \"\"}\n"
             "2. {\"type\": \"want_to_do\", \"title\": \"...\", \"category\": \"\"} (bucket list, someday goals, things to try)\n"
-            "3. {\"type\": \"note\", \"title\": \"...\", \"content\": \"...\", \"tags\": [\"...\"]}\n"
+            "3. {\"type\": \"note\", \"title\": \"...\", \"folder\": \"Lectures|Projects|Study|Personal|Ideas\", \"summary\": \"1-sentence TL;DR\", \"content\": \"clean Markdown with ## headings, bullets & - [ ] follow-ups\", \"tags\": [\"...\"]}\n"
             "4. {\"type\": \"gym_day\", \"date\": \"YYYY-MM-DD\", \"note\": \"\"} (when user mentions going to gym / working out)\n"
             "5. {\"type\": \"gym_set\", \"date\": \"YYYY-MM-DD\", \"exercise\": \"...\", \"sets\": 3, \"reps\": 10, \"weight\": 80, \"unit\": \"kg\", \"notes\": \"\"}\n"
             "6. {\"type\": \"art_day\", \"date\": \"YYYY-MM-DD\", \"note\": \"\"} (when user says they drew/painted/did art)\n"
@@ -487,7 +729,9 @@ def _build_life_context(question: str) -> tuple[str, list[dict[str, Any]]]:
         lines.append("\n[Recent Notes]")
         for n in recent_notes:
             tags = " ".join(f"#{t}" for t in n["tags"])
-            lines.append(f"- Note #{n['id']} '{n['title']}' [{tags}]: {n['content'][:320]}")
+            folder_lbl = f" ({n['folder']})" if n.get("folder") else ""
+            body_preview = n.get("summary") or n["content"][:320]
+            lines.append(f"- Note #{n['id']} '{n['title']}'{folder_lbl} [{tags}]: {body_preview}")
 
     if open_tasks or want_tasks:
         lines.append("\n[Open Tasks & Want-to-Do]")

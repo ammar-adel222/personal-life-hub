@@ -233,10 +233,15 @@ async def run_agent_turn(
         "   - Always fill `frequency` when a cadence or target amount is mentioned (e.g. '4x / week', '3 artworks in 10 days', '10-20 hours total').\n"
         "   - Add concrete `checklist_items` when an item is countable (e.g. Lectures 1..5, Artwork 1..3, or subtasks).\n"
         "   - Reserve `list_type='want_to_do'` strictly for unscheduled someday ideas with no timeline.\n"
-        "4. **Update hobby trackers too**: If the user mentions games (e.g. Elden Ring) or art projects, ALSO call `upsert_game` / `upsert_art` alongside creating any sprint tasks.\n"
-        "5. **Check existing records first**: When updating/checking off an existing task or lecture note without its ID in recent history, call `list_tasks` or `search_notes` first.\n"
-        "6. **Delete safety**: Never delete without explicit confirmation (`confirmed=false` first).\n"
-        "7. **Concise replies**: Confirm clearly what was created/updated in 1-3 short, friendly sentences. Ask a brief clarifying question only if genuinely ambiguous."
+        "4. **Auto-structure notes**: Whenever saving or updating a note (`create_note`, `append_to_note`, `update_note`), "
+        "NEVER dump raw unformatted voice transcripts. Format `content` in clean Markdown (`##` headings, concise bullet points, "
+        "**bold** key terms, `> [!NOTE]` callout for key takeaways, and `- [ ]` research/action items), write a concise 1-2 sentence `summary`, "
+        "pick an appropriate `folder` (`Lectures`, `Projects`, `Study`, `Personal`, `Ideas`), and include relevant `tags`. "
+        "When the user asks to organize or clean up an existing note, fetch it with `get_note` or `search_notes` and update it via `update_note`.\n"
+        "5. **Update hobby trackers too**: If the user mentions games (e.g. Elden Ring) or art projects, ALSO call `upsert_game` / `upsert_art` alongside creating any sprint tasks.\n"
+        "6. **Check existing records first**: When updating/checking off an existing task or lecture note without its ID in recent history, call `list_tasks` or `search_notes` first.\n"
+        "7. **Delete safety**: Never delete without explicit confirmation (`confirmed=false` first).\n"
+        "8. **Concise replies**: Confirm clearly what was created/updated in 1-3 short, friendly sentences. Ask a brief clarifying question only if genuinely ambiguous."
     )
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]

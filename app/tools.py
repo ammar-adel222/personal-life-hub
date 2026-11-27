@@ -176,12 +176,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "search_notes",
-            "description": "Search notes by keyword query and/or tag. Use before appending to or checking off a lecture/research note if note_id is not yet known.",
+            "description": "Search notes by keyword query, folder/notebook, pinned state, and/or tag. Use before appending to or organizing a note if note_id is not yet known.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
                     "tag": {"type": "string"},
+                    "folder": {"type": "string", "description": "Optional notebook/folder filter (e.g. Lectures, Projects, Study, Personal, Ideas)."},
+                    "pinned_only": {"type": "boolean"},
                 },
                 "required": [],
             },
@@ -191,7 +193,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "get_note",
-            "description": "Fetch full note content, tags, and interactive checklist stats by note_id.",
+            "description": "Fetch full note content, folder, summary, tags, and interactive checklist stats by note_id.",
             "parameters": {
                 "type": "object",
                 "properties": {"note_id": {"type": "integer"}},
@@ -203,12 +205,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "create_note",
-            "description": "Create a new note (e.g. lecture note, idea, research note) with optional tags and Markdown checklist items.",
+            "description": "Create a well-structured Markdown note (using ## headings, bullets, > [!NOTE] callouts, and - [ ] follow-ups) with folder, 1-2 sentence summary, tags, and optional checklist items.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "title": {"type": "string"},
-                    "content": {"type": "string"},
+                    "folder": {"type": "string", "description": "Notebook folder, e.g. 'Lectures', 'Projects', 'Study', 'Personal', 'Ideas', or custom name."},
+                    "summary": {"type": "string", "description": "Concise 1-2 sentence TL;DR summary of the note."},
+                    "content": {"type": "string", "description": "Structured Markdown content with ## headings and bullets."},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "checklist_items": {
                         "type": "array",
@@ -225,15 +229,37 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "append_to_note",
-            "description": "Append additional text, checklist items to research later, or tags to an existing note (great for mid-lecture voice additions).",
+            "name": "update_note",
+            "description": "Rewrite or update an existing note's title, structured Markdown content, folder, summary, tags, or pinned status (ideal for organizing raw/messy notes).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "note_id": {"type": "integer"},
+                    "title": {"type": "string"},
+                    "content": {"type": "string", "description": "Cleaned/organized Markdown content."},
+                    "folder": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "pinned": {"type": "boolean"},
+                },
+                "required": ["note_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "append_to_note",
+            "description": "Append structured text (optionally under a new ## heading), checklist items to research later, folder, or tags to an existing note.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_id": {"type": "integer"},
+                    "heading": {"type": "string", "description": "Optional Markdown section heading above the appended block."},
                     "text": {"type": "string"},
                     "checklist_items": {"type": "array", "items": {"type": "string"}},
                     "add_tags": {"type": "array", "items": {"type": "string"}},
+                    "folder": {"type": "string"},
                 },
                 "required": ["note_id"],
             },
@@ -612,11 +638,15 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
             items = db.list_notes(
                 query=str(args.get("query") or ""),
                 tag=str(args.get("tag") or ""),
+                folder=str(args.get("folder") or ""),
+                pinned_only=_coerce_bool(args.get("pinned_only"), False),
             )
             compact = [
                 {
                     "id": n["id"],
                     "title": n["title"],
+                    "folder": n["folder"],
+                    "summary": n["summary"],
                     "tags": n["tags"],
                     "checklist": n["checklist"],
                     "snippet": n["content"][:280],
@@ -636,6 +666,8 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
         if name == "create_note":
             title = str(args.get("title") or "").strip()
             content = str(args.get("content") or "").strip()
+            folder = str(args.get("folder") or "").strip()
+            summary = str(args.get("summary") or "").strip()
             tags = _coerce_str_list(args.get("tags"))
             checklist = _coerce_str_list(args.get("checklist_items"))
             if checklist:
@@ -648,14 +680,17 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
                 content=content,
                 tags=tags,
                 pinned=_coerce_bool(args.get("pinned"), False),
+                folder=folder,
+                summary=summary,
             )
             if _coerce_bool(args.get("save_to_folder"), False):
-                folder = settings.get("notes_folder", "").strip()
-                if folder:
+                folder_cfg = settings.get("notes_folder", "").strip()
+                if folder_cfg:
                     try:
-                        note = notes_sync.save_new_note_to_folder(note, folder)
+                        note = notes_sync.save_new_note_to_folder(note, folder_cfg)
                     except OSError:
                         pass
+            folder_lbl = f" ({note['folder']})" if note.get("folder") else ""
             tag_label = f" [{', '.join('#' + t for t in note['tags'])}]" if note["tags"] else ""
             return {
                 "result": {"note": note},
@@ -663,7 +698,34 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
                     "tool": name,
                     "domain": "note",
                     "item_id": note["id"],
-                    "label": f"Note: {note['title']}{tag_label}",
+                    "label": f"Note{folder_lbl}: {note['title']}{tag_label}",
+                },
+                "navigate_to": None,
+            }
+
+        if name == "update_note":
+            note_id = _coerce_int(args.get("note_id"))
+            if note_id is None:
+                return {"result": {"error": "note_id is required."}, "action_badge": None, "navigate_to": None}
+            patch: dict[str, Any] = {}
+            for key in ("title", "content", "folder", "summary"):
+                if key in args and args[key] is not None:
+                    patch[key] = str(args[key])
+            if "tags" in args and args["tags"] is not None:
+                patch["tags"] = _coerce_str_list(args["tags"])
+            if "pinned" in args and args["pinned"] is not None:
+                patch["pinned"] = _coerce_bool(args["pinned"])
+            note = db.update_note(note_id, patch)
+            if not note:
+                return {"result": {"error": f"Note #{note_id} not found."}, "action_badge": None, "navigate_to": None}
+            note = _sync_note_if_needed(note)
+            return {
+                "result": {"note": note},
+                "action_badge": {
+                    "tool": name,
+                    "domain": "note",
+                    "item_id": note["id"],
+                    "label": f"Organized Note: {note['title']}",
                 },
                 "navigate_to": None,
             }
@@ -672,11 +734,14 @@ def execute_tool(name: str, raw_args: dict[str, Any] | None = None) -> dict[str,
             note_id = _coerce_int(args.get("note_id"))
             if note_id is None:
                 return {"result": {"error": "note_id is required."}, "action_badge": None, "navigate_to": None}
+            folder_arg = str(args.get("folder") or "").strip() or None
             note = db.append_to_note(
                 note_id=note_id,
                 text=str(args.get("text") or ""),
                 checklist_items=_coerce_str_list(args.get("checklist_items")),
                 add_tags=_coerce_str_list(args.get("add_tags")),
+                heading=str(args.get("heading") or ""),
+                folder=folder_arg,
             )
             if not note:
                 return {"result": {"error": f"Note #{note_id} not found."}, "action_badge": None, "navigate_to": None}
