@@ -51,6 +51,7 @@ flowchart LR
   - **Tagging, Linking & Stats**: Categorize by subject, link sessions to any **Active Task** (or auto-match from topic) or **Note**, log past sessions manually, track streaks & 7-day charts, and control everything by voice.
 - **📺 Watchlist & Playlists (`Alt+5`)**:
   - Save **playlists, videos, courses, podcasts, and articles** (`YouTube` oEmbed + safe HTML title auto-fill, SSRF-protected).
+  - **Strict Opt-In Voice Routing**: Mentioning that you plan to watch a lecture or video creates a **Task** unless you explicitly ask to add/save it to your **Watchlist / Playlists** tab (or share a link).
   - Track episode/lecture progress (`3/12` with automatic `to_watch` → `watching` → `watched` status rollup), open structured lecture notes in 1 click (`📝 Note`), and launch a linked **Focus Timer** (`⏱️ Study`) directly from any item.
 - **☁️ Dual Cloud & Google Drive Sync (`Alt+0`)**:
   - **Option A — Instant Cloud Folder Auto-Sync**: Mirror organized `Notes/<Notebook>/*.md`, `Watchlist.md`, `Tasks.md`, and `lifehub-backup.json` automatically to **Google Drive Desktop**, **OneDrive**, or **Dropbox** (with Windows path auto-detection).

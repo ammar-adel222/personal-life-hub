@@ -8,12 +8,13 @@ This document details how **Personal Life Hub** implements a voice-first, multi-
 
 Instead of pulling in LangChain/LangGraph abstractions, `app/agent.py` + `app/tools.py` run a focused, inspectable ~150-line tool-calling loop directly over Groq's OpenAI-compatible `/chat/completions` API:
 
-1. **Session Context Assembly**: Loads the active session from `agent_sessions` and the last 12 `agent_messages`, injecting compact `[Executed actions: domain #id: label]` annotations onto prior assistant messages so follow-up voice turns (*"check off the first item on that lecture note"*) resolve exact database IDs across turns.
-2. **Bounded Tool Loop (`MAX_TOOL_ROUNDS = 12`)**:
-   - Sends messages + 24 JSON tool schemas (`tools.TOOL_SCHEMAS`) + a 14-day local calendar context to `openai/gpt-oss-120b` (with automatic fallback to `qwen/qwen3.8-27b`, `openai/gpt-oss-20b`, and dynamic `/models` discovery on HTTP `404`).
+1. **Session Context Assembly**: Loads the active session from `agent_sessions` and the last 8 `agent_messages` (trimmed cleanly for TPM budget, excluding noisy offline-fallback action hints), injecting compact `[Executed actions: domain #id: label]` annotations onto prior assistant messages so follow-up voice turns (*"check off the first item on that lecture note"*) resolve exact database IDs across turns.
+2. **Bounded Tool Loop (`MAX_TOOL_ROUNDS = 12`) & Opt-In Watchlist Guard**:
+   - Sends messages + 24 nullable-optional JSON tool schemas (`tools.TOOL_SCHEMAS`, patched via `_enable_nullable_optional_params` for strict validators) + a 14-day local calendar context to `openai/gpt-oss-120b` (with automatic fallback to `openai/gpt-oss-20b`, `qwen/qwen3.8-27b`, and dynamic `/models` discovery on HTTP `404`).
+   - Enforces `watchlist.has_explicit_watchlist_intent()` as a runtime guardrail in both `agent.run_agent_turn` (blocking unsolicited `upsert_watchlist_item` calls so the model pivots to `create_task` or asks) and `ai.smart_capture`.
    - Executes returned `tool_calls` synchronously in `app/tools.py`, appends structured JSON results as `"tool"` messages, and collects UI badges (`action_badge`) and navigation triggers (`navigate_to`).
    - When the model returns a natural-language response, persists both the reply and action metadata into SQLite and returns `is_question` so the UI knows whether to speak clarifications aloud.
-3. **Offline Fallback**: When no Groq key is present (or the network is unreachable), `_offline_agent_fallback` handles checklist task syntax (`steps: ...`), tagged lecture notes, gym sets, and quick captures cleanly.
+3. **Offline Fallback**: When no Groq key is present (or the network is unreachable), `_offline_agent_fallback` handles checklist task syntax (`steps: ...`), multi-day/today task plans, tagged lecture notes, focus timers, gym sets, and explicit Watchlist/Playlist commands cleanly without misrouting casual *"I will watch..."* remarks.
 
 ---
 
@@ -41,7 +42,7 @@ Instead of pulling in LangChain/LangGraph abstractions, `app/agent.py` + `app/to
 | `control_study_timer` | Start/pause/resume/stop/reset countdown or stopwatch timer linked to a task or note |
 | `log_study_session` | Log a completed study/focus session with duration, subject, topic, and optional task/note link |
 | `get_study_stats` | Retrieve live timer state, today/7d/all-time focus hours, streak, subject breakdown, and sessions |
-| `upsert_watchlist_item` | Save or update a playlist, video, course, podcast, or article (with URL auto-detection, tags & episode progress) |
+| `upsert_watchlist_item` | Strictly opt-in save/update of a playlist, video, course, podcast, or article in Watchlist (enforced by `has_explicit_watchlist_intent`) |
 | `list_watchlist` | List or search saved watchlist items filtered by status, type, category, or query |
 | `navigate_ui` | Switch the WebView2 desktop view (`hub`, `tasks`, `notes`, `timer`, `watchlist`, `gym`, `art`, `gaming`, `ask`, `settings`) |
 | `delete_item` | Safely delete a task, note, gym log, art item, game, study session, or watchlist item — requires `confirmed=true` |
