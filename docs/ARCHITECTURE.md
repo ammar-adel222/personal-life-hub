@@ -50,13 +50,15 @@ Instead of pulling in LangChain/LangGraph abstractions, `app/agent.py` + `app/to
 
 ## 3. SQLite Schema & Legacy Migration (`app/db.py`)
 
-Databases use `PRAGMA journal_mode=WAL` and `PRAGMA foreign_keys=ON`. `_migrate_db()` inspects existing tables on startup so older databases automatically receive new columns (`status`, `progress_note`, `start_date`, `timeline`, `frequency`, `parent_task_id`, `parent_item_id`, `is_recurring`, `target_days`, `daily_target_minutes`, `folder`, `summary`) and new tables (`task_daily_logs`, `study_sessions`, `active_timer`, `watchlist_items`) without data loss.
+Databases use `PRAGMA journal_mode=WAL` and `PRAGMA foreign_keys=ON`. `_migrate_db()` inspects existing tables on startup so older databases automatically receive new columns (`status`, `progress_note`, `start_date`, `timeline`, `frequency`, `parent_task_id`, `parent_item_id`, `is_recurring`, `target_days`, `daily_target_minutes`, `progress_mode`, `progress_percent`, `note_id`, `folder`, `summary`) and new tables (`task_daily_logs`, `task_progress_logs`, `study_sessions`, `active_timer`, `watchlist_items`) without data loss.
 
 ```mermaid
 erDiagram
     tasks ||--o{ task_items : "has checklist steps"
     tasks ||--o{ tasks : "optional parent goal"
     tasks ||--o{ task_daily_logs : "logs Done Today dates"
+    tasks ||--o{ task_progress_logs : "logs % and improvement notes"
+    notes ||--o{ tasks : "optional connected task note"
     tasks ||--o{ study_sessions : "optional task link"
     notes ||--o{ study_sessions : "optional note link"
     notes ||--o{ watchlist_items : "optional linked note"
@@ -77,6 +79,9 @@ erDiagram
         text frequency
         text status "not_started | partially_completed | completed"
         text progress_note
+        text progress_mode "auto | percent | days | checklist"
+        int progress_percent "0..100"
+        int note_id FK "ON DELETE SET NULL"
         int done
     }
     task_daily_logs {
@@ -85,6 +90,13 @@ erDiagram
         text date
         text note
         text completed_at
+    }
+    task_progress_logs {
+        int id PK
+        int task_id FK "ON DELETE CASCADE"
+        int percent
+        text note
+        text logged_at
     }
     task_items {
         int id PK
@@ -149,10 +161,13 @@ erDiagram
     }
 ```
 
-### 3-State Task Auto-Rollup & Parent-Goal / Study Linking
-- `0` sub-items checked → `not_started`
-- `1 .. N-1` sub-items checked → `partially_completed`
-- `N / N` sub-items checked → `completed` (for recurring daily habits, logs today into `task_daily_logs` and checks `days_completed / target_days` instead of closing future days prematurely)
+### Two-Tab Tasks, Progress Modes (`days` / `percent` / `checklist`) & Connected Notes
+- **Tasks for Today vs. Tasks in General**: Today's actionable items live on the **Tasks for Today** tab; recurring habits, multi-day goals, projects, and collapsible Someday items live on **Tasks in General**.
+- **`effective_progress_mode` Resolution (`_resolve_effective_progress_mode`)**:
+  - `days`: Countable daily habits (`is_recurring=1` or `target_days > 1`) render individual **Day 1 … Day N** (or 7-day rolling window) checkboxes persisted via `task_daily_logs` / `POST /api/tasks/{id}/done-today`.
+  - `percent`: Non-countable goals without sub-items default to `0–100%` progress bars backed by `tasks.progress_percent` and timestamped `task_progress_logs` (`POST /api/tasks/{id}/progress`), rolling `0% → not_started`, `1–99% → partially_completed`, `100% → completed`.
+  - `checklist`: Tasks with sub-items roll up automatically (`0 → not_started`, `1..N-1 → partially_completed`, `N/N → completed`).
+- **Bidirectional Connected Task Notes**: `tasks.note_id` links each task to a structured Markdown note (`POST /api/tasks/{id}/open-note`, `POST /api/tasks/{id}/notes`), while `notes` surfaces `linked_tasks` chips back to the originating tasks; `delete_note()` explicitly clears `tasks.note_id = NULL` on legacy migrated schemas too.
 - **3-Tier Parent Detection (`_analyze_parent_candidates_conn`)**: High-confidence matches auto-link Today's child task to its larger/recurring goal (and completing the child propagates to the parent); medium/tied matches populate `possible_parents` so the Voice Agent can ask the user to confirm; live focus timers count immediately in `get_study_stats()` and roll study seconds up into linked goals.
 
 ---
